@@ -1,6 +1,6 @@
 {
   "name": "@uniqu/url",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "URL query string parser producing the Uniqu canonical query format",
   "license": "MIT",
   "author": "Artem Maltsev",
@@ -24,7 +24,9 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "pub": "pnpm publish --access public",
     "test": "vitest"
