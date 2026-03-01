@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "target": "ES2020",
+    "module": "ESNext",
+    "lib": ["ESNext"],
+    "noUnusedLocals": true,
+    "types": ["node"],
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationMap": false,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "skipLibCheck": true,
+    "removeComments": false,
+    "baseUrl": ".",
+    "paths": {
+      "@uniqu/core": ["packages/core/src/index.ts"],
+      "@uniqu/core/*": ["packages/core/src/*"],
+      "@uniqu/url": ["packages/url/src/index.ts"],
+      "@uniqu/url/*": ["packages/url/src/*"]
+    }
+  }
+}

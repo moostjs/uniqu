@@ -1,0 +1,32 @@
+{
+  "name": "@uniqu/core",
+  "version": "0.0.0",
+  "description": "Canonical query format types, tree walker, and utilities for Uniqu",
+  "license": "MIT",
+  "author": "Artem Maltsev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moostjs/uniqu.git",
+    "directory": "packages/core"
+  },
+  "bugs": {
+    "url": "https://github.com/moostjs/uniqu/issues"
+  },
+  "homepage": "https://github.com/moostjs/uniqu/tree/main/packages/core#readme",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "pub": "pnpm publish --access public",
+    "test": "vitest"
+  }
+}

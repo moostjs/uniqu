@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": ".types"
+  },
+  "include": [
+    "packages/*/src/**/*.ts"
+  ],
+  "exclude": ["**/*.spec.ts", "__snapshots__"]
+}

@@ -1,0 +1,46 @@
+{
+  "name": "uniqu",
+  "version": "0.0.0",
+  "description": "Canonical query representation for filters, sorting, pagination, and projection",
+  "private": true,
+  "type": "module",
+  "author": "Artem Maltsev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moostjs/uniqu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/moostjs/uniqu/issues"
+  },
+  "homepage": "https://github.com/moostjs/uniqu#readme",
+  "scripts": {
+    "lint": "oxlint",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "build": "node ./scripts/build.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s",
+    "release": "pnpm build && pnpm test && node ./scripts/versions && pnpm -r run pub",
+    "sync": "node ./scripts/versions",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.4.2",
+    "@commitlint/config-conventional": "^20.4.2",
+    "@types/node": "^25.3.3",
+    "conventional-changelog-cli": "^5.0.0",
+    "husky": "^9.1.7",
+    "inquirer": "^13.3.0",
+    "oxfmt": "^0.35.0",
+    "oxlint": "^1.50.0",
+    "rolldown": "1.0.0-rc.6",
+    "rollup": "^4.59.0",
+    "rollup-plugin-dts": "^6.3.0",
+    "typescript": "^5.9.3",
+    "unplugin-swc": "^1.5.9",
+    "vitest": "^4.0.18",
+    "zx": "^8.8.5"
+  }
+}
