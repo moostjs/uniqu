@@ -228,6 +228,43 @@ describe('walkFilter', () => {
     expect(fields).toEqual(['age', 'name', 'status'])
   })
 
+  it('treats class instances as leaf values (not operator maps)', () => {
+    // Simulates ObjectId, Decimal128, Buffer, etc.
+    class CustomId {
+      constructor(public value: string) {}
+      toString() { return this.value }
+    }
+
+    const id = new CustomId('abc123')
+    const expr: FilterExpr = { _id: id } as any
+    const { calls, visitor } = collectingVisitor()
+    walkFilter(expr, visitor)
+
+    expect(calls).toEqual([
+      { type: 'comparison', field: '_id', op: '$eq', value: id },
+    ])
+  })
+
+  it('does not treat plain objects as leaf values', () => {
+    const expr: FilterExpr = { age: { $gte: 18 } }
+    const { calls, visitor } = collectingVisitor()
+    walkFilter(expr, visitor)
+
+    expect(calls[0]).toEqual({
+      type: 'comparison', field: 'age', op: '$gte', value: 18,
+    })
+  })
+
+  it('does not treat arrays as leaf values', () => {
+    const expr: FilterExpr = { role: { $in: ['Admin', 'Editor'] } }
+    const { calls, visitor } = collectingVisitor()
+    walkFilter(expr, visitor)
+
+    expect(calls[0]).toEqual({
+      type: 'comparison', field: 'role', op: '$in', value: ['Admin', 'Editor'],
+    })
+  })
+
   it('rejects mixed comparison+logical nodes at the type level', () => {
     // @ts-expect-error — $or node cannot have $and
     const _mixedLogical: LogicalNode = { $or: [], $and: [] }

@@ -82,12 +82,17 @@ export function walkFilter<R>(expr: FilterExpr, visitor: FilterVisitor<R>): R {
 }
 
 export function isPrimitive(x: unknown): x is Primitive {
-  return (
-    x === null ||
-    typeof x === 'string' ||
-    typeof x === 'number' ||
-    typeof x === 'boolean' ||
-    x instanceof RegExp ||
-    x instanceof Date
-  )
+  if (x === null || typeof x !== 'object') {
+    return true
+  }
+  // Known built-in value types
+  if (x instanceof RegExp || x instanceof Date) {
+    return true
+  }
+  // Non-plain objects (class instances like ObjectId, Decimal128, Buffer, etc.)
+  // are leaf values — only plain objects { $gt: 5 } are operator maps.
+  if (!Array.isArray(x) && x.constructor !== undefined && x.constructor !== Object) {
+    return true
+  }
+  return false
 }
