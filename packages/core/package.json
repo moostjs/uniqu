@@ -1,6 +1,6 @@
 {
   "name": "@uniqu/core",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Canonical query format types, tree walker, and utilities for Uniqu",
   "license": "MIT",
   "author": "Artem Maltsev",
