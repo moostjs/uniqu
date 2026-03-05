@@ -422,6 +422,126 @@ describe('parseUrl – percent-encoded literals', () => {
   })
 })
 
+describe('parseUrl – $with relation loading', () => {
+  it('single relation', () => {
+    const r = parseUrl('$with=posts')
+    expect(r.controls.$with).toEqual([{ name: 'posts' }])
+    expect(r.insights.get('posts')).toEqual(new Set(['$with']))
+  })
+
+  it('multiple relations', () => {
+    const r = parseUrl('$with=posts,comments')
+    expect(r.controls.$with).toEqual([{ name: 'posts' }, { name: 'comments' }])
+    expect(r.insights.get('posts')).toEqual(new Set(['$with']))
+    expect(r.insights.get('comments')).toEqual(new Set(['$with']))
+  })
+
+  it('deduplicates relation names', () => {
+    const r = parseUrl('$with=posts,posts')
+    expect(r.controls.$with).toEqual([{ name: 'posts' }])
+  })
+
+  it('empty $with value is omitted', () => {
+    const r = parseUrl('$with=')
+    expect(r.controls.$with).toBeUndefined()
+  })
+
+  it('per-relation filter via parens', () => {
+    const r = parseUrl('status=active&$with=posts(status=published)')
+    expect(r.filter).toEqual({ status: 'active' })
+    expect(r.controls.$with).toEqual([
+      { name: 'posts', filter: { status: 'published' } },
+    ])
+    expect(r.insights.get('posts')).toEqual(new Set(['$with']))
+  })
+
+  it('per-relation sort via parens', () => {
+    const r = parseUrl('$with=posts($sort=-createdAt,title)')
+    expect(r.controls.$with).toEqual([
+      { name: 'posts', $sort: { createdAt: -1, title: 1 } },
+    ])
+  })
+
+  it('per-relation limit and skip via parens', () => {
+    const r = parseUrl('$with=posts($limit=5&$skip=10)')
+    expect(r.controls.$with).toEqual([
+      { name: 'posts', $limit: 5, $skip: 10 },
+    ])
+  })
+
+  it('per-relation select (include) via parens', () => {
+    const r = parseUrl('$with=posts($select=title,createdAt)')
+    expect(r.controls.$with).toEqual([
+      { name: 'posts', $select: ['title', 'createdAt'] },
+    ])
+  })
+
+  it('per-relation select (exclude) via parens', () => {
+    const r = parseUrl('$with=posts($select=title,-body)')
+    expect(r.controls.$with).toEqual([
+      { name: 'posts', $select: { title: 1, body: 0 } },
+    ])
+  })
+
+  it('per-relation filter + controls combined', () => {
+    const r = parseUrl('$with=posts($sort=-createdAt&$limit=5&status=published)')
+    expect(r.controls.$with).toEqual([
+      { name: 'posts', filter: { status: 'published' }, $sort: { createdAt: -1 }, $limit: 5 },
+    ])
+  })
+
+  it('nested $with (recursive)', () => {
+    const r = parseUrl('$with=posts($with=comments($limit=10))')
+    expect(r.controls.$with).toEqual([
+      {
+        name: 'posts',
+        $with: [{ name: 'comments', $limit: 10 }],
+      },
+    ])
+  })
+
+  it('deep nesting with filters', () => {
+    const r = parseUrl('$with=posts($with=comments($with=author&status=approved))')
+    expect(r.controls.$with).toEqual([
+      {
+        name: 'posts',
+        $with: [
+          {
+            name: 'comments',
+            filter: { status: 'approved' },
+            $with: [{ name: 'author' }],
+          },
+        ],
+      },
+    ])
+  })
+
+  it('empty parens treated as no sub-query', () => {
+    const r = parseUrl('$with=posts()')
+    expect(r.controls.$with).toEqual([{ name: 'posts' }])
+  })
+
+  it('full $with kitchen-sink', () => {
+    const r = parseUrl(
+      'status=active' +
+      '&$with=posts($sort=-createdAt&$limit=5&$select=title,body&status=published),author'
+    )
+    expect(r.controls.$with).toEqual([
+      {
+        name: 'posts',
+        filter: { status: 'published' },
+        $sort: { createdAt: -1 },
+        $limit: 5,
+        $select: ['title', 'body'],
+      },
+      { name: 'author' },
+    ])
+    expect(r.filter).toEqual({ status: 'active' })
+    expect(r.insights.get('posts')).toEqual(new Set(['$with']))
+    expect(r.insights.get('author')).toEqual(new Set(['$with']))
+  })
+})
+
 describe('parseUrl – control words', () => {
   it('supports only control words', () => {
     const r = parseUrl('%24search=test')

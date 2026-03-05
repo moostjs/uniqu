@@ -7,6 +7,7 @@ export type {
   FilterExpr,
   ComparisonNode,
   LogicalNode,
+  WithRelation,
   UniqueryControls,
   Uniquery,
   InsightOp,

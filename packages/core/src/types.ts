@@ -72,6 +72,14 @@ export type LogicalNode<T = Record<string, unknown>> =
   | { $or: FilterExpr<T>[]; $and?: never; $not?: never }
   | { $not: FilterExpr<T>; $and?: never; $or?: never }
 
+/** A relation to populate alongside the primary query. */
+export interface WithRelation extends Omit<UniqueryControls, '$count'> {
+  /** Relation name (e.g. "posts", "posts.author"). */
+  name: string
+  /** Filter scoped to this relation. */
+  filter?: FilterExpr
+}
+
 /** Query controls (pagination, projection, sorting). Generic `T` constrains field names in `$select` and `$sort`. */
 export interface UniqueryControls<T = Record<string, unknown>> {
   $sort?: Partial<Record<keyof T & string, 1 | -1>>
@@ -79,6 +87,8 @@ export interface UniqueryControls<T = Record<string, unknown>> {
   $limit?: number
   $count?: boolean
   $select?: (keyof T & string)[] | Partial<Record<keyof T & string, 0 | 1>>
+  /** Relations to populate alongside the primary query. */
+  $with?: WithRelation[]
   /** Pass-through for unknown $-prefixed keywords. */
   [key: `$${string}`]: unknown
 }
@@ -92,7 +102,7 @@ export interface Uniquery<T = Record<string, unknown>> {
 }
 
 /** Insight operator includes comparison ops plus control-derived ops. */
-export type InsightOp = ComparisonOp | '$select' | '$order'
+export type InsightOp = ComparisonOp | '$select' | '$order' | '$with'
 
 /** Map of field names to the set of operators used on that field. */
 export type UniqueryInsights = Map<string, Set<InsightOp>>

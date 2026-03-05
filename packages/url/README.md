@@ -151,9 +151,116 @@ Control keywords start with `$` and are separated from filter expressions:
 | `$limit` | `$top` | `$limit=20` | `{ $limit: 20 }` |
 | `$skip` | — | `$skip=40` | `{ $skip: 40 }` |
 | `$count` | — | `$count` | `{ $count: true }` |
+| `$with` | — | `$with=posts,author` | `{ $with: [{ name: 'posts' }, { name: 'author' }] }` |
 | `$<custom>` | — | `$search=term` | `{ $search: 'term' }` |
 
 Prefix a field with `-` in `$select` to exclude it. When any exclusion is present, `$select` produces an object (`{ name: 1, password: 0 }`); otherwise it produces an array (`['name', 'email']`). Prefix with `-` in `$order` for descending sort.
+
+### Relation Loading (`$with`)
+
+`$with` declares which relations to populate alongside the primary query. Relations are comma-separated:
+
+```
+$with=posts,comments,author
+```
+
+#### Per-Relation Sub-Queries
+
+Each relation can include an inline sub-query in parentheses. Inside the parens, the full query syntax applies — filters, controls, and nested `$with`:
+
+```
+$with=posts($sort=-createdAt&$limit=5&status=published)
+```
+
+This parses to:
+
+```ts
+controls.$with = [
+  {
+    name: 'posts',
+    filter: { status: 'published' },
+    $sort: { createdAt: -1 },
+    $limit: 5,
+  },
+]
+```
+
+All controls are supported inside parens: `$sort`, `$limit`, `$skip`, `$select`, and nested `$with`.
+
+#### Nested Relations
+
+`$with` is recursive — relations can load their own sub-relations to any depth:
+
+```
+$with=posts($sort=-createdAt&$limit=5&$with=comments($limit=10&$with=author),tags)
+```
+
+This produces a tree:
+
+```ts
+controls.$with = [
+  {
+    name: 'posts',
+    $sort: { createdAt: -1 },
+    $limit: 5,
+    $with: [
+      { name: 'comments', $limit: 10, $with: [{ name: 'author' }] },
+      { name: 'tags' },
+    ],
+  },
+]
+```
+
+Inside each level of parens, `&` separates parameters and `,` separates sibling relations within `$with=`. The parser handles balanced parentheses correctly across nesting levels.
+
+#### Combined Example
+
+```
+status=active&$with=posts($sort=-createdAt&$limit=5&$select=title,body&status=published),author
+```
+
+Produces:
+
+```ts
+{
+  filter: { status: 'active' },
+  controls: {
+    $with: [
+      {
+        name: 'posts',
+        filter: { status: 'published' },
+        $sort: { createdAt: -1 },
+        $limit: 5,
+        $select: ['title', 'body'],
+      },
+      { name: 'author' },
+    ],
+  },
+  insights: Map {
+    'status' => Set { '$eq' },
+    'posts'  => Set { '$with' },
+    'author' => Set { '$with' },
+  },
+}
+```
+
+#### Edge Cases
+
+| Case | Behavior |
+|------|----------|
+| `$with=posts,posts` | Deduplicated — one entry |
+| `$with=` or `$with` | No relations (empty/omitted) |
+| `$with=posts()` | Empty parens — same as `$with=posts` |
+| Unknown relation names | Recorded as-is — consumer validates against its schema |
+
+#### Consumer Responsibility
+
+Uniqu parses and types the `$with` declaration. The consumer (e.g. a database adapter) is responsible for:
+
+- **Execution strategy** — JOINs, subqueries, or separate queries
+- **Relation validation** — checking that relation names exist on the entity
+- **Circular reference detection** — preventing infinite `$with` chains
+- **Depth limits** — restricting nesting depth for performance
 
 ## Insights
 
@@ -168,6 +275,7 @@ $select=firstName,-client.ssn
 &$order=-createdAt,score
 &$limit=50&$skip=10
 &$count
+&$with=posts($sort=-date&$limit=5&status=published),profile
 &$exists=client.phone
 &$!exists=deletedAt
 &age>=18&age<=30
@@ -205,6 +313,10 @@ Produces:
     $limit: 50,
     $skip: 10,
     $count: true,
+    $with: [
+      { name: 'posts', filter: { status: 'published' }, $sort: { date: -1 }, $limit: 5 },
+      { name: 'profile' },
+    ],
   },
 }
 ```

@@ -53,6 +53,11 @@ export function computeInsights(
       capture(field, '$order')
     }
   }
+  if (controls?.$with) {
+    for (const rel of controls.$with) {
+      capture(rel.name, '$with')
+    }
+  }
 
   return insights
 }

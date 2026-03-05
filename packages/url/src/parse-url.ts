@@ -1,5 +1,6 @@
 import type {
   FilterExpr,
+  WithRelation,
   UniqueryControls,
   UniqueryInsights,
   Uniquery,
@@ -24,7 +25,7 @@ export interface UrlQuery extends Uniquery {
  * @param raw - Raw query string without the leading "?"
  */
 export function parseUrl(raw: string): UrlQuery {
-  const parts = raw.split('&')
+  const parts = splitTopLevel(raw, '&')
 
   const controlParts: string[] = []
   const exprParts: string[] = []
@@ -40,7 +41,7 @@ export function parseUrl(raw: string): UrlQuery {
     else if (p.length) exprParts.push(p)
   }
 
-  const { controls, selectInsights, orderInsights } =
+  const { controls, selectInsights, orderInsights, withInsights } =
     handleControls(controlParts)
 
   let filter: FilterExpr = {}
@@ -62,6 +63,9 @@ export function parseUrl(raw: string): UrlQuery {
   for (const f of orderInsights) {
     parser.captureInsight(f, '$order')
   }
+  for (const f of withInsights) {
+    parser.captureInsight(f, '$with')
+  }
 
   return {
     filter,
@@ -70,20 +74,83 @@ export function parseUrl(raw: string): UrlQuery {
   }
 }
 
+/** Split a string by `sep` at the top level (ignoring separators inside balanced parentheses). */
+function splitTopLevel(str: string, sep: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let start = 0
+
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === '(') depth++
+    else if (str[i] === ')') depth--
+    else if (str[i] === sep && depth === 0) {
+      parts.push(str.slice(start, i))
+      start = i + 1
+    }
+  }
+
+  parts.push(str.slice(start))
+  return parts
+}
+
+/** Parse a single `$with` segment like `posts` or `posts($sort=-createdAt&status=active)`. */
+function parseWithSegment(seg: string): WithRelation | null {
+  if (!seg) return null
+
+  const parenIdx = seg.indexOf('(')
+  if (parenIdx === -1) return { name: seg }
+
+  const name = seg.slice(0, parenIdx)
+  if (!name) return null
+
+  // Strip surrounding parens
+  const inner = seg.slice(parenIdx + 1, -1)
+  if (!inner) return { name }
+
+  // Recursively parse the sub-query inside parens
+  const sub = parseUrl(inner)
+  const rel: WithRelation = { name }
+
+  if (Object.keys(sub.filter).length) rel.filter = sub.filter
+  if (sub.controls.$sort) rel.$sort = sub.controls.$sort
+  if (sub.controls.$skip != null) rel.$skip = sub.controls.$skip
+  if (sub.controls.$limit != null) rel.$limit = sub.controls.$limit
+  if (sub.controls.$select) rel.$select = sub.controls.$select
+  if (sub.controls.$with?.length) rel.$with = sub.controls.$with
+
+  return rel
+}
+
 function handleControls(parts: string[]): {
   controls: UniqueryControls
   selectInsights: Set<string>
   orderInsights: Set<string>
+  withInsights: Set<string>
 } {
   const controls = {} as UniqueryControls
   const selectInsights = new Set<string>()
   const orderInsights = new Set<string>()
+  const withInsights = new Set<string>()
 
   for (const raw of parts) {
     const [key, ...rest] = raw.split('=')
-    const value = decodeURIComponent(rest.join('='))
+    const value = rest.join('=')
 
     switch (key) {
+      case '$with': {
+        if (!value) break
+        controls.$with ??= []
+        const seen = new Set(controls.$with.map((r) => r.name))
+        for (const seg of splitTopLevel(value, ',')) {
+          const rel = parseWithSegment(seg)
+          if (!rel || seen.has(rel.name)) continue
+          seen.add(rel.name)
+          controls.$with.push(rel)
+          withInsights.add(rel.name)
+        }
+        break
+      }
+
       case '$select': {
         let hasExclusion = false
         const fields: Array<{ name: string; include: boolean }> = []
@@ -145,5 +212,5 @@ function handleControls(parts: string[]): {
     }
   }
 
-  return { controls, selectInsights, orderInsights }
+  return { controls, selectInsights, orderInsights, withInsights }
 }

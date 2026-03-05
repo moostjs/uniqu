@@ -98,6 +98,18 @@ describe('computeInsights', () => {
     expect(insights.size).toBe(0)
   })
 
+  it('includes $with from controls', () => {
+    const filter: FilterExpr = { status: 'active' }
+    const controls: UniqueryControls = {
+      $with: [{ name: 'posts' }, { name: 'posts.author' }],
+    }
+    const insights = computeInsights(filter, controls)
+
+    expect(insights.get('status')).toEqual(new Set(['$eq']))
+    expect(insights.get('posts')).toEqual(new Set(['$with']))
+    expect(insights.get('posts.author')).toEqual(new Set(['$with']))
+  })
+
   it('handles $exists operator', () => {
     const filter: FilterExpr = {
       phone: { $exists: true },
