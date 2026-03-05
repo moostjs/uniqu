@@ -151,7 +151,7 @@ Control keywords start with `$` and are separated from filter expressions:
 | `$limit` | `$top` | `$limit=20` | `{ $limit: 20 }` |
 | `$skip` | — | `$skip=40` | `{ $skip: 40 }` |
 | `$count` | — | `$count` | `{ $count: true }` |
-| `$with` | — | `$with=posts,author` | `{ $with: [{ name: 'posts' }, { name: 'author' }] }` |
+| `$with` | — | `$with=posts,author` | `{ $with: [{ name: 'posts', filter: {}, controls: {} }, ...] }` |
 | `$<custom>` | — | `$search=term` | `{ $search: 'term' }` |
 
 Prefix a field with `-` in `$select` to exclude it. When any exclusion is present, `$select` produces an object (`{ name: 1, password: 0 }`); otherwise it produces an array (`['name', 'email']`). Prefix with `-` in `$order` for descending sort.
@@ -179,13 +179,12 @@ controls.$with = [
   {
     name: 'posts',
     filter: { status: 'published' },
-    $sort: { createdAt: -1 },
-    $limit: 5,
+    controls: { $sort: { createdAt: -1 }, $limit: 5 },
   },
 ]
 ```
 
-All controls are supported inside parens: `$sort`, `$limit`, `$skip`, `$select`, and nested `$with`.
+Each relation is a full `Uniquery` sub-query with its own `filter`, `controls`, and `insights`. All controls are supported inside parens: `$sort`, `$limit`, `$skip`, `$select`, `$count`, and nested `$with`.
 
 #### Nested Relations
 
@@ -201,12 +200,22 @@ This produces a tree:
 controls.$with = [
   {
     name: 'posts',
-    $sort: { createdAt: -1 },
-    $limit: 5,
-    $with: [
-      { name: 'comments', $limit: 10, $with: [{ name: 'author' }] },
-      { name: 'tags' },
-    ],
+    filter: {},
+    controls: {
+      $sort: { createdAt: -1 },
+      $limit: 5,
+      $with: [
+        {
+          name: 'comments',
+          filter: {},
+          controls: {
+            $limit: 10,
+            $with: [{ name: 'author', filter: {}, controls: {} }],
+          },
+        },
+        { name: 'tags', filter: {}, controls: {} },
+      ],
+    },
   },
 ]
 ```
@@ -229,20 +238,26 @@ Produces:
       {
         name: 'posts',
         filter: { status: 'published' },
-        $sort: { createdAt: -1 },
-        $limit: 5,
-        $select: ['title', 'body'],
+        controls: {
+          $sort: { createdAt: -1 },
+          $limit: 5,
+          $select: ['title', 'body'],
+        },
+        insights: Map { 'status' => Set { '$eq' }, ... },
       },
-      { name: 'author' },
+      { name: 'author', filter: {}, controls: {} },
     ],
   },
   insights: Map {
     'status' => Set { '$eq' },
     'posts'  => Set { '$with' },
+    'posts.status' => Set { '$eq' },
     'author' => Set { '$with' },
   },
 }
 ```
+
+Each `$with` relation carries its own scoped `insights`, and nested insights bubble up to the root with dot-notation prefixed field names.
 
 #### Edge Cases
 
@@ -314,8 +329,12 @@ Produces:
     $skip: 10,
     $count: true,
     $with: [
-      { name: 'posts', filter: { status: 'published' }, $sort: { date: -1 }, $limit: 5 },
-      { name: 'profile' },
+      {
+        name: 'posts',
+        filter: { status: 'published' },
+        controls: { $sort: { date: -1 }, $limit: 5 },
+      },
+      { name: 'profile', filter: {}, controls: {} },
     ],
   },
 }

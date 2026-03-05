@@ -87,7 +87,7 @@ A `FilterExpr` is either a **comparison node** (leaf) or a **logical node** (bra
 
 ### Relation Loading (`$with`)
 
-`$with` declares which relations to populate alongside the primary query. Each `WithRelation` is a self-contained sub-query with its own filter, sort, pagination, projection, and nested `$with`:
+`$with` declares which relations to populate alongside the primary query. Each relation is a full `Uniquery` sub-query (a `WithRelation`) with its own `name`, `filter`, `controls`, and `insights`:
 
 ```ts
 import type { Uniquery, WithRelation } from '@uniqu/core'
@@ -99,30 +99,29 @@ const query: Uniquery = {
       {
         name: 'posts',
         filter: { status: 'published' },
-        $sort: { createdAt: -1 },
-        $limit: 5,
-        $select: ['title', 'body'],
-        $with: [
-          { name: 'comments', $limit: 10 },
-          { name: 'author' },
-        ],
+        controls: {
+          $sort: { createdAt: -1 },
+          $limit: 5,
+          $select: ['title', 'body'],
+          $with: [
+            { name: 'comments', filter: {}, controls: { $limit: 10 } },
+            { name: 'author', filter: {}, controls: {} },
+          ],
+        },
       },
-      { name: 'profile' },
+      { name: 'profile', filter: {}, controls: {} },
     ],
   },
 }
 ```
 
-`WithRelation` extends `UniqueryControls` (minus `$count`) and adds `name` and `filter`:
+`WithRelation` is a `Uniquery` with a required `name`:
 
 ```ts
-interface WithRelation extends Omit<UniqueryControls, '$count'> {
-  name: string
-  filter?: FilterExpr
-}
+type WithRelation = Uniquery & { name: string }
 ```
 
-This means each relation entry supports the full set of controls — `$sort`, `$skip`, `$limit`, `$select`, nested `$with`, and pass-through `$`-prefixed keys — plus an optional scoped filter. The structure is recursive: a `WithRelation` can contain `$with` entries that themselves contain `$with` entries, to any depth.
+The `Uniquery` type itself has an optional `name` — when present it is a nested relation, when absent it is the root query. This means every `$with` entry is a self-contained query with its own `filter`, `controls` (including `$sort`, `$skip`, `$limit`, `$select`, nested `$with`, and pass-through keywords), and optional `insights`. The structure is recursive to any depth.
 
 Uniqu is a query parser, not an ORM. It records what was requested — the consumer (e.g. a database adapter) decides how to execute it (JOINs, subqueries, separate queries), validates relation names against its schema, and enforces depth/security limits.
 
@@ -236,7 +235,34 @@ const insights = computeInsights(query.filter, query.controls)
 // }
 ```
 
-Relation names from `$with` are captured with the `$with` insight operator, letting consumers validate that requested relations exist on the entity type. Only immediate (top-level) `$with` entries are captured — nested relation insights belong to their parent relation's scope.
+Relation names from `$with` are captured with the `$with` insight operator. Nested `$with` insights bubble up to the parent with dot-notation prefixed field names, and each relation also carries its own scoped `insights`:
+
+```ts
+const controls: UniqueryControls = {
+  $with: [
+    {
+      name: 'tasks',
+      filter: {},
+      controls: {
+        $with: [
+          { name: 'comments', filter: { body: { $regex: 'Great' } }, controls: {} },
+        ],
+      },
+    },
+  ],
+}
+
+const insights = computeInsights({}, controls)
+// Map {
+//   'tasks'               => Set { '$with' },
+//   'tasks.comments'      => Set { '$with' },
+//   'tasks.comments.body' => Set { '$regex' },
+// }
+
+// Each relation also has its own scoped insights:
+// tasks.insights        => Map { 'comments' => Set { '$with' }, 'comments.body' => Set { '$regex' } }
+// comments.insights     => Map { 'body' => Set { '$regex' } }
+```
 
 Use cases: field whitelisting, operator auditing, index planning, relation validation.
 
@@ -266,8 +292,8 @@ const insights = getInsights(query)
 | `ComparisonNode<T>` | Leaf node with typed field comparisons |
 | `LogicalNode<T>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — variants are mutually exclusive via `never` |
 | `UniqueryControls<T>` | Pagination, sorting, projection — `$select`/`$sort` constrained to `keyof T` when typed |
-| `Uniquery<T>` | `{ filter: FilterExpr<T>, controls: UniqueryControls<T>, insights?: UniqueryInsights }` |
-| `WithRelation` | Relation sub-query — extends `UniqueryControls` (minus `$count`) with `name` and `filter` |
+| `Uniquery<T>` | `{ name?, filter, controls, insights? }` — root query (no name) or nested relation (with name) |
+| `WithRelation` | `Uniquery & { name: string }` — a `$with` relation with a required name |
 | `InsightOp` | `ComparisonOp \| '$select' \| '$order' \| '$with'` |
 | `UniqueryInsights` | `Map<string, Set<InsightOp>>` |
 

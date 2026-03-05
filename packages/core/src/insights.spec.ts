@@ -101,13 +101,105 @@ describe('computeInsights', () => {
   it('includes $with from controls', () => {
     const filter: FilterExpr = { status: 'active' }
     const controls: UniqueryControls = {
-      $with: [{ name: 'posts' }, { name: 'posts.author' }],
+      $with: [
+        { name: 'posts', filter: {}, controls: {} },
+        { name: 'posts.author', filter: {}, controls: {} },
+      ],
     }
     const insights = computeInsights(filter, controls)
 
     expect(insights.get('status')).toEqual(new Set(['$eq']))
     expect(insights.get('posts')).toEqual(new Set(['$with']))
     expect(insights.get('posts.author')).toEqual(new Set(['$with']))
+  })
+
+  it('bubbles nested $with insights with dot-notation prefix', () => {
+    const filter: FilterExpr = {}
+    const controls: UniqueryControls = {
+      $with: [
+        { name: 'owner', filter: {}, controls: {} },
+        {
+          name: 'tasks',
+          filter: {},
+          controls: {
+            $with: [
+              {
+                name: 'comments',
+                filter: { body: { $regex: 'Great' } },
+                controls: {},
+              },
+            ],
+          },
+        },
+      ],
+    }
+    const insights = computeInsights(filter, controls)
+
+    expect(insights.get('owner')).toEqual(new Set(['$with']))
+    expect(insights.get('tasks')).toEqual(new Set(['$with']))
+    expect(insights.get('tasks.comments')).toEqual(new Set(['$with']))
+    expect(insights.get('tasks.comments.body')).toEqual(new Set(['$regex']))
+
+    // scoped insights on each relation
+    const tasks = controls.$with![1]
+    expect(tasks.insights?.get('comments')).toEqual(new Set(['$with']))
+    expect(tasks.insights?.get('comments.body')).toEqual(new Set(['$regex']))
+
+    const comments = tasks.controls.$with![0]
+    expect(comments.insights?.get('body')).toEqual(new Set(['$regex']))
+
+    // simple relation has no insights
+    expect(controls.$with![0].insights).toBeUndefined()
+  })
+
+  it('deep nesting populates insights at every level', () => {
+    const controls: UniqueryControls = {
+      $with: [
+        {
+          name: 'tasks',
+          filter: {},
+          controls: {
+            $with: [
+              {
+                name: 'comments',
+                filter: { body: { $regex: 'Great' } },
+                controls: {
+                  $with: [
+                    {
+                      name: 'likes',
+                      filter: { user: 'admin' },
+                      controls: { $limit: 3 },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      ],
+    }
+    const insights = computeInsights({}, controls)
+
+    // top-level bubbles everything
+    expect(insights.get('tasks')).toEqual(new Set(['$with']))
+    expect(insights.get('tasks.comments')).toEqual(new Set(['$with']))
+    expect(insights.get('tasks.comments.body')).toEqual(new Set(['$regex']))
+    expect(insights.get('tasks.comments.likes')).toEqual(new Set(['$with']))
+    expect(insights.get('tasks.comments.likes.user')).toEqual(new Set(['$eq']))
+
+    // each level has scoped insights
+    const tasks = controls.$with![0]
+    expect(tasks.insights?.get('comments')).toEqual(new Set(['$with']))
+    expect(tasks.insights?.get('comments.likes')).toEqual(new Set(['$with']))
+    expect(tasks.insights?.get('comments.likes.user')).toEqual(new Set(['$eq']))
+
+    const comments = tasks.controls.$with![0]
+    expect(comments.insights?.get('body')).toEqual(new Set(['$regex']))
+    expect(comments.insights?.get('likes')).toEqual(new Set(['$with']))
+    expect(comments.insights?.get('likes.user')).toEqual(new Set(['$eq']))
+
+    const likes = comments.controls.$with![0]
+    expect(likes.insights?.get('user')).toEqual(new Set(['$eq']))
   })
 
   it('handles $exists operator', () => {

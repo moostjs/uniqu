@@ -3,6 +3,7 @@ import type {
   WithRelation,
   UniqueryControls,
   UniqueryInsights,
+  InsightOp,
   Uniquery,
 } from '@uniqu/core'
 import { lex } from './tokens'
@@ -41,8 +42,7 @@ export function parseUrl(raw: string): UrlQuery {
     else if (p.length) exprParts.push(p)
   }
 
-  const { controls, selectInsights, orderInsights, withInsights } =
-    handleControls(controlParts)
+  const { controls, controlInsights } = handleControls(controlParts)
 
   let filter: FilterExpr = {}
   let parser: Parser
@@ -57,14 +57,8 @@ export function parseUrl(raw: string): UrlQuery {
     parser = new Parser([])
   }
 
-  for (const f of selectInsights) {
-    parser.captureInsight(f, '$select')
-  }
-  for (const f of orderInsights) {
-    parser.captureInsight(f, '$order')
-  }
-  for (const f of withInsights) {
-    parser.captureInsight(f, '$with')
+  for (const [field, op] of controlInsights) {
+    parser.captureInsight(field, op)
   }
 
   return {
@@ -98,39 +92,33 @@ function parseWithSegment(seg: string): WithRelation | null {
   if (!seg) return null
 
   const parenIdx = seg.indexOf('(')
-  if (parenIdx === -1) return { name: seg }
+  if (parenIdx === -1) return { name: seg, filter: {}, controls: {} }
 
   const name = seg.slice(0, parenIdx)
   if (!name) return null
 
   // Strip surrounding parens
   const inner = seg.slice(parenIdx + 1, -1)
-  if (!inner) return { name }
+  if (!inner) return { name, filter: {}, controls: {} }
 
   // Recursively parse the sub-query inside parens
   const sub = parseUrl(inner)
-  const rel: WithRelation = { name }
-
-  if (Object.keys(sub.filter).length) rel.filter = sub.filter
-  if (sub.controls.$sort) rel.$sort = sub.controls.$sort
-  if (sub.controls.$skip != null) rel.$skip = sub.controls.$skip
-  if (sub.controls.$limit != null) rel.$limit = sub.controls.$limit
-  if (sub.controls.$select) rel.$select = sub.controls.$select
-  if (sub.controls.$with?.length) rel.$with = sub.controls.$with
+  const rel: WithRelation = {
+    name,
+    filter: sub.filter,
+    controls: sub.controls,
+  }
+  if (sub.insights.size) rel.insights = sub.insights
 
   return rel
 }
 
 function handleControls(parts: string[]): {
   controls: UniqueryControls
-  selectInsights: Set<string>
-  orderInsights: Set<string>
-  withInsights: Set<string>
+  controlInsights: Array<[string, InsightOp]>
 } {
   const controls = {} as UniqueryControls
-  const selectInsights = new Set<string>()
-  const orderInsights = new Set<string>()
-  const withInsights = new Set<string>()
+  const controlInsights: Array<[string, InsightOp]> = []
 
   for (const raw of parts) {
     const [key, ...rest] = raw.split('=')
@@ -146,7 +134,15 @@ function handleControls(parts: string[]): {
           if (!rel || seen.has(rel.name)) continue
           seen.add(rel.name)
           controls.$with.push(rel)
-          withInsights.add(rel.name)
+          controlInsights.push([rel.name, '$with'])
+          if (rel.insights) {
+            for (const [field, ops] of rel.insights) {
+              const prefixed = `${rel.name}.${field}`
+              for (const op of ops) {
+                controlInsights.push([prefixed, op])
+              }
+            }
+          }
         }
         break
       }
@@ -168,14 +164,14 @@ function handleControls(parts: string[]): {
           const obj: Record<string, 0 | 1> = (controls.$select as Record<string, 0 | 1>) ?? {}
           for (const { name, include } of fields) {
             obj[name] = include ? 1 : 0
-            selectInsights.add(name)
+            controlInsights.push([name, '$select'])
           }
           controls.$select = obj
         } else {
           const arr: string[] = Array.isArray(controls.$select) ? controls.$select : []
           for (const { name } of fields) {
             arr.push(name)
-            selectInsights.add(name)
+            controlInsights.push([name, '$select'])
           }
           controls.$select = arr
         }
@@ -187,7 +183,7 @@ function handleControls(parts: string[]): {
         controls.$sort ??= {}
         value.split(',').forEach((f) => {
           if (!f) return
-          orderInsights.add(f.replace(/^-/, ''))
+          controlInsights.push([f.replace(/^-/, ''), '$order'])
           if (f.startsWith('-')) controls.$sort![f.slice(1)] = -1
           else controls.$sort![f] = 1
         })
@@ -212,5 +208,5 @@ function handleControls(parts: string[]): {
     }
   }
 
-  return { controls, selectInsights, orderInsights, withInsights }
+  return { controls, controlInsights }
 }

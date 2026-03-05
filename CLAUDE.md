@@ -38,9 +38,10 @@ Cross-package imports use `workspace:^` protocol and TypeScript path aliases in 
 
 ### Core design
 
+- `Uniquery` is the single canonical query type: `{ name?, filter, controls, insights? }`. When `name` is present it's a nested `$with` relation; when absent it's the root query. `WithRelation` is just `Uniquery & { name: string }`.
 - `FilterExpr<T>` is a recursive tree: `ComparisonNode<T>` (leaf with field→value/operators) or `LogicalNode<T>` (`$and`/`$or` wrapping children). Generic `T` defaults to `Record<string, unknown>` — provides type-safe fields when an entity shape is given, while always allowing arbitrary string keys for dot-notation paths.
 - `walkFilter<R>(expr, visitor)` drives depth-first traversal. The visitor's 3 callbacks (`comparison`, `and`, `or`) control output — return `string` for SQL, `boolean` for validation, `void` for side-effects.
-- `computeInsights(filter, controls?)` lazily builds a `Map<field, Set<operator>>` from an already-constructed query. The URL parser computes insights eagerly during parsing instead.
+- `computeInsights(filter, controls?)` lazily builds a `Map<field, Set<operator>>` from an already-constructed query. Nested `$with` insights bubble up with dot-notation prefixed field names, and each relation gets its own scoped `insights`. The URL parser computes insights eagerly during parsing instead.
 
 ## Conventions
 

@@ -72,14 +72,6 @@ export type LogicalNode<T = Record<string, unknown>> =
   | { $or: FilterExpr<T>[]; $and?: never; $not?: never }
   | { $not: FilterExpr<T>; $and?: never; $or?: never }
 
-/** A relation to populate alongside the primary query. */
-export interface WithRelation extends Omit<UniqueryControls, '$count'> {
-  /** Relation name (e.g. "posts", "posts.author"). */
-  name: string
-  /** Filter scoped to this relation. */
-  filter?: FilterExpr
-}
-
 /** Query controls (pagination, projection, sorting). Generic `T` constrains field names in `$select` and `$sort`. */
 export interface UniqueryControls<T = Record<string, unknown>> {
   $sort?: Partial<Record<keyof T & string, 1 | -1>>
@@ -87,19 +79,28 @@ export interface UniqueryControls<T = Record<string, unknown>> {
   $limit?: number
   $count?: boolean
   $select?: (keyof T & string)[] | Partial<Record<keyof T & string, 0 | 1>>
-  /** Relations to populate alongside the primary query. */
+  /** Relations to populate alongside the query. */
   $with?: WithRelation[]
   /** Pass-through for unknown $-prefixed keywords. */
   [key: `$${string}`]: unknown
 }
 
-/** Top-level query: filter tree + controls. */
+/**
+ * Canonical query representation.
+ * When `name` is present this is a nested relation (sub-query inside `$with`).
+ * When absent it is the root query.
+ */
 export interface Uniquery<T = Record<string, unknown>> {
+  /** Relation name. Present only for nested `$with` sub-queries. */
+  name?: string
   filter: FilterExpr<T>
   controls: UniqueryControls<T>
-  /** Pre-computed insights. When present, consumers should use `getInsights()` which trusts these instead of recomputing. */
+  /** Pre-computed insights. */
   insights?: UniqueryInsights
 }
+
+/** A `$with` relation — a `Uniquery` with a required `name`. */
+export type WithRelation = Uniquery & { name: string }
 
 /** Insight operator includes comparison ops plus control-derived ops. */
 export type InsightOp = ComparisonOp | '$select' | '$order' | '$with'

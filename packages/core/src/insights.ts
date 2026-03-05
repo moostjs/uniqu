@@ -56,6 +56,14 @@ export function computeInsights(
   if (controls?.$with) {
     for (const rel of controls.$with) {
       capture(rel.name, '$with')
+      const nested = rel.insights ?? computeInsights(rel.filter, rel.controls)
+      if (nested.size) rel.insights = nested
+      for (const [field, ops] of nested) {
+        const prefixed = `${rel.name}.${field}`
+        for (const op of ops) {
+          capture(prefixed, op)
+        }
+      }
     }
   }
 
