@@ -13,7 +13,7 @@ import { walkFilter, type FilterVisitor } from './walk'
  * URL parsing.
  */
 export function computeInsights(
-  filter: FilterExpr,
+  filter?: FilterExpr,
   controls?: UniqueryControls,
 ): UniqueryInsights {
   const insights: UniqueryInsights = new Map()
@@ -35,7 +35,7 @@ export function computeInsights(
     or() {},
     not() {},
   }
-  walkFilter(filter, visitor)
+  if (filter) walkFilter(filter, visitor)
 
   if (controls?.$select) {
     if (Array.isArray(controls.$select)) {
@@ -75,5 +75,5 @@ export function computeInsights(
  * computes lazily otherwise.
  */
 export function getInsights(query: Uniquery): UniqueryInsights {
-  return query.insights ?? computeInsights(query.filter, query.controls)
+  return query.insights ?? computeInsights(query.filter ?? {}, query.controls)
 }

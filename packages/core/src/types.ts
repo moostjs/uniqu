@@ -73,14 +73,17 @@ export type LogicalNode<T = Record<string, unknown>> =
   | { $not: FilterExpr<T>; $and?: never; $or?: never }
 
 /** Query controls (pagination, projection, sorting). Generic `T` constrains field names in `$select` and `$sort`. */
-export interface UniqueryControls<T = Record<string, unknown>> {
+export interface UniqueryControls<
+  T = Record<string, unknown>,
+  Nav extends Record<string, unknown> = Record<string, unknown>,
+> {
   $sort?: Partial<Record<keyof T & string, 1 | -1>>
   $skip?: number
   $limit?: number
   $count?: boolean
   $select?: (keyof T & string)[] | Partial<Record<keyof T & string, 0 | 1>>
   /** Relations to populate alongside the query. */
-  $with?: WithRelation[]
+  $with?: TypedWithRelation<Nav>[]
   /** Pass-through for unknown $-prefixed keywords. */
   [key: `$${string}`]: unknown
 }
@@ -90,17 +93,49 @@ export interface UniqueryControls<T = Record<string, unknown>> {
  * When `name` is present this is a nested relation (sub-query inside `$with`).
  * When absent it is the root query.
  */
-export interface Uniquery<T = Record<string, unknown>> {
+export interface Uniquery<
+  T = Record<string, unknown>,
+  Nav extends Record<string, unknown> = Record<string, unknown>,
+> {
   /** Relation name. Present only for nested `$with` sub-queries. */
   name?: string
-  filter: FilterExpr<T>
-  controls: UniqueryControls<T>
+  filter?: FilterExpr<T>
+  controls?: UniqueryControls<T, Nav>
   /** Pre-computed insights. */
   insights?: UniqueryInsights
 }
 
-/** A `$with` relation — a `Uniquery` with a required `name`. */
-export type WithRelation = Uniquery & { name: string }
+/** Unwrap array types to get the element type for nav props. */
+export type NavTarget<T> = T extends Array<infer U> ? U : T
+
+/**
+ * A typed $with relation entry.
+ * When Nav is typed (from __navProps), name is constrained to known nav prop keys.
+ * Each entry gets its own filter/controls typed to the target entity.
+ * Falls back to untyped WithRelation when Nav has no known keys.
+ */
+export type TypedWithRelation<Nav extends Record<string, unknown>> =
+  [keyof Nav & string] extends [never]
+    ? WithRelation
+    : {
+        [K in keyof Nav & string]: {
+          name: K
+          filter?: FilterExpr<NavTarget<Nav[K]> extends { __ownProps: infer F } ? F : Record<string, unknown>>
+          controls?: UniqueryControls<
+            NavTarget<Nav[K]> extends { __ownProps: infer F } ? F : Record<string, unknown>,
+            NavTarget<Nav[K]> extends { __navProps: infer N extends Record<string, unknown> } ? N : Record<string, unknown>
+          >
+          insights?: UniqueryInsights
+        }
+      }[keyof Nav & string]
+
+/** Untyped $with relation — used when Nav generic is not provided. */
+export type WithRelation = {
+  name: string
+  filter?: FilterExpr
+  controls?: UniqueryControls
+  insights?: UniqueryInsights
+}
 
 /** Insight operator includes comparison ops plus control-derived ops. */
 export type InsightOp = ComparisonOp | '$select' | '$order' | '$with'

@@ -9,8 +9,10 @@ import type {
 import { lex } from './tokens'
 import { Parser } from './parser'
 
-/** Result of parsing a URL query string. Narrows `Uniquery.insights` from optional to required (eagerly computed during parsing). */
+/** Result of parsing a URL query string. Narrows optional fields to required (always produced by the parser). */
 export interface UrlQuery extends Uniquery {
+  filter: FilterExpr
+  controls: UniqueryControls
   insights: UniqueryInsights
 }
 

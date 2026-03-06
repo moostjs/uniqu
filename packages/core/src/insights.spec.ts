@@ -145,7 +145,7 @@ describe('computeInsights', () => {
     expect(tasks.insights?.get('comments')).toEqual(new Set(['$with']))
     expect(tasks.insights?.get('comments.body')).toEqual(new Set(['$regex']))
 
-    const comments = tasks.controls.$with![0]
+    const comments = tasks.controls!.$with![0]
     expect(comments.insights?.get('body')).toEqual(new Set(['$regex']))
 
     // simple relation has no insights
@@ -193,12 +193,12 @@ describe('computeInsights', () => {
     expect(tasks.insights?.get('comments.likes')).toEqual(new Set(['$with']))
     expect(tasks.insights?.get('comments.likes.user')).toEqual(new Set(['$eq']))
 
-    const comments = tasks.controls.$with![0]
+    const comments = tasks.controls!.$with![0]
     expect(comments.insights?.get('body')).toEqual(new Set(['$regex']))
     expect(comments.insights?.get('likes')).toEqual(new Set(['$with']))
     expect(comments.insights?.get('likes.user')).toEqual(new Set(['$eq']))
 
-    const likes = comments.controls.$with![0]
+    const likes = comments.controls!.$with![0]
     expect(likes.insights?.get('user')).toEqual(new Set(['$eq']))
   })
 

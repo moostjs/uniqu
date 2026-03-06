@@ -8,6 +8,8 @@ export type {
   ComparisonNode,
   LogicalNode,
   WithRelation,
+  TypedWithRelation,
+  NavTarget,
   UniqueryControls,
   Uniquery,
   InsightOp,

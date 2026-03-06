@@ -30,7 +30,8 @@ export interface FilterVisitor<R> {
  * - Bare primitive values are normalized to `comparison(field, '$eq', value)`.
  * - Multi-field ComparisonNodes are combined via `visitor.and(...)`.
  */
-export function walkFilter<R>(expr: FilterExpr, visitor: FilterVisitor<R>): R {
+export function walkFilter<R>(expr: FilterExpr | undefined, visitor: FilterVisitor<R>): R | undefined {
+  if (!expr) return undefined
   // Guard with !== undefined to handle malformed objects (e.g. from JSON.parse)
   // where a key exists but has value undefined/null due to the `never` typed fields.
   if ('$and' in expr && expr.$and !== undefined) {
