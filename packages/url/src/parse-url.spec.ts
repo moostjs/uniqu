@@ -26,6 +26,14 @@ describe('parseUrl – happy-path filters', () => {
     `)
   })
 
+  it('hex strings (e.g. MongoDB ObjectId) as filter values', () => {
+    const r = parseUrl('taskId=69aca32e434504011457636c&tagId=69aca32e434504011457636d')
+    expect(r.filter).toEqual({
+      taskId: '69aca32e434504011457636c',
+      tagId: '69aca32e434504011457636d',
+    })
+  })
+
   it('simple equality for props with dots', () => {
     const r = parseUrl('client.age=25&items.0.status=ACTIVE')
     expect(r.filter).toEqual({

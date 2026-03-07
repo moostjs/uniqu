@@ -51,7 +51,7 @@ export const tokens: TokenDef[] = [
   { r: /^'(?:\\.|[^'\\])*'/u, type: 'string' },
 
   // number  -12.34   0   42   (but NOT 007, 00, 01, -00)
-  { r: /^-?(?:0(?!\d)|[1-9]\d*)(?:\.\d+)?(?!\d)/u, type: 'number' },
+  { r: /^-?(?:0(?!\d)|[1-9]\d*)(?:\.\d+)?(?!\w)/u, type: 'number' },
 
   // boolean  true | false
   { r: /^(?:true|false)/u, type: 'boolean' },

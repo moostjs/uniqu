@@ -29,6 +29,15 @@ describe('Lexer', () => {
     expect(tokens).toEqual([{ pos: 0, type: 'regex', value: '/^John/i' }])
   })
 
+  it('should tokenize hex strings (e.g. ObjectId) as words, not numbers', () => {
+    const tokens = lex('taskId=69aca32e434504011457636c')
+    expect(tokens).toEqual([
+      { pos: 0, type: 'word', value: 'taskId' },
+      { pos: 6, type: 'op-eq', value: '=' },
+      { pos: 7, type: 'word', value: '69aca32e434504011457636c' },
+    ])
+  })
+
   it('should tokenize a list', () => {
     const tokens = lex('role{Admin,Editor}')
     expect(tokens).toEqual([
