@@ -1,8 +1,8 @@
-# Uniqu
-
 <p align="center">
-  <img src="./logo.svg" alt="uniqu" height="80">
+  <img src="./logo.svg" alt="uniqu" height="128">
 </p>
+
+# Uniqu
 
 Canonical query representation for filters, sorting, pagination, and projection — agnostic to transport layer.
 
@@ -10,21 +10,21 @@ Uniqu defines a single intermediate format for queries that can be **parsed from
 
 ## Packages
 
-| Package | Description |
-|---------|-------------|
+| Package                          | Description                                            |
+| -------------------------------- | ------------------------------------------------------ |
 | [`@uniqu/core`](./packages/core) | Query format types, generic tree walker, lazy insights |
-| [`@uniqu/url`](./packages/url) | URL query string parser producing the uniqu format |
+| [`@uniqu/url`](./packages/url)   | URL query string parser producing the uniqu format     |
 
 ## Quick Example
 
 ```ts
-import { parseUrl } from '@uniqu/url'
-import { walkFilter, computeInsights } from '@uniqu/core'
+import { parseUrl } from "@uniqu/url";
+import { walkFilter, computeInsights } from "@uniqu/core";
 
 // Parse a URL query string
 const { filter, controls, insights } = parseUrl(
-  'age>=18&status!=DELETED&name~=/^Jo/i&$select=name,email&$limit=20'
-)
+  "age>=18&status!=DELETED&name~=/^Jo/i&$select=name,email&$limit=20",
+);
 
 // filter   → { age: { $gte: 18 }, status: { $ne: 'DELETED' }, name: { $regex: '/^Jo/i' } }
 // controls → { $select: ['name', 'email'], $limit: 20 }
@@ -33,10 +33,10 @@ const { filter, controls, insights } = parseUrl(
 // Walk the filter tree with a custom visitor
 const sql = walkFilter(filter, {
   comparison: (field, op, value) => `${field} ${op} ${JSON.stringify(value)}`,
-  and: (children) => children.join(' AND '),
-  or: (children) => `(${children.join(' OR ')})`,
+  and: (children) => children.join(" AND "),
+  or: (children) => `(${children.join(" OR ")})`,
   not: (child) => `NOT (${child})`,
-})
+});
 ```
 
 ## Architecture
