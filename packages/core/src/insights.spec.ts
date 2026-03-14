@@ -282,8 +282,8 @@ describe('computeInsights', () => {
     const insights = computeInsights({}, controls)
 
     expect(insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
-    expect(insights.get('amount')).toEqual(new Set(['sum']))
-    expect(insights.get('total')).toEqual(new Set(['$order']))
+    expect(insights.get('amount')).toEqual(new Set(['sum', '$order']))
+    expect(insights.has('total')).toBe(false)
   })
 })
 

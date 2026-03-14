@@ -711,9 +711,9 @@ describe('parseUrl – aggregate functions in $select', () => {
     expect(r.controls.$groupBy).toEqual(['currency'])
     expect(r.controls.$sort).toEqual({ total: -1 })
     expect(r.controls.$limit).toBe(10)
-    expect(r.insights.get('amount')).toEqual(new Set(['sum']))
+    expect(r.insights.get('amount')).toEqual(new Set(['sum', '$order']))
     expect(r.insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
-    expect(r.insights.get('total')).toEqual(new Set(['$order']))
+    expect(r.insights.has('total')).toBe(false)
   })
 
   it('aggregates inside $with sub-query', () => {
@@ -844,8 +844,27 @@ describe('parseUrl – $having', () => {
     expect(r.controls.$having).toEqual({ total: { $gt: 1000 } })
     expect(r.controls.$groupBy).toEqual(['currency'])
     expect(r.controls.$sort).toEqual({ total: -1 })
-    expect(r.insights.get('total')).toEqual(new Set(['$having', '$order']))
+    expect(r.insights.get('total')).toEqual(new Set(['$having']))
+    expect(r.insights.get('amount')).toEqual(new Set(['sum', '$order']))
     expect(r.insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
+  })
+
+  it('$sort by aggregate alias resolves insight to real field', () => {
+    const r = parseUrl('$select=category,sum(amount):total&$sort=total')
+    expect(r.insights.get('amount')).toEqual(new Set(['sum', '$order']))
+    expect(r.insights.has('total')).toBe(false)
+  })
+
+  it('$sort by aggregate alias (descending) resolves insight to real field', () => {
+    const r = parseUrl('$select=sum(amount):total&$sort=-total')
+    expect(r.insights.get('amount')).toEqual(new Set(['sum', '$order']))
+    expect(r.insights.has('total')).toBe(false)
+  })
+
+  it('$sort by non-alias field keeps field name in insight', () => {
+    const r = parseUrl('$select=sum(amount):total&$sort=-createdAt')
+    expect(r.insights.get('createdAt')).toEqual(new Set(['$order']))
+    expect(r.insights.get('amount')).toEqual(new Set(['sum']))
   })
 
   it('$having inside $with sub-query', () => {

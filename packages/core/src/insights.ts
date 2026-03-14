@@ -68,8 +68,17 @@ export function computeInsights(
     walkFilter(controls.$having, havingVisitor)
   }
   if (controls?.$sort) {
+    // Resolve sort-by-alias: build alias→field map from $select aggregates
+    let aliasToField: Map<string, string> | undefined
+    if (Array.isArray(controls.$select)) {
+      for (const entry of controls.$select) {
+        if (typeof entry !== 'string' && entry.$as) {
+          ;(aliasToField ??= new Map()).set(entry.$as, entry.$field)
+        }
+      }
+    }
     for (const field of Object.keys(controls.$sort)) {
-      capture(field, '$order')
+      capture(aliasToField?.get(field) ?? field, '$order')
     }
   }
   if (controls?.$with) {

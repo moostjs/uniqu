@@ -130,6 +130,8 @@ function handleControls(parts: string[]): {
 } {
   const controls = {} as UniqueryControls
   const controlInsights: Array<[string, InsightOp]> = []
+  // Map aggregate aliases to their underlying field names (e.g. "total" → "amount" for sum(amount):total)
+  const aliasToField = new Map<string, string>()
 
   for (const raw of parts) {
     const eqIdx = raw.indexOf('=')
@@ -187,6 +189,7 @@ function handleControls(parts: string[]): {
             const field = aggMatch[2]
             const alias = aggMatch[3] ?? (field === '*' ? `${fn}_star` : `${fn}_${field}`)
             arr.push({ $fn: fn, $field: field, $as: alias })
+            aliasToField.set(alias, field)
             controlInsights.push([field, fn])
           }
           controls.$select = arr
@@ -265,6 +268,17 @@ function handleControls(parts: string[]): {
 
       default:
         ;(controls as Record<string, unknown>)[key] = value
+    }
+  }
+
+  // Resolve sort insights that reference aggregate aliases back to real field names
+  if (aliasToField.size) {
+    for (let i = 0; i < controlInsights.length; i++) {
+      const [field, op] = controlInsights[i]
+      if (op === '$order') {
+        const real = aliasToField.get(field)
+        if (real) controlInsights[i] = [real, op]
+      }
     }
   }
 
