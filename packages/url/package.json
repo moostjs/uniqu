@@ -1,6 +1,6 @@
 {
   "name": "@uniqu/url",
-  "version": "0.0.6",
+  "version": "0.1.0",
   "description": "URL query string parser producing the Uniqu canonical query format",
   "license": "MIT",
   "author": "Artem Maltsev",
@@ -30,8 +30,16 @@
     "./package.json": "./package.json"
   },
   "build": [
-    { "entries": ["src/index.ts"] },
-    { "entries": ["src/builder.ts"] }
+    {
+      "entries": [
+        "src/index.ts"
+      ]
+    },
+    {
+      "entries": [
+        "src/builder.ts"
+      ]
+    }
   ],
   "files": [
     "dist"
