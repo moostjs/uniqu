@@ -83,6 +83,7 @@ A `FilterExpr` is either a **comparison node** (leaf) or a **logical node** (bra
 | `$count` | `boolean` | Request total count |
 | `$select` | `SelectExpr<T>` | Field projection — array of strings/aggregates for inclusion, object for exclusion/mixed |
 | `$groupBy` | `(keyof T & string)[]` | Fields to group by for aggregate queries |
+| `$having` | `FilterExpr` | Post-aggregation filter on aliases and dimension fields |
 | `$with` | `(WithRelation \| string)[]` | Relations to populate alongside the primary query |
 | `$<custom>` | `unknown` | Arbitrary pass-through keywords |
 
@@ -163,6 +164,36 @@ interface AggregateExpr {
 ```
 
 Known functions are `sum`, `count`, `avg`, `min`, `max` (`AggregateFn`), but `$fn` accepts any string for extensibility — consumers validate and execute supported functions.
+
+#### Post-Aggregation Filter (`$having`)
+
+`$having` filters groups after aggregation — the equivalent of SQL `HAVING`. It operates on aggregate result aliases and dimension fields:
+
+```ts
+const query: Uniquery = {
+  filter: { status: 'active' },
+  controls: {
+    $select: [
+      'currency',
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+    ],
+    $groupBy: ['currency'],
+    $having: { total: { $gt: 1000 } },
+    $sort: { total: -1 },
+  },
+}
+```
+
+`$having` accepts a full `FilterExpr` — logical operators (`$and`, `$or`, `$not`) and all comparison operators are supported. It is untyped (`FilterExpr` without a generic) because its fields are aggregate aliases that don't exist on the entity type `T`.
+
+Insights track `$having` fields with the `'$having'` op:
+
+```ts
+// insights for the query above:
+// 'total'    => Set { '$having', '$order' }
+// 'currency' => Set { '$select', '$groupBy' }
+// 'amount'   => Set { 'sum' }
+```
 
 Insights track aggregate usage with bare function names (not `$`-prefixed), making it easy to distinguish controls from aggregates:
 
@@ -341,13 +372,17 @@ const insights = getInsights(query)
 | `ComparisonNode<T>` | Leaf node — keys constrained to `keyof T` when typed |
 | `LogicalNode<T>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — variants are mutually exclusive via `never` |
 | `AggregateFn` | `'sum' \| 'count' \| 'avg' \| 'min' \| 'max'` |
-| `AggregateExpr` | `{ $fn, $field, $as? }` — aggregate function call in `$select` |
+| `AggregateExpr<Fn, Field, Alias>` | `{ $fn, $field, $as? }` — aggregate function call in `$select`. Generic params preserve literal types for result inference |
 | `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
-| `UniqueryControls<T>` | Pagination, sorting, projection, grouping — `$select`/`$sort`/`$groupBy` constrained to `keyof T` when typed |
+| `UniqueryControls<T>` | Pagination, sorting, projection, grouping, `$having` — `$select`/`$sort`/`$groupBy` constrained to `keyof T` when typed |
 | `Uniquery<T>` | `{ name?, filter, controls, insights? }` — root query (no name) or nested relation (with name) |
 | `TypedWithRelation<Nav>` | Typed `$with` entry — `keyof Nav & string` or object with typed filter/controls |
 | `WithRelation` | Untyped `$with` relation with `{ name: string, filter?, controls?, insights? }` |
-| `InsightOp` | `ComparisonOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| AggregateFn \| string` |
+| `AggregateControls<T, D, M>` | Typed aggregate controls — `$groupBy` required, `$with` forbidden, `$select` constrained to dimensions + aggregates |
+| `AggregateQuery<T, D, M>` | Typed aggregate query — `{ filter?, controls, insights? }` with dimension/measure constraints |
+| `AggregateResult<T, Select>` | Infer result row type from `$select` — dimensions preserve original types, aggregates → `number` (min/max preserve field type) |
+| `ResolveAlias<A>` | Resolve the output alias of an `AggregateExpr` — uses `$as` if provided, otherwise `{fn}_{field}` |
+| `InsightOp` | `ComparisonOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| '$having' \| AggregateFn \| string` |
 | `UniqueryInsights` | `Map<string, Set<InsightOp>>` |
 
 ### Functions

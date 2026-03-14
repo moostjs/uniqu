@@ -152,6 +152,7 @@ Control keywords start with `$` and are separated from filter expressions:
 | `$skip` | — | `$skip=40` | `{ $skip: 40 }` |
 | `$count` | — | `$count` | `{ $count: true }` |
 | `$groupBy` | — | `$groupBy=currency,region` | `{ $groupBy: ['currency', 'region'] }` |
+| `$having` | — | `$having=total>1000` | `{ $having: { total: { $gt: 1000 } } }` |
 | `$with` | — | `$with=posts,author` | `{ $with: [{ name: 'posts', filter: {}, controls: {} }, ...] }` |
 | `$<custom>` | — | `$search=term` | `{ $search: 'term' }` |
 
@@ -219,6 +220,31 @@ Aggregates and `$groupBy` work inside `$with` sub-queries too:
 ```
 $with=orders($select=sum(total):revenue&$groupBy=status)
 ```
+
+### Post-Aggregation Filter (`$having`)
+
+`$having` filters groups after aggregation (SQL `HAVING`). It accepts the same filter expression syntax as the main query:
+
+```
+$having=total>1000                          → { $having: { total: { $gt: 1000 } } }
+$having=total>1000&$having=count_star>=5    → { $having: { $and: [...] } }   (AND-merged)
+$having=total>1000^avg_price<50             → { $having: { $or: [...] } }    (OR via ^)
+$having=!(total<100)                        → { $having: { $not: {...} } }   (NOT via !())
+```
+
+For multi-condition `$having` with AND, either use multiple `$having` params (AND-merged automatically) or wrap in parentheses:
+
+```
+$having=(total>1000&count_star>=5)
+```
+
+`$having` works inside `$with` sub-queries:
+
+```
+$with=orders($select=sum(total):revenue&$groupBy=status&$having=revenue>500)
+```
+
+Insights track `$having` fields with the `'$having'` op.
 
 ### Relation Loading (`$with`)
 
@@ -432,7 +458,7 @@ Accepts a `Uniquery` object and returns a URL query string (without leading `?`)
 
 All features are supported:
 - Filter expressions (comparisons, `$and`/`$or`/`$not`, `$in`/`$nin`, `$exists`, `$regex`)
-- Controls (`$select`, `$sort`, `$limit`, `$skip`, `$count`, `$groupBy`, `$with`)
+- Controls (`$select`, `$sort`, `$limit`, `$skip`, `$count`, `$groupBy`, `$having`, `$with`)
 - Aggregates in `$select` (`sum(amount):total`)
 - Nested `$with` sub-queries
 - Pass-through custom `$`-prefixed controls

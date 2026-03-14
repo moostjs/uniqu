@@ -109,6 +109,15 @@ const { controls, insights } = parseUrl(
 
 Aggregate functions (`sum`, `count`, `avg`, `min`, `max`) appear as `AggregateExpr` objects in `$select`. The `$fn` field accepts any string for extensibility — consumers validate supported functions.
 
+Use `$having` to filter groups after aggregation (SQL `HAVING`):
+
+```ts
+const { controls } = parseUrl(
+  "$select=sum(amount):total,currency&$groupBy=currency&$having=total>1000&$sort=-total",
+);
+// controls.$having → { total: { $gt: 1000 } }
+```
+
 ## URL Builder
 
 Build URL query strings from `Uniquery` objects — the inverse of `parseUrl`. Available as a separate entry point for optimal bundle size in UI apps:
