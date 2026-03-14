@@ -22,8 +22,17 @@
       "import": "./dist/index.mjs",
       "require": "./dist/index.cjs"
     },
+    "./builder": {
+      "types": "./dist/builder.d.ts",
+      "import": "./dist/builder.mjs",
+      "require": "./dist/builder.cjs"
+    },
     "./package.json": "./package.json"
   },
+  "build": [
+    { "entries": ["src/index.ts"] },
+    { "entries": ["src/builder.ts"] }
+  ],
   "files": [
     "dist"
   ],

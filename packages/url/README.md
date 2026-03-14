@@ -4,7 +4,7 @@
   <img src="../../logo.svg" alt="uniqu" height="80">
 </p>
 
-URL query string parser that produces the [Uniqu](../../README.md) canonical query format. Human-readable URL syntax with full filter expressions, sorting, pagination, and projection.
+URL query string parser and builder for the [Uniqu](../../README.md) canonical query format. Human-readable URL syntax with full filter expressions, sorting, pagination, projection, and aggregation.
 
 ## Install
 
@@ -151,10 +151,74 @@ Control keywords start with `$` and are separated from filter expressions:
 | `$limit` | `$top` | `$limit=20` | `{ $limit: 20 }` |
 | `$skip` | — | `$skip=40` | `{ $skip: 40 }` |
 | `$count` | — | `$count` | `{ $count: true }` |
+| `$groupBy` | — | `$groupBy=currency,region` | `{ $groupBy: ['currency', 'region'] }` |
 | `$with` | — | `$with=posts,author` | `{ $with: [{ name: 'posts', filter: {}, controls: {} }, ...] }` |
 | `$<custom>` | — | `$search=term` | `{ $search: 'term' }` |
 
 Prefix a field with `-` in `$select` to exclude it. When any exclusion is present, `$select` produces an object (`{ name: 1, password: 0 }`); otherwise it produces an array (`['name', 'email']`). Prefix with `-` in `$order` for descending sort.
+
+### Aggregate Functions in `$select`
+
+`$select` supports aggregate function calls using `fn(field)` syntax. An optional alias can be specified with `:alias`:
+
+```
+$select=sum(amount)                → [{ $fn: 'sum', $field: 'amount', $as: 'sum_amount' }]
+$select=sum(amount):total          → [{ $fn: 'sum', $field: 'amount', $as: 'total' }]
+$select=count(*)                   → [{ $fn: 'count', $field: '*', $as: 'count_star' }]
+$select=sum(amount),currency       → [{ $fn: 'sum', $field: 'amount', $as: 'sum_amount' }, 'currency']
+```
+
+When no alias is given, one is auto-generated as `{fn}_{field}` (with `*` becoming `star`).
+
+Supported functions: `sum`, `count`, `avg`, `min`, `max`, plus any custom function name — consumers validate supported functions.
+
+When aggregates are present, `$select` always uses the array form (even if `-` prefixed fields are mixed in).
+
+### Grouping (`$groupBy`)
+
+`$groupBy` declares which fields to group by. Comma-separated:
+
+```
+$groupBy=currency           → ['currency']
+$groupBy=currency,region    → ['currency', 'region']
+```
+
+#### Aggregation Example
+
+```
+$select=sum(amount):total,count(*),currency&$groupBy=currency&$sort=-total&$limit=10
+```
+
+Produces:
+
+```ts
+{
+  controls: {
+    $select: [
+      'currency',
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+      { $fn: 'count', $field: '*', $as: 'count_star' },
+    ],
+    $groupBy: ['currency'],
+    $sort: { total: -1 },
+    $limit: 10,
+  },
+  insights: Map {
+    'amount'   => Set { 'sum' },
+    '*'        => Set { 'count' },
+    'currency' => Set { '$select', '$groupBy' },
+    'total'    => Set { '$order' },
+  },
+}
+```
+
+Insights track aggregate functions with bare names (`'sum'`, `'count'`), distinct from `$`-prefixed control ops (`'$select'`, `'$groupBy'`).
+
+Aggregates and `$groupBy` work inside `$with` sub-queries too:
+
+```
+$with=orders($select=sum(total):revenue&$groupBy=status)
+```
 
 ### Relation Loading (`$with`)
 
@@ -279,7 +343,7 @@ Uniqu parses and types the `$with` declaration. The consumer (e.g. a database ad
 
 ## Insights
 
-Insights are computed **eagerly** during URL parsing — a `Map<string, Set<InsightOp>>` recording which fields are used and with which operators. This includes both filter operators and control usage (`$select`, `$order`).
+Insights are computed **eagerly** during URL parsing — a `Map<string, Set<InsightOp>>` recording which fields are used and with which operators. This includes filter operators, control usage (`$select`, `$order`, `$groupBy`), and aggregate functions (`sum`, `avg`, etc. — bare names without `$` prefix).
 
 For queries constructed as JSON objects (not parsed from URL), use `computeInsights()` from `@uniqu/core` for **lazy** computation.
 
@@ -340,11 +404,75 @@ Produces:
 }
 ```
 
+## URL Builder
+
+Build URL query strings from `Uniquery` objects — the inverse of `parseUrl`. Available as a separate entry point for optimal bundle size:
+
+```ts
+import { buildUrl } from '@uniqu/url/builder'
+```
+
+### Usage
+
+```ts
+const url = buildUrl({
+  filter: { status: 'active', age: { $gte: 18 } },
+  controls: {
+    $select: ['name', 'email'],
+    $sort: { createdAt: -1 },
+    $limit: 20,
+  },
+})
+// → "status=active&age>=18&$select=name,email&$sort=-createdAt&$limit=20"
+```
+
+### `buildUrl(query: Uniquery): string`
+
+Accepts a `Uniquery` object and returns a URL query string (without leading `?`).
+
+All features are supported:
+- Filter expressions (comparisons, `$and`/`$or`/`$not`, `$in`/`$nin`, `$exists`, `$regex`)
+- Controls (`$select`, `$sort`, `$limit`, `$skip`, `$count`, `$groupBy`, `$with`)
+- Aggregates in `$select` (`sum(amount):total`)
+- Nested `$with` sub-queries
+- Pass-through custom `$`-prefixed controls
+
+### Value serialization
+
+- Strings that look like numbers, booleans, or `null` are automatically quoted (`'25'`, `'true'`, `'null'`)
+- Strings with special characters (`&`, `^`, `=`, spaces, quotes) are quoted and escaped
+- Leading-zero numbers (`007`) stay as bare strings
+- `Date` values are serialized as quoted ISO strings
+- `RegExp` values are serialized as `/pattern/flags`
+
+### Round-tripping
+
+`buildUrl` produces output compatible with `parseUrl`:
+
+```ts
+import { parseUrl } from '@uniqu/url'
+import { buildUrl } from '@uniqu/url/builder'
+
+const query = { filter: { age: { $gte: 18 } }, controls: { $limit: 10 } }
+const url = buildUrl(query)
+const parsed = parseUrl(url)
+// parsed.filter → { age: { $gte: 18 } }
+// parsed.controls.$limit → 10
+```
+
+### Bundle optimization
+
+The builder is a separate entry point (`@uniqu/url/builder`) so that apps using only `buildUrl` don't pull in the lexer and parser code, and vice versa.
+
 ## API Reference
 
 ### `parseUrl(raw: string): UrlQuery`
 
 Parse a URL query string (without the leading `?`) into the uniqu format.
+
+### `buildUrl(query: Uniquery): string`
+
+Build a URL query string from a `Uniquery` object. Imported from `@uniqu/url/builder`.
 
 ### `UrlQuery`
 

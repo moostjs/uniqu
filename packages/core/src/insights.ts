@@ -1,4 +1,5 @@
 import type {
+  AggregateExpr,
   FilterExpr,
   UniqueryControls,
   UniqueryInsights,
@@ -39,13 +40,22 @@ export function computeInsights(
 
   if (controls?.$select) {
     if (Array.isArray(controls.$select)) {
-      for (const field of controls.$select) {
-        capture(field, '$select')
+      for (const entry of controls.$select) {
+        if (typeof entry === 'string') {
+          capture(entry, '$select')
+        } else {
+          capture((entry as AggregateExpr).$field, (entry as AggregateExpr).$fn)
+        }
       }
     } else {
       for (const field of Object.keys(controls.$select)) {
         capture(field, '$select')
       }
+    }
+  }
+  if (controls?.$groupBy) {
+    for (const field of controls.$groupBy) {
+      capture(field, '$groupBy')
     }
   }
   if (controls?.$sort) {
@@ -54,12 +64,16 @@ export function computeInsights(
     }
   }
   if (controls?.$with) {
-    for (const rel of controls.$with) {
-      capture(rel.name, '$with')
-      const nested = rel.insights ?? computeInsights(rel.filter, rel.controls)
-      if (nested.size) rel.insights = nested
+    for (const entry of controls.$with) {
+      if (typeof entry === 'string') {
+        capture(entry, '$with')
+        continue
+      }
+      capture(entry.name, '$with')
+      const nested = entry.insights ?? computeInsights(entry.filter, entry.controls)
+      if (nested.size) entry.insights = nested
       for (const [field, ops] of nested) {
-        const prefixed = `${rel.name}.${field}`
+        const prefixed = `${entry.name}.${field}`
         for (const op of ops) {
           capture(prefixed, op)
         }

@@ -35,16 +35,20 @@ export function walkFilter<R>(expr: FilterExpr | undefined, visitor: FilterVisit
   // Guard with !== undefined to handle malformed objects (e.g. from JSON.parse)
   // where a key exists but has value undefined/null due to the `never` typed fields.
   if ('$and' in expr && expr.$and !== undefined) {
-    const children = (expr as { $and: FilterExpr[] }).$and.map((child) =>
-      walkFilter(child, visitor),
-    )
+    const andArr = (expr as { $and: FilterExpr[] }).$and
+    const children: R[] = []
+    for (const child of andArr) {
+      children.push(walkFilter(child, visitor) as R)
+    }
     return visitor.and(children)
   }
 
   if ('$or' in expr && expr.$or !== undefined) {
-    const children = (expr as { $or: FilterExpr[] }).$or.map((child) =>
-      walkFilter(child, visitor),
-    )
+    const orArr = (expr as { $or: FilterExpr[] }).$or
+    const children: R[] = []
+    for (const child of orArr) {
+      children.push(walkFilter(child, visitor) as R)
+    }
     return visitor.or(children)
   }
 

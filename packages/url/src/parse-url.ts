@@ -1,4 +1,5 @@
 import type {
+  AggregateExpr,
   FilterExpr,
   WithRelation,
   UniqueryControls,
@@ -123,14 +124,16 @@ function handleControls(parts: string[]): {
   const controlInsights: Array<[string, InsightOp]> = []
 
   for (const raw of parts) {
-    const [key, ...rest] = raw.split('=')
-    const value = rest.join('=')
+    const eqIdx = raw.indexOf('=')
+    const key = eqIdx === -1 ? raw : raw.slice(0, eqIdx)
+    const value = eqIdx === -1 ? '' : raw.slice(eqIdx + 1)
 
     switch (key) {
       case '$with': {
         if (!value) break
         controls.$with ??= []
-        const seen = new Set(controls.$with.map((r) => r.name))
+        const seen = new Set<string>()
+        for (const r of controls.$with) seen.add(typeof r === 'string' ? r : r.name)
         for (const seg of splitTopLevel(value, ',')) {
           const rel = parseWithSegment(seg)
           if (!rel || seen.has(rel.name)) continue
@@ -150,32 +153,49 @@ function handleControls(parts: string[]): {
       }
 
       case '$select': {
+        const items = value.split(',')
+        // Quick scan: determine form (array vs object)
         let hasExclusion = false
-        const fields: Array<{ name: string; include: boolean }> = []
-        value.split(',').forEach((f) => {
-          if (!f) return
-          if (f.startsWith('-')) {
-            hasExclusion = true
-            fields.push({ name: f.slice(1), include: false })
-          } else {
-            fields.push({ name: f, include: true })
-          }
-        })
+        let hasAggregate = false
+        for (const f of items) {
+          if (!f) continue
+          if (f.startsWith('-')) hasExclusion = true
+          else if (/^\w+\(/.test(f)) hasAggregate = true
+        }
 
-        if (hasExclusion) {
-          const obj: Record<string, 0 | 1> = (controls.$select as Record<string, 0 | 1>) ?? {}
-          for (const { name, include } of fields) {
-            obj[name] = include ? 1 : 0
-            controlInsights.push([name, '$select'])
+        if (hasAggregate || !hasExclusion) {
+          const arr: (string | AggregateExpr)[] = Array.isArray(controls.$select) ? controls.$select : []
+          // Plain fields first, then aggregates (stable ordering)
+          for (const f of items) {
+            if (!f || /^\w+\(/.test(f)) continue
+            arr.push(f)
+            controlInsights.push([f, '$select'])
           }
-          controls.$select = obj
-        } else {
-          const arr: string[] = Array.isArray(controls.$select) ? controls.$select : []
-          for (const { name } of fields) {
-            arr.push(name)
-            controlInsights.push([name, '$select'])
+          for (const f of items) {
+            if (!f) continue
+            const aggMatch = /^(\w+)\((\*|[\w.]+)\)(?::([\w.]+))?$/.exec(f)
+            if (!aggMatch) continue
+            const fn = aggMatch[1]
+            const field = aggMatch[2]
+            const alias = aggMatch[3] ?? (field === '*' ? `${fn}_star` : `${fn}_${field}`)
+            arr.push({ $fn: fn, $field: field, $as: alias })
+            controlInsights.push([field, fn])
           }
           controls.$select = arr
+        } else {
+          const obj: Record<string, 0 | 1> = (controls.$select as Record<string, 0 | 1>) ?? {}
+          for (const f of items) {
+            if (!f) continue
+            if (f.startsWith('-')) {
+              const name = f.slice(1)
+              obj[name] = 0
+              controlInsights.push([name, '$select'])
+            } else {
+              obj[f] = 1
+              controlInsights.push([f, '$select'])
+            }
+          }
+          controls.$select = obj
         }
         break
       }
@@ -183,12 +203,28 @@ function handleControls(parts: string[]): {
       case '$sort':
       case '$order': {
         controls.$sort ??= {}
-        value.split(',').forEach((f) => {
-          if (!f) return
-          controlInsights.push([f.replace(/^-/, ''), '$order'])
-          if (f.startsWith('-')) controls.$sort![f.slice(1)] = -1
-          else controls.$sort![f] = 1
-        })
+        for (const f of value.split(',')) {
+          if (!f) continue
+          if (f.startsWith('-')) {
+            const name = f.slice(1)
+            controls.$sort![name] = -1
+            controlInsights.push([name, '$order'])
+          } else {
+            controls.$sort![f] = 1
+            controlInsights.push([f, '$order'])
+          }
+        }
+        break
+      }
+
+      case '$groupBy': {
+        if (!value) break
+        controls.$groupBy ??= []
+        for (const f of value.split(',')) {
+          if (!f) continue
+          controls.$groupBy!.push(f)
+          controlInsights.push([f, '$groupBy'])
+        }
         break
       }
 

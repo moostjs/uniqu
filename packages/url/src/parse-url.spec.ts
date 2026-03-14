@@ -162,6 +162,16 @@ describe('parseUrl – literal typing edge-cases', () => {
     expect((r.filter as Record<string, unknown>).note).toBe('null')
   })
 
+  it('escaped quote inside quoted string', () => {
+    const r = parseUrl("name='John\\'s'")
+    expect((r.filter as Record<string, unknown>).name).toBe("John's")
+  })
+
+  it('escaped backslash inside quoted string', () => {
+    const r = parseUrl("path='a\\\\b'")
+    expect((r.filter as Record<string, unknown>).path).toBe('a\\b')
+  })
+
   it('leading-zero number treated as string', () => {
     const r = parseUrl('code=007')
     expect((r.filter as Record<string, unknown>).code).toBe('007')
@@ -613,5 +623,169 @@ describe('parseUrl – control words', () => {
     expect(r.controls).toEqual({
       $search: 'test',
     })
+  })
+})
+
+describe('parseUrl – $groupBy', () => {
+  it('single field', () => {
+    const r = parseUrl('$groupBy=currency')
+    expect(r.controls.$groupBy).toEqual(['currency'])
+    expect(r.insights.get('currency')).toEqual(new Set(['$groupBy']))
+  })
+
+  it('multiple fields', () => {
+    const r = parseUrl('$groupBy=currency,region')
+    expect(r.controls.$groupBy).toEqual(['currency', 'region'])
+    expect(r.insights.get('currency')).toEqual(new Set(['$groupBy']))
+    expect(r.insights.get('region')).toEqual(new Set(['$groupBy']))
+  })
+
+  it('empty value is ignored', () => {
+    const r = parseUrl('$groupBy=')
+    expect(r.controls.$groupBy).toBeUndefined()
+  })
+})
+
+describe('parseUrl – aggregate functions in $select', () => {
+  it('single aggregate', () => {
+    const r = parseUrl('$select=sum(amount)')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'amount', $as: 'sum_amount' },
+    ])
+    expect(r.insights.get('amount')).toEqual(new Set(['sum']))
+  })
+
+  it('aggregate with explicit alias', () => {
+    const r = parseUrl('$select=sum(amount):total')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+    ])
+  })
+
+  it('count(*)', () => {
+    const r = parseUrl('$select=count(*)')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'count', $field: '*', $as: 'count_star' },
+    ])
+  })
+
+  it('mixed plain fields and aggregates', () => {
+    const r = parseUrl('$select=sum(amount),currency,count(*)')
+    expect(r.controls.$select).toEqual([
+      'currency',
+      { $fn: 'sum', $field: 'amount', $as: 'sum_amount' },
+      { $fn: 'count', $field: '*', $as: 'count_star' },
+    ])
+    expect(r.insights.get('currency')).toEqual(new Set(['$select']))
+    expect(r.insights.get('amount')).toEqual(new Set(['sum']))
+    expect(r.insights.get('*')).toEqual(new Set(['count']))
+  })
+
+  it('multiple aggregates with aliases', () => {
+    const r = parseUrl('$select=sum(amount):total,avg(price):avgPrice,min(age)')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+      { $fn: 'avg', $field: 'price', $as: 'avgPrice' },
+      { $fn: 'min', $field: 'age', $as: 'min_age' },
+    ])
+  })
+
+  it('aggregates force array form even with exclusion prefix', () => {
+    const r = parseUrl('$select=sum(amount),-password')
+    expect(Array.isArray(r.controls.$select)).toBe(true)
+  })
+
+  it('dot-notation field in aggregate', () => {
+    const r = parseUrl('$select=sum(order.total)')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'order.total', $as: 'sum_order.total' },
+    ])
+  })
+
+  it('full aggregation query with groupBy, sort, limit', () => {
+    const r = parseUrl('$select=sum(amount):total,currency&$groupBy=currency&$sort=-total&$limit=10')
+    expect(r.controls.$select).toEqual([
+      'currency',
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+    ])
+    expect(r.controls.$groupBy).toEqual(['currency'])
+    expect(r.controls.$sort).toEqual({ total: -1 })
+    expect(r.controls.$limit).toBe(10)
+    expect(r.insights.get('amount')).toEqual(new Set(['sum']))
+    expect(r.insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
+    expect(r.insights.get('total')).toEqual(new Set(['$order']))
+  })
+
+  it('aggregates inside $with sub-query', () => {
+    const r = parseUrl('$with=orders($select=sum(total):revenue&$groupBy=status)')
+    const orders = r.controls.$with![0] as { name: string; controls: Record<string, unknown> }
+    expect(orders.name).toBe('orders')
+    expect(orders.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'total', $as: 'revenue' },
+    ])
+    expect(orders.controls.$groupBy).toEqual(['status'])
+  })
+
+  it('all five aggregate functions', () => {
+    const r = parseUrl('$select=sum(a),count(b),avg(c),min(d),max(e)')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'a', $as: 'sum_a' },
+      { $fn: 'count', $field: 'b', $as: 'count_b' },
+      { $fn: 'avg', $field: 'c', $as: 'avg_c' },
+      { $fn: 'min', $field: 'd', $as: 'min_d' },
+      { $fn: 'max', $field: 'e', $as: 'max_e' },
+    ])
+  })
+
+  it('custom (unknown) aggregate function', () => {
+    const r = parseUrl('$select=stddev(score):sd')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'stddev', $field: 'score', $as: 'sd' },
+    ])
+    expect(r.insights.get('score')).toEqual(new Set(['stddev']))
+  })
+
+  it('same field with multiple aggregates', () => {
+    const r = parseUrl('$select=sum(amount):total,avg(amount):mean')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+      { $fn: 'avg', $field: 'amount', $as: 'mean' },
+    ])
+    expect(r.insights.get('amount')).toEqual(new Set(['sum', 'avg']))
+  })
+
+  it('aggregate combined with filter', () => {
+    const r = parseUrl('status=active&$select=count(*):n&$groupBy=category')
+    expect(r.filter).toEqual({ status: 'active' })
+    expect(r.controls.$select).toEqual([
+      { $fn: 'count', $field: '*', $as: 'n' },
+    ])
+    expect(r.controls.$groupBy).toEqual(['category'])
+  })
+
+  it('plain word with parens that is not aggregate stays as string', () => {
+    // A word like "name" without parens is a plain field
+    const r = parseUrl('$select=name')
+    expect(r.controls.$select).toEqual(['name'])
+  })
+
+  it('$groupBy with dot-notation fields', () => {
+    const r = parseUrl('$groupBy=address.city,address.country')
+    expect(r.controls.$groupBy).toEqual(['address.city', 'address.country'])
+  })
+
+  it('aggregate insights bubble up from nested $with', () => {
+    const r = parseUrl('$with=orders($select=sum(amount):total&$groupBy=status)')
+    expect(r.insights.get('orders')).toEqual(new Set(['$with']))
+    expect(r.insights.get('orders.amount')).toEqual(new Set(['sum']))
+    expect(r.insights.get('orders.status')).toEqual(new Set(['$groupBy']))
+  })
+
+  it('percent-encoded aggregate syntax', () => {
+    // sum(amount):total percent-encoded
+    const r = parseUrl('$select=sum%28amount%29%3Atotal')
+    expect(r.controls.$select).toEqual([
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+    ])
   })
 })

@@ -230,7 +230,7 @@ export class Parser {
 }
 
 function unescapeString(str: string): string {
-  return str.replace(/(^'|'$)/gu, '')
+  return str.replace(/(^'|'$)/gu, '').replace(/\\(.)/gu, '$1')
 }
 
 /**
@@ -252,7 +252,7 @@ function mergeConjunction(nodes: FilterExpr[]): FilterExpr | null {
           ? ['$eq']
           : Object.keys(currentVal)
         const otherOps = isPrimitive(val)
-          ? new Set('$eq')
+          ? new Set(['$eq'])
           : new Set(Object.keys(val))
         const intersects: boolean = currentOps.some((op) => otherOps.has(op))
         if (intersects) {
@@ -265,7 +265,7 @@ function mergeConjunction(nodes: FilterExpr[]): FilterExpr | null {
               ? currentVal
               : currentVal[op as '$eq']
           }
-          for (const op of Array.from(otherOps)) {
+          for (const op of otherOps) {
             currentMerge[key][op as '$eq'] = isPrimitive(val)
               ? val
               : val[op as '$eq']

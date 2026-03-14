@@ -212,6 +212,48 @@ describe('computeInsights', () => {
     expect(insights.get('phone')).toEqual(new Set(['$exists']))
     expect(insights.get('deletedAt')).toEqual(new Set(['$exists']))
   })
+
+  it('captures $groupBy fields', () => {
+    const controls: UniqueryControls = {
+      $groupBy: ['currency', 'region'],
+    }
+    const insights = computeInsights({}, controls)
+
+    expect(insights.get('currency')).toEqual(new Set(['$groupBy']))
+    expect(insights.get('region')).toEqual(new Set(['$groupBy']))
+  })
+
+  it('captures aggregate functions in $select with bare fn names', () => {
+    const controls: UniqueryControls = {
+      $select: [
+        'currency',
+        { $fn: 'sum', $field: 'amount', $as: 'total' },
+        { $fn: 'avg', $field: 'amount' },
+        { $fn: 'count', $field: '*' },
+      ],
+    }
+    const insights = computeInsights({}, controls)
+
+    expect(insights.get('currency')).toEqual(new Set(['$select']))
+    expect(insights.get('amount')).toEqual(new Set(['sum', 'avg']))
+    expect(insights.get('*')).toEqual(new Set(['count']))
+  })
+
+  it('combines groupBy and aggregate insights', () => {
+    const controls: UniqueryControls = {
+      $select: [
+        'currency',
+        { $fn: 'sum', $field: 'amount', $as: 'total' },
+      ],
+      $groupBy: ['currency'],
+      $sort: { total: -1 },
+    }
+    const insights = computeInsights({}, controls)
+
+    expect(insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
+    expect(insights.get('amount')).toEqual(new Set(['sum']))
+    expect(insights.get('total')).toEqual(new Set(['$order']))
+  })
 })
 
 describe('getInsights', () => {

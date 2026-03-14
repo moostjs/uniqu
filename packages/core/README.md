@@ -81,13 +81,14 @@ A `FilterExpr` is either a **comparison node** (leaf) or a **logical node** (bra
 | `$skip` | `number` | Skip N results |
 | `$limit` | `number` | Limit to N results |
 | `$count` | `boolean` | Request total count |
-| `$select` | `string[] \| Record<string, 0 \| 1>` | Field projection — array for inclusion, object for exclusion/mixed |
-| `$with` | `WithRelation[]` | Relations to populate alongside the primary query |
+| `$select` | `SelectExpr<T>` | Field projection — array of strings/aggregates for inclusion, object for exclusion/mixed |
+| `$groupBy` | `(keyof T & string)[]` | Fields to group by for aggregate queries |
+| `$with` | `(WithRelation \| string)[]` | Relations to populate alongside the primary query |
 | `$<custom>` | `unknown` | Arbitrary pass-through keywords |
 
 ### Relation Loading (`$with`)
 
-`$with` declares which relations to populate alongside the primary query. Each relation is a full `Uniquery` sub-query (a `WithRelation`) with its own `name`, `filter`, `controls`, and `insights`:
+`$with` declares which relations to populate alongside the primary query. Each entry can be a **string** (relation name only) or a full **object** (a `WithRelation` sub-query with its own `filter`, `controls`, and `insights`):
 
 ```ts
 import type { Uniquery, WithRelation } from '@uniqu/core'
@@ -96,6 +97,9 @@ const query: Uniquery = {
   filter: { status: 'active' },
   controls: {
     $with: [
+      // String shorthand — just the relation name
+      'profile',
+      // Object form — full sub-query
       {
         name: 'posts',
         filter: { status: 'published' },
@@ -105,11 +109,10 @@ const query: Uniquery = {
           $select: ['title', 'body'],
           $with: [
             { name: 'comments', filter: {}, controls: { $limit: 10 } },
-            { name: 'author', filter: {}, controls: {} },
+            'author',
           ],
         },
       },
-      { name: 'profile', filter: {}, controls: {} },
     ],
   },
 }
@@ -121,13 +124,59 @@ const query: Uniquery = {
 type WithRelation = Uniquery & { name: string }
 ```
 
-The `Uniquery` type itself has an optional `name` — when present it is a nested relation, when absent it is the root query. This means every `$with` entry is a self-contained query with its own `filter`, `controls` (including `$sort`, `$skip`, `$limit`, `$select`, nested `$with`, and pass-through keywords), and optional `insights`. The structure is recursive to any depth.
+The `Uniquery` type itself has an optional `name` — when present it is a nested relation, when absent it is the root query. This means every `$with` object entry is a self-contained query with its own `filter`, `controls` (including `$sort`, `$skip`, `$limit`, `$select`, nested `$with`, and pass-through keywords), and optional `insights`. The structure is recursive to any depth.
+
+When a `Nav` generic is provided, string entries and `name` fields are constrained to `keyof Nav & string`. Without a generic, any string is accepted.
 
 Uniqu is a query parser, not an ORM. It records what was requested — the consumer (e.g. a database adapter) decides how to execute it (JOINs, subqueries, separate queries), validates relation names against its schema, and enforces depth/security limits.
 
+### Aggregation (`$groupBy` + `$select`)
+
+`$groupBy` declares grouping fields. Aggregate functions appear as `AggregateExpr` objects in the `$select` array alongside plain field names:
+
+```ts
+import type { Uniquery, AggregateExpr } from '@uniqu/core'
+
+const query: Uniquery = {
+  filter: { status: 'active' },
+  controls: {
+    $select: [
+      'currency',
+      { $fn: 'sum', $field: 'amount', $as: 'total' },
+      { $fn: 'count', $field: '*', $as: 'count' },
+    ],
+    $groupBy: ['currency'],
+    $sort: { total: -1 },
+    $limit: 10,
+  },
+}
+```
+
+`AggregateExpr` has three fields:
+
+```ts
+interface AggregateExpr {
+  $fn: AggregateFn | (string & {})  // 'sum' | 'count' | 'avg' | 'min' | 'max' | custom
+  $field: string                     // field name, or '*' for count(*)
+  $as?: string                       // optional alias for the result
+}
+```
+
+Known functions are `sum`, `count`, `avg`, `min`, `max` (`AggregateFn`), but `$fn` accepts any string for extensibility — consumers validate and execute supported functions.
+
+Insights track aggregate usage with bare function names (not `$`-prefixed), making it easy to distinguish controls from aggregates:
+
+```ts
+// insights for the query above:
+// 'currency' => Set { '$select', '$groupBy' }
+// 'amount'   => Set { 'sum' }
+// '*'        => Set { 'count' }
+// 'total'    => Set { '$order' }
+```
+
 ## Type-Safe Filters
 
-`FilterExpr<T>` accepts a generic entity type for compile-time field and value checking. Dot-notation paths are always allowed for nested access:
+`FilterExpr<T>` accepts a generic entity type for compile-time field and value checking:
 
 ```ts
 interface User {
@@ -140,12 +189,12 @@ const filter: FilterExpr<User> = {
   name: 'John',              // string — ok
   age: { $gte: 18 },         // number — ok
   active: true,              // boolean — ok
-  'address.city': 'NYC',     // dot-notation — always allowed
   // age: { $gte: 'old' },   // type error: string not assignable to number
+  // foo: 'bar',             // type error: 'foo' is not a key of User
 }
 ```
 
-Without a generic argument, `FilterExpr` accepts any string keys with any values (untyped mode).
+When typed, only keys of `T` are allowed — no arbitrary string keys. Without a generic argument, `FilterExpr` accepts any string keys with any values (untyped mode).
 
 ### Type-Safe Controls
 
@@ -289,12 +338,16 @@ const insights = getInsights(query)
 | `FieldOps` | Untyped operator map (`FieldOpsFor<Primitive>`) |
 | `FieldValue` | `Primitive \| FieldOps` |
 | `FilterExpr<T>` | `ComparisonNode<T> \| LogicalNode<T>` |
-| `ComparisonNode<T>` | Leaf node with typed field comparisons |
+| `ComparisonNode<T>` | Leaf node — keys constrained to `keyof T` when typed |
 | `LogicalNode<T>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — variants are mutually exclusive via `never` |
-| `UniqueryControls<T>` | Pagination, sorting, projection — `$select`/`$sort` constrained to `keyof T` when typed |
+| `AggregateFn` | `'sum' \| 'count' \| 'avg' \| 'min' \| 'max'` |
+| `AggregateExpr` | `{ $fn, $field, $as? }` — aggregate function call in `$select` |
+| `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
+| `UniqueryControls<T>` | Pagination, sorting, projection, grouping — `$select`/`$sort`/`$groupBy` constrained to `keyof T` when typed |
 | `Uniquery<T>` | `{ name?, filter, controls, insights? }` — root query (no name) or nested relation (with name) |
-| `WithRelation` | `Uniquery & { name: string }` — a `$with` relation with a required name |
-| `InsightOp` | `ComparisonOp \| '$select' \| '$order' \| '$with'` |
+| `TypedWithRelation<Nav>` | Typed `$with` entry — `keyof Nav & string` or object with typed filter/controls |
+| `WithRelation` | Untyped `$with` relation with `{ name: string, filter?, controls?, insights? }` |
+| `InsightOp` | `ComparisonOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| AggregateFn \| string` |
 | `UniqueryInsights` | `Map<string, Set<InsightOp>>` |
 
 ### Functions
