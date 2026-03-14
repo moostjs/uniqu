@@ -53,7 +53,7 @@ export function walkFilter<R>(expr: FilterExpr | undefined, visitor: FilterVisit
   }
 
   if ('$not' in expr && expr.$not !== undefined) {
-    const child = walkFilter((expr as { $not: FilterExpr }).$not, visitor)
+    const child = walkFilter((expr as { $not: FilterExpr }).$not, visitor) as R
     return visitor.not(child)
   }
 

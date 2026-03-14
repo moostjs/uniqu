@@ -17,6 +17,10 @@ export type {
   Uniquery,
   InsightOp,
   UniqueryInsights,
+  AggregateControls,
+  AggregateQuery,
+  AggregateResult,
+  ResolveAlias,
 } from './types'
 
 export { walkFilter, isPrimitive, type FilterVisitor } from './walk'

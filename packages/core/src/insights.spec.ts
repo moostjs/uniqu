@@ -239,6 +239,37 @@ describe('computeInsights', () => {
     expect(insights.get('*')).toEqual(new Set(['count']))
   })
 
+  it('captures $having fields', () => {
+    const controls: UniqueryControls = {
+      $groupBy: ['currency'],
+      $select: [
+        'currency',
+        { $fn: 'sum', $field: 'amount', $as: 'total' },
+      ],
+      $having: { total: { $gt: 1000 } },
+    }
+    const insights = computeInsights({}, controls)
+
+    expect(insights.get('total')).toEqual(new Set(['$having']))
+    expect(insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
+    expect(insights.get('amount')).toEqual(new Set(['sum']))
+  })
+
+  it('captures $having with multiple fields', () => {
+    const controls: UniqueryControls = {
+      $having: {
+        $and: [
+          { total: { $gt: 1000 } },
+          { count_star: { $gte: 5 } },
+        ],
+      },
+    }
+    const insights = computeInsights({}, controls)
+
+    expect(insights.get('total')).toEqual(new Set(['$having']))
+    expect(insights.get('count_star')).toEqual(new Set(['$having']))
+  })
+
   it('combines groupBy and aggregate insights', () => {
     const controls: UniqueryControls = {
       $select: [

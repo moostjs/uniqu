@@ -58,6 +58,15 @@ export function computeInsights(
       capture(field, '$groupBy')
     }
   }
+  if (controls?.$having) {
+    const havingVisitor: FilterVisitor<void> = {
+      comparison(field) { capture(field, '$having') },
+      and() {},
+      or() {},
+      not() {},
+    }
+    walkFilter(controls.$having, havingVisitor)
+  }
   if (controls?.$sort) {
     for (const field of Object.keys(controls.$sort)) {
       capture(field, '$order')

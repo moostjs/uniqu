@@ -1,6 +1,7 @@
 import type { Token, TokenType } from './tokens'
 import type {
   FilterExpr,
+  ComparisonNode,
   ComparisonOp,
   Primitive,
   InsightOp,
@@ -239,7 +240,7 @@ function unescapeString(str: string): string {
  */
 function mergeConjunction(nodes: FilterExpr[]): FilterExpr | null {
   const merged: FilterExpr[] = []
-  let currentMerge: FilterExpr = {}
+  let currentMerge: ComparisonNode = {}
   for (const node of nodes) {
     if ('$or' in node || '$and' in node || '$not' in node) {
       merged.push(node)
@@ -250,26 +251,23 @@ function mergeConjunction(nodes: FilterExpr[]): FilterExpr | null {
         const currentVal = currentMerge[key]
         const currentOps = isPrimitive(currentVal)
           ? ['$eq']
-          : Object.keys(currentVal)
+          : Object.keys(currentVal as object)
         const otherOps = isPrimitive(val)
           ? new Set(['$eq'])
-          : new Set(Object.keys(val))
+          : new Set(Object.keys(val as object))
         const intersects: boolean = currentOps.some((op) => otherOps.has(op))
         if (intersects) {
           merged.push(currentMerge)
           currentMerge = {}
         } else {
-          currentMerge[key] = {}
+          const m: Record<string, unknown> = {}
           for (const op of currentOps) {
-            currentMerge[key][op as '$eq'] = isPrimitive(currentVal)
-              ? currentVal
-              : currentVal[op as '$eq']
+            m[op] = isPrimitive(currentVal) ? currentVal : (currentVal as Record<string, unknown>)[op]
           }
           for (const op of otherOps) {
-            currentMerge[key][op as '$eq'] = isPrimitive(val)
-              ? val
-              : val[op as '$eq']
+            m[op] = isPrimitive(val) ? val : (val as Record<string, unknown>)[op]
           }
+          currentMerge[key] = m
         }
       } else {
         currentMerge[key] = val

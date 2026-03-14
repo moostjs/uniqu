@@ -52,10 +52,9 @@ export function parseUrl(raw: string): UrlQuery {
 
   if (exprParts.length) {
     const rawExpr = exprParts.join('&')
-    const tokens = lex(rawExpr)
-    parser = new Parser(tokens)
-    filter = parser.parseExpression()
-    parser.expectEof()
+    const parsed = parseFilterExpr(rawExpr)
+    parser = parsed.parser
+    filter = parsed.expr
   } else {
     parser = new Parser([])
   }
@@ -88,6 +87,15 @@ function splitTopLevel(str: string, sep: string): string[] {
 
   parts.push(str.slice(start))
   return parts
+}
+
+/** Lex + parse a raw filter expression string. */
+function parseFilterExpr(raw: string) {
+  const tokens = lex(raw)
+  const parser = new Parser(tokens)
+  const expr = parser.parseExpression()
+  parser.expectEof()
+  return { expr, parser }
 }
 
 /** Parse a single `$with` segment like `posts` or `posts($sort=-createdAt&status=active)`. */
@@ -224,6 +232,20 @@ function handleControls(parts: string[]): {
           if (!f) continue
           controls.$groupBy!.push(f)
           controlInsights.push([f, '$groupBy'])
+        }
+        break
+      }
+
+      case '$having': {
+        if (!value) break
+        const { expr, parser: hp } = parseFilterExpr(value)
+        if (controls.$having) {
+          controls.$having = { $and: [controls.$having, expr] }
+        } else {
+          controls.$having = expr
+        }
+        for (const [field] of hp.getInsights()) {
+          controlInsights.push([field, '$having'])
         }
         break
       }

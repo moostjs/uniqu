@@ -259,6 +259,55 @@ describe('buildUrl – aggregation', () => {
       '$select=currency,sum(amount):total,count(*):count&$groupBy=currency&$sort=-total&$limit=10',
     )
   })
+
+  it('$having single condition', () => {
+    const url = buildUrl({
+      controls: { $having: { total: { $gt: 1000 } } },
+    })
+    expect(url).toBe('$having=total>1000')
+  })
+
+  it('$having AND wraps in parens', () => {
+    const url = buildUrl({
+      controls: {
+        $having: {
+          $and: [
+            { total: { $gt: 1000 } },
+            { count_star: { $gte: 5 } },
+          ],
+        },
+      },
+    })
+    expect(url).toBe('$having=(total>1000&count_star>=5)')
+  })
+
+  it('$having OR does not wrap', () => {
+    const url = buildUrl({
+      controls: {
+        $having: {
+          $or: [
+            { total: { $gt: 1000 } },
+            { avg_price: { $lt: 50 } },
+          ],
+        },
+      },
+    })
+    expect(url).toBe('$having=total>1000^avg_price<50')
+  })
+
+  it('$having with full aggregation controls', () => {
+    const url = buildUrl({
+      controls: {
+        $select: ['currency', { $fn: 'sum', $field: 'amount', $as: 'total' }],
+        $groupBy: ['currency'],
+        $having: { total: { $gt: 1000 } },
+        $sort: { total: -1 },
+      },
+    })
+    expect(url).toBe(
+      '$select=currency,sum(amount):total&$groupBy=currency&$having=total>1000&$sort=-total',
+    )
+  })
 })
 
 describe('buildUrl – round-trip with parseUrl', () => {
@@ -407,5 +456,71 @@ describe('buildUrl – round-trip with parseUrl', () => {
       const r = roundTrip(query)
       expect((r.filter as Record<string, unknown>).val).toBe(`x${ch}y`)
     }
+  })
+
+  it('$having single condition round-trips', () => {
+    const query: Uniquery = {
+      controls: { $having: { total: { $gt: 1000 } } },
+    }
+    const r = roundTrip(query)
+    expect(r.controls.$having).toEqual({ total: { $gt: 1000 } })
+  })
+
+  it('$having AND (multi-condition) round-trips', () => {
+    const query: Uniquery = {
+      controls: {
+        $having: {
+          $and: [
+            { total: { $gt: 1000 } },
+            { count_star: { $gte: 5 } },
+          ],
+        },
+      },
+    }
+    const r = roundTrip(query)
+    expect(r.controls.$having).toEqual({
+      total: { $gt: 1000 },
+      count_star: { $gte: 5 },
+    })
+  })
+
+  it('$having OR round-trips', () => {
+    const query: Uniquery = {
+      controls: {
+        $having: {
+          $or: [
+            { total: { $gt: 1000 } },
+            { avg_price: { $lt: 50 } },
+          ],
+        },
+      },
+    }
+    const r = roundTrip(query)
+    expect(r.controls.$having).toEqual({
+      $or: [
+        { total: { $gt: 1000 } },
+        { avg_price: { $lt: 50 } },
+      ],
+    })
+  })
+
+  it('full aggregation query with $having round-trips', () => {
+    const query: Uniquery = {
+      filter: { status: 'active' },
+      controls: {
+        $select: [
+          'currency',
+          { $fn: 'sum', $field: 'amount', $as: 'total' },
+        ],
+        $groupBy: ['currency'],
+        $having: { total: { $gt: 1000 } },
+        $sort: { total: -1 },
+        $limit: 10,
+      },
+    }
+    const r = roundTrip(query)
+    expect(r.controls.$having).toEqual({ total: { $gt: 1000 } })
+    expect(r.controls.$groupBy).toEqual(['currency'])
+    expect(r.controls.$sort).toEqual({ total: -1 })
   })
 })

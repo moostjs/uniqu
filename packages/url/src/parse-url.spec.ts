@@ -789,3 +789,69 @@ describe('parseUrl – aggregate functions in $select', () => {
     ])
   })
 })
+
+describe('parseUrl – $having', () => {
+  it('single condition', () => {
+    const r = parseUrl('$having=total>1000')
+    expect(r.controls.$having).toEqual({ total: { $gt: 1000 } })
+    expect(r.insights.get('total')).toEqual(new Set(['$having']))
+  })
+
+  it('multiple $having params AND-merged', () => {
+    const r = parseUrl('$having=total>1000&$having=count_star>=5')
+    expect(r.controls.$having).toEqual({
+      $and: [
+        { total: { $gt: 1000 } },
+        { count_star: { $gte: 5 } },
+      ],
+    })
+    expect(r.insights.get('total')).toEqual(new Set(['$having']))
+    expect(r.insights.get('count_star')).toEqual(new Set(['$having']))
+  })
+
+  it('parenthesized multi-condition', () => {
+    const r = parseUrl('$having=(total>1000&count_star>=5)')
+    expect(r.controls.$having).toEqual({
+      total: { $gt: 1000 },
+      count_star: { $gte: 5 },
+    })
+  })
+
+  it('OR via ^', () => {
+    const r = parseUrl('$having=total>1000^avg_price<50')
+    expect(r.controls.$having).toEqual({
+      $or: [
+        { total: { $gt: 1000 } },
+        { avg_price: { $lt: 50 } },
+      ],
+    })
+  })
+
+  it('NOT via !()', () => {
+    const r = parseUrl('$having=!(total<100)')
+    expect(r.controls.$having).toEqual({
+      $not: { total: { $lt: 100 } },
+    })
+  })
+
+  it('empty value is ignored', () => {
+    const r = parseUrl('$having=')
+    expect(r.controls.$having).toBeUndefined()
+  })
+
+  it('combined with full aggregation query', () => {
+    const r = parseUrl('$select=sum(amount):total,currency&$groupBy=currency&$having=total>1000&$sort=-total')
+    expect(r.controls.$having).toEqual({ total: { $gt: 1000 } })
+    expect(r.controls.$groupBy).toEqual(['currency'])
+    expect(r.controls.$sort).toEqual({ total: -1 })
+    expect(r.insights.get('total')).toEqual(new Set(['$having', '$order']))
+    expect(r.insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
+  })
+
+  it('$having inside $with sub-query', () => {
+    const r = parseUrl('$with=orders($select=sum(total):revenue&$groupBy=status&$having=revenue>500)')
+    const orders = r.controls.$with![0] as { name: string; controls: Record<string, unknown> }
+    expect(orders.controls.$having).toEqual({ revenue: { $gt: 500 } })
+    expect(r.insights.get('orders.revenue')).toEqual(new Set(['$having']))
+  })
+})

@@ -117,7 +117,7 @@ function serializeValue(value: unknown): string {
   return str
 }
 
-const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$sort', '$limit', '$skip', '$count', '$with'])
+const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$having', '$sort', '$limit', '$skip', '$count', '$with'])
 
 function serializeControls(controls: UniqueryControls): string {
   let result = ''
@@ -151,6 +151,17 @@ function serializeControls(controls: UniqueryControls): string {
     }
     const part = `$groupBy=${seg}`
     result = result ? result + '&' + part : part
+  }
+
+  if (controls.$having) {
+    const havingStr = serializeFilter(controls.$having)
+    if (havingStr) {
+      const needsParens = '$and' in controls.$having
+      const part = needsParens
+        ? `$having=(${havingStr})`
+        : `$having=${havingStr}`
+      result = result ? result + '&' + part : part
+    }
   }
 
   if (controls.$sort) {
