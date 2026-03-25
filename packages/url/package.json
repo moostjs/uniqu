@@ -1,6 +1,6 @@
 {
   "name": "@uniqu/url",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "URL query string parser producing the Uniqu canonical query format",
   "license": "MIT",
   "author": "Artem Maltsev",
