@@ -49,7 +49,7 @@ function serializeFilter(expr: FilterExpr): string {
   let result = ''
   for (const [field, value] of Object.entries(expr as Record<string, unknown>)) {
     if (value instanceof RegExp) {
-      const part = `${field}~=/${value.source}/${value.flags}`
+      const part = `${field}~=${serializeValue(value)}`
       result = result ? result + '&' + part : part
     } else if (isPrimitive(value)) {
       const part = `${field}=${serializeValue(value)}`
@@ -108,13 +108,13 @@ function serializeValue(value: unknown): string {
   if (value === true) return 'true'
   if (value === false) return 'false'
   if (typeof value === 'number') return String(value)
-  if (value instanceof RegExp) return value.toString()
+  if (value instanceof RegExp) return `'${value.toString()}'`
   if (value instanceof Date) return `'${value.toISOString()}'`
   const str = String(value)
   // Quote strings that could be misinterpreted as other types
   if (str === 'null' || str === 'true' || str === 'false') return `'${str}'`
   if (/^\d/.test(str) && !isNaN(Number(str)) && !str.startsWith('0')) return `'${str}'`
-  if (str.startsWith('/') && /\/[gimsuy]*$/.test(str)) return str // regex string passthrough
+  if (str.startsWith('/') && /\/[gimsuy]*$/.test(str)) return `'${str}'`
   // Quote strings with special characters
   if (/[&^=!<>~(){},\s'\\]/.test(str)) return `'${str.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
   return str

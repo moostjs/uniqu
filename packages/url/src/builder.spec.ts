@@ -40,7 +40,7 @@ describe('buildUrl', () => {
   })
 
   it('regex operator', () => {
-    expect(buildUrl({ filter: { name: { $regex: '/^Jo/i' } } })).toBe('name~=/^Jo/i')
+    expect(buildUrl({ filter: { name: { $regex: '/^Jo/i' } } })).toBe("name~='/^Jo/i'")
   })
 
   it('$in list', () => {
@@ -153,15 +153,15 @@ describe('buildUrl', () => {
   })
 
   it('RegExp values serialize as /pattern/flags', () => {
-    expect(buildUrl({ filter: { name: { $regex: '/^test/gi' } } })).toBe('name~=/^test/gi')
+    expect(buildUrl({ filter: { name: { $regex: '/^test/gi' } } })).toBe("name~='/^test/gi'")
   })
 
   it('RegExp object in $regex', () => {
-    expect(buildUrl({ filter: { name: { $regex: /^Ali/i } } })).toBe('name~=/^Ali/i')
+    expect(buildUrl({ filter: { name: { $regex: /^Ali/i } } })).toBe("name~='/^Ali/i'")
   })
 
   it('RegExp as direct field value', () => {
-    expect(buildUrl({ filter: { name: /^Ali/i } as any })).toBe('name~=/^Ali/i')
+    expect(buildUrl({ filter: { name: /^Ali/i } as any })).toBe("name~='/^Ali/i'")
   })
 
   it('$or with regex fields', () => {
@@ -174,7 +174,7 @@ describe('buildUrl', () => {
         ],
       },
     })
-    expect(url).toBe('firstName~=/^Ali/i^email~=/^Ali/i^id=1')
+    expect(url).toBe("firstName~='/^Ali/i'^email~='/^Ali/i'^id=1")
   })
 })
 
@@ -374,6 +374,23 @@ describe('buildUrl – round-trip with parseUrl', () => {
       },
     }
     expect(roundTrip(query).filter).toEqual(query.filter)
+  })
+
+  it('$or with regex and controls round-trips (BUG.md reproduction)', () => {
+    const query: Uniquery = {
+      filter: {
+        $or: [
+          { firstName: { $regex: '/^Ali/i' } },
+          { email: { $regex: '/^Ali/i' } },
+          { id: 'Ali' },
+        ],
+      },
+      controls: { $select: ['id', 'firstName', 'email'], $limit: 20 },
+    }
+    const r = roundTrip(query)
+    expect(r.filter).toEqual(query.filter)
+    expect(r.controls.$select).toEqual(['id', 'firstName', 'email'])
+    expect(r.controls.$limit).toBe(20)
   })
 
   it('$not filter round-trips', () => {
