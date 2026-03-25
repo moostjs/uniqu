@@ -155,6 +155,27 @@ describe('buildUrl', () => {
   it('RegExp values serialize as /pattern/flags', () => {
     expect(buildUrl({ filter: { name: { $regex: '/^test/gi' } } })).toBe('name~=/^test/gi')
   })
+
+  it('RegExp object in $regex', () => {
+    expect(buildUrl({ filter: { name: { $regex: /^Ali/i } } })).toBe('name~=/^Ali/i')
+  })
+
+  it('RegExp as direct field value', () => {
+    expect(buildUrl({ filter: { name: /^Ali/i } as any })).toBe('name~=/^Ali/i')
+  })
+
+  it('$or with regex fields', () => {
+    const url = buildUrl({
+      filter: {
+        $or: [
+          { firstName: { $regex: '/^Ali/i' } },
+          { email: { $regex: '/^Ali/i' } },
+          { id: 1 },
+        ],
+      },
+    })
+    expect(url).toBe('firstName~=/^Ali/i^email~=/^Ali/i^id=1')
+  })
 })
 
 describe('buildUrl – controls', () => {
@@ -339,6 +360,19 @@ describe('buildUrl – round-trip with parseUrl', () => {
 
   it('$or filter round-trips', () => {
     const query: Uniquery = { filter: { $or: [{ age: { $gt: 25 } }, { role: 'admin' }] } }
+    expect(roundTrip(query).filter).toEqual(query.filter)
+  })
+
+  it('$or with regex round-trips', () => {
+    const query: Uniquery = {
+      filter: {
+        $or: [
+          { firstName: { $regex: '/^Ali/i' } },
+          { email: { $regex: '/^Ali/i' } },
+          { id: 1 },
+        ],
+      },
+    }
     expect(roundTrip(query).filter).toEqual(query.filter)
   })
 

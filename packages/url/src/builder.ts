@@ -48,7 +48,10 @@ function serializeFilter(expr: FilterExpr): string {
   // Comparison node
   let result = ''
   for (const [field, value] of Object.entries(expr as Record<string, unknown>)) {
-    if (isPrimitive(value)) {
+    if (value instanceof RegExp) {
+      const part = `${field}~=/${value.source}/${value.flags}`
+      result = result ? result + '&' + part : part
+    } else if (isPrimitive(value)) {
       const part = `${field}=${serializeValue(value)}`
       result = result ? result + '&' + part : part
     } else {
