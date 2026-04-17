@@ -21,11 +21,11 @@ export function buildUrl(query: Uniquery): string {
   return filterStr || controlStr
 }
 
-function serializeFilter(expr: FilterExpr): string {
+function serializeFilter(expr: FilterExpr, parentOp?: '$and' | '$or'): string {
   if ('$and' in expr && expr.$and !== undefined) {
     let result = ''
     for (const child of expr.$and as FilterExpr[]) {
-      const s = serializeFilter(child)
+      const s = serializeFilter(child, '$and')
       if (s) result = result ? result + '&' + s : s
     }
     return result
@@ -34,10 +34,11 @@ function serializeFilter(expr: FilterExpr): string {
   if ('$or' in expr && expr.$or !== undefined) {
     let result = ''
     for (const child of expr.$or as FilterExpr[]) {
-      const s = serializeFilter(child)
+      const s = serializeFilter(child, '$or')
       if (s) result = result ? result + '^' + s : s
     }
-    return result
+    // `&` binds tighter than `^`, so an $or embedded in an $and must be grouped.
+    return parentOp === '$and' && result ? `(${result})` : result
   }
 
   if ('$not' in expr && expr.$not !== undefined) {
@@ -61,7 +62,8 @@ function serializeFilter(expr: FilterExpr): string {
       }
     }
   }
-  return result
+  // Implicit-AND (>1 part joined by `&`) inside an $or needs grouping.
+  return parentOp === '$or' && result.includes('&') ? `(${result})` : result
 }
 
 function serializeComparison(field: string, op: string, value: unknown): string {

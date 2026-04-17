@@ -73,6 +73,48 @@ describe('buildUrl', () => {
     expect(buildUrl({ filter: { $not: { status: 'DELETED' } } })).toBe('!(status=DELETED)')
   })
 
+  it('$or inside $and is parenthesized', () => {
+    const url = buildUrl({
+      filter: {
+        $and: [
+          { $or: [{ category: 'electronics' }, { category: 'clothing' }] },
+          { createdAt: 0 },
+        ],
+      },
+    })
+    expect(url).toBe('(category=electronics^category=clothing)&createdAt=0')
+  })
+
+  it('$and inside $or needs no parens (& binds tighter)', () => {
+    const url = buildUrl({
+      filter: {
+        $or: [
+          { $and: [{ a: 1 }, { b: 2 }] },
+          { c: 3 },
+        ],
+      },
+    })
+    expect(url).toBe('a=1&b=2^c=3')
+  })
+
+  it('multi-field comparison child inside $or is parenthesized', () => {
+    const url = buildUrl({
+      filter: {
+        $or: [{ status: 'A' }, { status: 'B', tier: 'gold' }],
+      },
+    })
+    expect(url).toBe('status=A^(status=B&tier=gold)')
+  })
+
+  it('single-field multi-operator child inside $or is parenthesized', () => {
+    const url = buildUrl({
+      filter: {
+        $or: [{ age: { $gte: 18, $lte: 30 } }, { role: 'admin' }],
+      },
+    })
+    expect(url).toBe('(age>=18&age<=30)^role=admin')
+  })
+
   it('quotes string values that look like numbers', () => {
     expect(buildUrl({ filter: { code: '25' } })).toBe("code='25'")
   })
@@ -374,6 +416,55 @@ describe('buildUrl – round-trip with parseUrl', () => {
       },
     }
     expect(roundTrip(query).filter).toEqual(query.filter)
+  })
+
+  it('$and with nested $or round-trips (BUG.md reproduction)', () => {
+    const query: Uniquery = {
+      filter: {
+        $and: [
+          { $or: [{ category: 'electronics' }, { category: 'clothing' }] },
+          { createdAt: 0 },
+        ],
+      },
+    }
+    expect(roundTrip(query).filter).toEqual(query.filter)
+  })
+
+  it('$or with multi-field comparison child round-trips', () => {
+    const query: Uniquery = {
+      filter: { $or: [{ status: 'A' }, { status: 'B', tier: 'gold' }] },
+    }
+    expect(roundTrip(query).filter).toEqual(query.filter)
+  })
+
+  it('$or with single-field multi-operator child round-trips', () => {
+    const query: Uniquery = {
+      filter: { $or: [{ age: { $gte: 18, $lte: 30 } }, { role: 'admin' }] },
+    }
+    expect(roundTrip(query).filter).toEqual(query.filter)
+  })
+
+  it('deeply nested $and/$or/$and round-trips (parser flattens inner $and)', () => {
+    const query: Uniquery = {
+      filter: {
+        $and: [
+          {
+            $or: [
+              { $and: [{ a: 1 }, { b: 2 }] },
+              { c: 3 },
+            ],
+          },
+          { d: 4 },
+        ],
+      },
+    }
+    // Parser collapses the inner $and of bare comparisons into an implicit-AND node.
+    expect(roundTrip(query).filter).toEqual({
+      $and: [
+        { $or: [{ a: 1, b: 2 }, { c: 3 }] },
+        { d: 4 },
+      ],
+    })
   })
 
   it('$or with regex and controls round-trips (BUG.md reproduction)', () => {
