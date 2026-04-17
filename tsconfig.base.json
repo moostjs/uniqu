@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "esModuleInterop": true,
     "target": "ES2020",
     "module": "ESNext",
@@ -16,12 +16,11 @@
     "noImplicitAny": true,
     "skipLibCheck": true,
     "removeComments": false,
-    "baseUrl": ".",
     "paths": {
-      "@uniqu/core": ["packages/core/src/index.ts"],
-      "@uniqu/core/*": ["packages/core/src/*"],
-      "@uniqu/url": ["packages/url/src/index.ts"],
-      "@uniqu/url/*": ["packages/url/src/*"]
+      "@uniqu/core": ["./packages/core/src/index.ts"],
+      "@uniqu/core/*": ["./packages/core/src/*"],
+      "@uniqu/url": ["./packages/url/src/index.ts"],
+      "@uniqu/url/*": ["./packages/url/src/*"]
     }
   }
 }
