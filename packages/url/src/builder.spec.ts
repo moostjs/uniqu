@@ -600,6 +600,90 @@ describe('buildUrl – round-trip with parseUrl', () => {
     }
   })
 
+  // Regression for the "encoder denylist drift" bug: any char that the
+  // tokenizer's `word` rule (`[A-Za-z0-9_.]+`) doesn't accept must trigger
+  // quoting, otherwise the value chops at the first such char on parse.
+  it('string with non-word chars (slugs, paths, ids) round-trips', () => {
+    for (const ch of [
+      '-', ':', ';', '?', '*', '/', '[', ']', '+',
+      '@', '#', '%', '"', '`', '|', '\\', "'",
+      ' ', '\t', '\n',
+    ]) {
+      const query: Uniquery = { filter: { val: `x${ch}y` } }
+      const r = roundTrip(query)
+      expect((r.filter as Record<string, unknown>).val).toBe(`x${ch}y`)
+    }
+  })
+
+  it('hyphenated slug round-trips (atscript-ui repro)', () => {
+    const query: Uniquery = { filter: { tableKey: 'orders-cancelled' } }
+    expect(buildUrl(query)).toBe("tableKey='orders-cancelled'")
+    expect((roundTrip(query).filter as Record<string, unknown>).tableKey).toBe('orders-cancelled')
+  })
+
+  it('file-path-like values round-trip', () => {
+    for (const v of ['/api/foo', 'a:b', 'a;b', 'q?r', 'x*y', 'a/b/c', 'arn:aws:s3:::bucket']) {
+      const query: Uniquery = { filter: { v } }
+      expect((roundTrip(query).filter as Record<string, unknown>).v).toBe(v)
+    }
+  })
+
+  it('empty-string value round-trips', () => {
+    const query: Uniquery = { filter: { x: '' } }
+    expect(buildUrl(query)).toBe("x=''")
+    expect((roundTrip(query).filter as Record<string, unknown>).x).toBe('')
+  })
+
+  it('negative-number-shaped string round-trips as string (not number)', () => {
+    const query: Uniquery = { filter: { code: '-42' } }
+    expect(buildUrl(query)).toBe("code='-42'")
+    expect((roundTrip(query).filter as Record<string, unknown>).code).toBe('-42')
+  })
+
+  it('bare-zero string round-trips as string (not number)', () => {
+    const query: Uniquery = { filter: { code: '0' } }
+    expect(buildUrl(query)).toBe("code='0'")
+    expect((roundTrip(query).filter as Record<string, unknown>).code).toBe('0')
+  })
+
+  it('decimal-number-shaped string round-trips as string', () => {
+    const query: Uniquery = { filter: { v: '3.14' } }
+    expect(buildUrl(query)).toBe("v='3.14'")
+    expect((roundTrip(query).filter as Record<string, unknown>).v).toBe('3.14')
+  })
+
+  it('non-ASCII string round-trips', () => {
+    for (const v of ['café', 'naïve', 'Ω', '日本語', 'emoji-rocket-🚀']) {
+      const query: Uniquery = { filter: { v } }
+      expect((roundTrip(query).filter as Record<string, unknown>).v).toBe(v)
+    }
+  })
+
+  // Fuzz: every printable ASCII char (0x21..0x7E) embedded mid-string must
+  // round-trip. Catches future tokenizer additions that drift from the
+  // builder's allowlist.
+  it('fuzz: every printable ASCII char embedded in a value round-trips', () => {
+    for (let code = 0x21; code <= 0x7e; code++) {
+      const ch = String.fromCharCode(code)
+      const v = `a${ch}b`
+      const query: Uniquery = { filter: { v } }
+      const r = roundTrip(query)
+      expect((r.filter as Record<string, unknown>).v, `char ${JSON.stringify(ch)} (0x${code.toString(16)})`).toBe(v)
+    }
+  })
+
+  // Fuzz: same but as a leading char — tickles the lexer's "number/regex/etc.
+  // pre-empts word" branch.
+  it('fuzz: every printable ASCII char as leading char round-trips', () => {
+    for (let code = 0x21; code <= 0x7e; code++) {
+      const ch = String.fromCharCode(code)
+      const v = `${ch}rest`
+      const query: Uniquery = { filter: { v } }
+      const r = roundTrip(query)
+      expect((r.filter as Record<string, unknown>).v, `char ${JSON.stringify(ch)} (0x${code.toString(16)})`).toBe(v)
+    }
+  })
+
   it('$having single condition round-trips', () => {
     const query: Uniquery = {
       controls: { $having: { total: { $gt: 1000 } } },

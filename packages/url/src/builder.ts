@@ -105,20 +105,43 @@ function serializeComparison(field: string, op: string, value: unknown): string 
   }
 }
 
+// A bare value in `field=<value>` position is round-trip-safe only when the
+// lexer in tokens.ts would consume the entire string as a single `word` token
+// (`[A-Za-z0-9_.]+`). Anything else must be single-quoted so it tokenizes as
+// a `string` literal. Pinning this allowlist to the tokenizer's `word` shape
+// keeps the encoder in sync if new operator/delimiter chars are added later —
+// the previous denylist drifted silently every time tokens.ts grew.
+const WORD_RE = /^[A-Za-z0-9_.]+$/u
+// Mirrors the tokenizer's `number` rule (full-string match). Strings matching
+// this would otherwise be lexed as numbers and lose their string identity on
+// round-trip. Leading-zero forms like '007' are intentionally NOT matched —
+// the tokenizer rejects them, so they parse cleanly as `word` tokens.
+const NUMBER_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/u
+
+function quote(str: string): string {
+  // `%` is escaped to `%25` because parseUrl runs `decodeURIComponent` on each
+  // top-level segment; a stray `%` not followed by two hex digits throws there.
+  // Other URL-syntactic chars (`&`, `?`, `#`, …) round-trip through the
+  // `splitTopLevel + join('&')` rejoin in parseUrl, so they don't need encoding.
+  return `'${str.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/%/g, '%25')}'`
+}
+
 function serializeValue(value: unknown): string {
   if (value === null) return 'null'
   if (value === true) return 'true'
   if (value === false) return 'false'
   if (typeof value === 'number') return String(value)
-  if (value instanceof RegExp) return `'${value.toString()}'`
-  if (value instanceof Date) return `'${value.toISOString()}'`
+  if (value instanceof RegExp) return quote(value.toString())
+  if (value instanceof Date) return quote(value.toISOString())
   const str = String(value)
-  // Quote strings that could be misinterpreted as other types
-  if (str === 'null' || str === 'true' || str === 'false') return `'${str}'`
-  if (/^\d/.test(str) && !isNaN(Number(str)) && !str.startsWith('0')) return `'${str}'`
-  if (str.startsWith('/') && /\/[gimsuy]*$/.test(str)) return `'${str}'`
-  // Quote strings with special characters
-  if (/[&^=!<>~(){},\s'\\]/.test(str)) return `'${str.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
+  if (
+    str === '' ||
+    str === 'null' || str === 'true' || str === 'false' ||
+    NUMBER_RE.test(str) ||
+    !WORD_RE.test(str)
+  ) {
+    return quote(str)
+  }
   return str
 }
 
