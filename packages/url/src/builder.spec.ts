@@ -499,6 +499,19 @@ describe('buildUrl – round-trip with parseUrl', () => {
     expect(roundTrip(query).filter).toEqual(query.filter)
   })
 
+  // Regression: a quoted list item containing whitespace used to be swallowed
+  // whole by the lexer's greedy unquoted-string rule, which ate the surrounding
+  // `{…}` braces and blew up the parse.
+  it('$in/$nin with whitespace-containing items round-trips', () => {
+    const query: Uniquery = {
+      filter: {
+        city: { $in: ['New York', 'Los Angeles', 'San Diego'] },
+        note: { $nin: ['to do', 'in progress'] },
+      },
+    }
+    expect(roundTrip(query).filter).toEqual(query.filter)
+  })
+
   it('$with round-trips', () => {
     const query: Uniquery = {
       controls: {
@@ -748,5 +761,66 @@ describe('buildUrl – round-trip with parseUrl', () => {
     expect(r.controls.$having).toEqual({ total: { $gt: 1000 } })
     expect(r.controls.$groupBy).toEqual(['currency'])
     expect(r.controls.$sort).toEqual({ total: -1 })
+  })
+})
+
+// The direct `parseUrl(buildUrl(...))` round-trip above cannot catch chars that
+// a real URL parser mangles *in transit* (fragment truncation on `#`, stripping
+// of tab/newline). These tests push the query string through a genuine WHATWG
+// `URL` — the same normalization `fetch`, the address bar, and the server's
+// `req.url` apply — before handing the search string to parseUrl.
+describe('buildUrl – round-trip through a real URL parser', () => {
+  function roundTripViaUrl(query: Uniquery) {
+    const qs = buildUrl(query)
+    // `.search` is exactly what a server sees as the query portion of `req.url`.
+    const search = new URL('http://host/path?' + qs).search.slice(1)
+    return parseUrl(search)
+  }
+
+  it('value containing `#` survives (BUG.md: jobName#runId ids)', () => {
+    const query: Uniquery = {
+      filter: { jobId: { $in: ['inventory-images:store#0-1000', 'inventory-images:plan#ALL:0:1'] } },
+    }
+    const r = roundTripViaUrl(query)
+    expect((r.filter as Record<string, unknown>).jobId).toEqual({
+      $in: ['inventory-images:store#0-1000', 'inventory-images:plan#ALL:0:1'],
+    })
+  })
+
+  it('single `#` value survives (BUG.md one-liner repro)', () => {
+    const query: Uniquery = { filter: { jobId: { $in: ['a#b'] } } }
+    const r = roundTripViaUrl(query)
+    expect((r.filter as Record<string, unknown>).jobId).toEqual({ $in: ['a#b'] })
+  })
+
+  // Locks the full contract for the whole class of transit-hostile chars:
+  // `#` (fragment), `\t \n \r` (stripped), plus `& ? % + ' \ space " < >` which
+  // the URL layer either passes through or percent-encodes and parseUrl decodes.
+  it('every transit-hostile char round-trips through a real URL', () => {
+    for (const ch of ['#', '&', '?', '%', '+', "'", '\\', ' ', '"', '<', '>', '\t', '\n', '\r', '=', '^']) {
+      const query: Uniquery = { filter: { val: `a${ch}b` } }
+      const r = roundTripViaUrl(query)
+      expect((r.filter as Record<string, unknown>).val, `char ${JSON.stringify(ch)}`).toBe(`a${ch}b`)
+    }
+  })
+
+  it('$in list with mixed transit-hostile chars round-trips through a real URL', () => {
+    const query: Uniquery = {
+      filter: { path: { $in: ['a#b', 'c d', 'e%f', 'g&h', "i'j", 'k\tl'] } },
+    }
+    const r = roundTripViaUrl(query)
+    expect((r.filter as Record<string, unknown>).path).toEqual({
+      $in: ['a#b', 'c d', 'e%f', 'g&h', "i'j", 'k\tl'],
+    })
+  })
+
+  it('fuzz: every printable ASCII char survives a real URL round-trip', () => {
+    for (let code = 0x21; code <= 0x7e; code++) {
+      const ch = String.fromCharCode(code)
+      const v = `a${ch}b`
+      const query: Uniquery = { filter: { v } }
+      const r = roundTripViaUrl(query)
+      expect((r.filter as Record<string, unknown>).v, `char ${JSON.stringify(ch)} (0x${code.toString(16)})`).toBe(v)
+    }
   })
 })

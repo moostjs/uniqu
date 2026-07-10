@@ -49,4 +49,16 @@ describe('Lexer', () => {
       { pos: 17, type: 'rbrace', value: '}' },
     ])
   })
+
+  it('should tokenize a list of quoted strings containing spaces', () => {
+    const tokens = lex("city{'New York','Los Angeles'}")
+    expect(tokens).toEqual([
+      { pos: 0, type: 'word', value: 'city' },
+      { pos: 4, type: 'lbrace', value: '{' },
+      { pos: 5, type: 'string', value: "'New York'" },
+      { pos: 15, type: 'comma', value: ',' },
+      { pos: 16, type: 'string', value: "'Los Angeles'" },
+      { pos: 29, type: 'rbrace', value: '}' },
+    ])
+  })
 })

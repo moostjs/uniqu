@@ -119,11 +119,29 @@ const WORD_RE = /^[A-Za-z0-9_.]+$/u
 const NUMBER_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/u
 
 function quote(str: string): string {
-  // `%` is escaped to `%25` because parseUrl runs `decodeURIComponent` on each
-  // top-level segment; a stray `%` not followed by two hex digits throws there.
-  // Other URL-syntactic chars (`&`, `?`, `#`, …) round-trip through the
-  // `splitTopLevel + join('&')` rejoin in parseUrl, so they don't need encoding.
-  return `'${str.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/%/g, '%25')}'`
+  // parseUrl runs `decodeURIComponent` on each top-level segment before lexing,
+  // so any `%XX` we emit here is decoded back to its literal char before the
+  // lexer ever sees it. We percent-encode exactly the chars a real URL (WHATWG
+  // `new URL` / `fetch` / the address bar) would otherwise mangle *in transit*,
+  // before parseUrl runs at all:
+  //   `%`         — a stray `%` not followed by two hex digits makes the
+  //                 `decodeURIComponent` in parseUrl throw; must go first so the
+  //                 `%` we introduce below (`%23` etc.) isn't itself re-encoded.
+  //   `#`         — the fragment delimiter: the browser/URL parser cuts the query
+  //                 string here, so everything after `#` never reaches the server.
+  //   `\t \n \r`  — ASCII tab/newline are stripped from the input entirely by the
+  //                 URL parser, silently corrupting the value.
+  // Other URL-syntactic chars (`&`, `?`, `+`) survive the query string untouched,
+  // and the ones the URL parser percent-encodes (space, `"`, `<`, `>`, …) are
+  // decoded back by parseUrl's `decodeURIComponent`, so none need encoding here.
+  return `'${str
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/%/g, '%25')
+    .replace(/#/g, '%23')
+    .replace(/\t/g, '%09')
+    .replace(/\n/g, '%0A')
+    .replace(/\r/g, '%0D')}'`
 }
 
 function serializeValue(value: unknown): string {

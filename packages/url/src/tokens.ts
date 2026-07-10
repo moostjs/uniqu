@@ -85,8 +85,13 @@ export const tokens: TokenDef[] = [
   // $keyword (reserved control keys, supports $exists and $!exists)
   { r: /^\$!?[A-Za-z0-9_]+/u, type: 'keyword' },
 
-  // unquoted string - any text
-  { r: /^(?:[^&^)\s=><!]+(?:\s|\+)+[^&^)=><!]*)+/u, type: 'string' },
+  // unquoted multi-word string (e.g. `name=John Doe`). The `{` / `}` list
+  // delimiters are excluded from both runs so this greedy rule stops at a list
+  // boundary instead of swallowing it: without this, a quoted item containing a
+  // space inside a `{…}` list (e.g. `city{'New York'}`) gets eaten whole and the
+  // braces never tokenize. Quotes stay allowed so unquoted apostrophes (`O'Brien`)
+  // still lex as free text.
+  { r: /^(?:[^&^){}\s=><!]+(?:\s|\+)+[^&^){}=><!]*)+/u, type: 'string' },
 
   // field / bare word  (allow dots inside so we don't need a separate DOT token)
   { r: /^[A-Za-z0-9_.]+/u, type: 'word' },
