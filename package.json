@@ -22,7 +22,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s",
-    "release": "pnpm build && pnpm test && node ./scripts/versions && pnpm -r run pub",
+    "release": "pnpm build && pnpm test && node ./scripts/versions patch && pnpm -r run pub",
     "sync": "node ./scripts/versions",
     "prepare": "husky"
   },

@@ -30,8 +30,14 @@ async function main() {
     major: `${major + 1}.0.0`,
   }
 
-  // Prompt for bump type
-  const { bump } = await inquirer.prompt([{
+  // Bump type: non-interactive via CLI arg (`node ./scripts/versions patch|minor|major`),
+  // falling back to a prompt.
+  const argBump = process.argv[2]
+  if (argBump && !['patch', 'minor', 'major'].includes(argBump)) {
+    console.error(`❌ Invalid bump type "${argBump}" (expected patch | minor | major).`)
+    process.exit(1)
+  }
+  const { bump } = argBump ? { bump: argBump } : await inquirer.prompt([{
     type: 'list',
     name: 'bump',
     message: `Current: ${pkg.version}. Select bump:`,
