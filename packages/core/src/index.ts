@@ -23,5 +23,5 @@ export type {
   ResolveAlias,
 } from './types'
 
-export { walkFilter, isPrimitive, type FilterVisitor } from './walk'
+export { walkFilter, isPrimitive, isLogicalKey, type FilterVisitor } from './walk'
 export { computeInsights, getInsights } from './insights'

@@ -7,7 +7,7 @@ import type {
   InsightOp,
   UniqueryInsights,
 } from '@uniqu/core'
-import { isPrimitive } from '@uniqu/core'
+import { isPrimitive, isLogicalKey } from '@uniqu/core'
 
 const opMap: Partial<Record<TokenType, ComparisonOp>> = {
   'op-eq': '$eq',
@@ -242,7 +242,7 @@ function mergeConjunction(nodes: FilterExpr[]): FilterExpr | null {
   const merged: FilterExpr[] = []
   let currentMerge: ComparisonNode = {}
   for (const node of nodes) {
-    if ('$or' in node || '$and' in node || '$not' in node) {
+    if (Object.keys(node).some(isLogicalKey)) {
       merged.push(node)
       continue
     }

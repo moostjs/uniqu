@@ -265,7 +265,117 @@ describe('walkFilter', () => {
     })
   })
 
-  it('rejects mixed comparison+logical nodes at the type level', () => {
+  it('walks a mixed comparison + $or node as an implicit AND', () => {
+    const expr: FilterExpr = {
+      id: 101,
+      nextRefreshAt: { $lte: 1000 },
+      $or: [{ status: 'a' }, { status: 'b' }],
+    }
+    const { calls, visitor } = collectingVisitor()
+    const result = walkFilter(expr, visitor)
+
+    expect(result).toBe(
+      'id $eq 101 AND nextRefreshAt $lte 1000 AND (status $eq a OR status $eq b)',
+    )
+    expect(calls).toEqual([
+      { type: 'comparison', field: 'id', op: '$eq', value: 101 },
+      { type: 'comparison', field: 'nextRefreshAt', op: '$lte', value: 1000 },
+      { type: 'comparison', field: 'status', op: '$eq', value: 'a' },
+      { type: 'comparison', field: 'status', op: '$eq', value: 'b' },
+      { type: 'or', count: 2 },
+      { type: 'and', count: 3 },
+    ])
+  })
+
+  it('walks a mixed node nested inside a logical branch', () => {
+    const expr: FilterExpr = {
+      $and: [{ a: 1, $or: [{ b: 2 }, { c: 3 }] }],
+    }
+    const { calls, visitor } = collectingVisitor()
+    const result = walkFilter(expr, visitor)
+
+    expect(result).toBe('a $eq 1 AND (b $eq 2 OR c $eq 3)')
+    expect(calls).toEqual([
+      { type: 'comparison', field: 'a', op: '$eq', value: 1 },
+      { type: 'comparison', field: 'b', op: '$eq', value: 2 },
+      { type: 'comparison', field: 'c', op: '$eq', value: 3 },
+      { type: 'or', count: 2 },
+      { type: 'and', count: 2 },
+      { type: 'and', count: 1 },
+    ])
+  })
+
+  it('walks $not alongside a comparison field', () => {
+    const expr: FilterExpr = { a: 1, $not: { status: 'DELETED' } }
+    const { calls, visitor } = collectingVisitor()
+    const result = walkFilter(expr, visitor)
+
+    expect(result).toBe('a $eq 1 AND NOT (status $eq DELETED)')
+    expect(calls).toEqual([
+      { type: 'comparison', field: 'a', op: '$eq', value: 1 },
+      { type: 'comparison', field: 'status', op: '$eq', value: 'DELETED' },
+      { type: 'not' },
+      { type: 'and', count: 2 },
+    ])
+  })
+
+  it('walks several logical keys plus a field in one node', () => {
+    const expr: FilterExpr = {
+      a: 1,
+      $and: [{ b: 2 }, { c: 3 }],
+      $or: [{ d: 4 }, { e: 5 }],
+    }
+    const { calls, visitor } = collectingVisitor()
+    const result = walkFilter(expr, visitor)
+
+    expect(result).toBe('a $eq 1 AND b $eq 2 AND c $eq 3 AND (d $eq 4 OR e $eq 5)')
+    expect(calls).toEqual([
+      { type: 'comparison', field: 'a', op: '$eq', value: 1 },
+      { type: 'comparison', field: 'b', op: '$eq', value: 2 },
+      { type: 'comparison', field: 'c', op: '$eq', value: 3 },
+      { type: 'and', count: 2 },
+      { type: 'comparison', field: 'd', op: '$eq', value: 4 },
+      { type: 'comparison', field: 'e', op: '$eq', value: 5 },
+      { type: 'or', count: 2 },
+      { type: 'and', count: 3 },
+    ])
+  })
+
+  it('ignores a logical key with an undefined value', () => {
+    // Malformed object, e.g. from JSON.parse or an optional spread.
+    const expr = { a: 1, $and: undefined } as FilterExpr
+    const { calls, visitor } = collectingVisitor()
+    const result = walkFilter(expr, visitor)
+
+    expect(result).toBe('a $eq 1')
+    expect(calls).toEqual([
+      { type: 'comparison', field: 'a', op: '$eq', value: 1 },
+    ])
+  })
+
+  it('a mixed node narrows the affected rows (no sibling drop)', () => {
+    type Row = Record<string, unknown>
+    const visitor: FilterVisitor<(row: Row) => boolean> = {
+      comparison(field, op, value) {
+        if (op !== '$eq') throw new Error(`unsupported op ${op}`)
+        return (row) => row[field] === value
+      },
+      and: (children) => (row) => children.every((child) => child(row)),
+      or: (children) => (row) => children.some((child) => child(row)),
+      not: (child) => (row) => !child(row),
+    }
+
+    const expr: FilterExpr = { id: 101, $or: [{ status: 'a' }, { status: 'b' }] }
+    const matches = walkFilter(expr, visitor)!
+    const rows: Row[] = [
+      { id: 101, status: 'a' },
+      { id: 102, status: 'a' },
+    ]
+
+    expect(rows.filter(matches)).toEqual([{ id: 101, status: 'a' }])
+  })
+
+  it('rejects logical nodes combining two logical operators at the type level', () => {
     // @ts-expect-error — $or node cannot have $and
     const _mixedLogical: LogicalNode = { $or: [], $and: [] }
 

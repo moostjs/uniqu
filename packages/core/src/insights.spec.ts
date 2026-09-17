@@ -37,6 +37,21 @@ describe('computeInsights', () => {
     expect(insights.get('role')).toEqual(new Set(['$in']))
   })
 
+  it('captures both sides of a mixed comparison + logical node', () => {
+    const filter: FilterExpr = {
+      id: 101,
+      nextRefreshAt: { $lte: 1000 },
+      $or: [{ status: 'a' }, { attempts: { $gt: 3 } }],
+    }
+    const insights = computeInsights(filter)
+
+    expect(insights.get('id')).toEqual(new Set(['$eq']))
+    expect(insights.get('nextRefreshAt')).toEqual(new Set(['$lte']))
+    expect(insights.get('status')).toEqual(new Set(['$eq']))
+    expect(insights.get('attempts')).toEqual(new Set(['$gt']))
+    expect(insights.size).toBe(4)
+  })
+
   it('includes $select from controls', () => {
     const filter: FilterExpr = { age: { $gte: 18 } }
     const controls: UniqueryControls = {

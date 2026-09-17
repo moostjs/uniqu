@@ -1,11 +1,12 @@
 import type {
   AggregateExpr,
   FilterExpr,
+  FilterVisitor,
   Uniquery,
   UniqueryControls,
   WithRelation,
 } from '@uniqu/core'
-import { isPrimitive } from '@uniqu/core'
+import { walkFilter } from '@uniqu/core'
 
 /**
  * Build a URL query string from a Uniquery object.
@@ -21,49 +22,58 @@ export function buildUrl(query: Uniquery): string {
   return filterStr || controlStr
 }
 
-function serializeFilter(expr: FilterExpr, parentOp?: '$and' | '$or'): string {
-  if ('$and' in expr && expr.$and !== undefined) {
-    let result = ''
-    for (const child of expr.$and as FilterExpr[]) {
-      const s = serializeFilter(child, '$and')
-      if (s) result = result ? result + '&' + s : s
-    }
-    return result
-  }
+interface TUrlPart {
+  s: string
+  kind: 'leaf' | 'and' | 'or'
+}
 
-  if ('$or' in expr && expr.$or !== undefined) {
-    let result = ''
-    for (const child of expr.$or as FilterExpr[]) {
-      const s = serializeFilter(child, '$or')
-      if (s) result = result ? result + '^' + s : s
-    }
-    // `&` binds tighter than `^`, so an $or embedded in an $and must be grouped.
-    return parentOp === '$and' && result ? `(${result})` : result
+/**
+ * Join the non-empty parts with `&` (and) or `^` (or). `&` binds tighter than
+ * `^`, so an `or` child inside an `and` and a multi-part `and` child inside an
+ * `or` are parenthesized. A single non-empty part is returned as is — its kind
+ * is preserved so an enclosing node can still group it correctly.
+ */
+function joinParts(children: TUrlPart[], kind: 'and' | 'or'): TUrlPart {
+  const parts = children.filter((child) => child.s)
+  if (parts.length === 0) return { s: '', kind: 'leaf' }
+  if (parts.length === 1) return parts[0]
+  const wrap = kind === 'and' ? 'or' : 'and'
+  const separator = kind === 'and' ? '&' : '^'
+  return {
+    s: parts.map((child) => (child.kind === wrap ? `(${child.s})` : child.s)).join(separator),
+    kind,
   }
+}
 
-  if ('$not' in expr && expr.$not !== undefined) {
-    const inner = serializeFilter(expr.$not as FilterExpr)
-    return inner ? `!(${inner})` : ''
-  }
+/**
+ * URL serializer as a `walkFilter` visitor. The walker owns the traversal
+ * rules (every member of a node is an implicit AND, `undefined` logical keys
+ * are skipped, a single-member node passes through unwrapped, one comparison
+ * per operator), so the serializer only decides how to spell each node.
+ */
+const urlVisitor: FilterVisitor<TUrlPart> = {
+  comparison(field, op, value) {
+    // A RegExp under `$eq` (a bare `{ field: /re/ }` value) is emitted with
+    // the regex operator, matching `{ field: { $regex } }`.
+    const s =
+      op === '$eq' && value instanceof RegExp
+        ? `${field}~=${serializeValue(value)}`
+        : serializeComparison(field, op, value)
+    return { s, kind: 'leaf' }
+  },
+  and: (children) => joinParts(children, 'and'),
+  or: (children) => joinParts(children, 'or'),
+  not: (child) => ({ s: child.s ? `!(${child.s})` : '', kind: 'leaf' }),
+}
 
-  // Comparison node
-  let result = ''
-  for (const [field, value] of Object.entries(expr as Record<string, unknown>)) {
-    if (value instanceof RegExp) {
-      const part = `${field}~=${serializeValue(value)}`
-      result = result ? result + '&' + part : part
-    } else if (isPrimitive(value)) {
-      const part = `${field}=${serializeValue(value)}`
-      result = result ? result + '&' + part : part
-    } else {
-      for (const [op, opValue] of Object.entries(value as Record<string, unknown>)) {
-        const part = serializeComparison(field, op, opValue)
-        result = result ? result + '&' + part : part
-      }
-    }
-  }
-  // Implicit-AND (>1 part joined by `&`) inside an $or needs grouping.
-  return parentOp === '$or' && result.includes('&') ? `(${result})` : result
+/**
+ * Serialize a filter expression. Every member of a node is an implicit AND,
+ * in key insertion order — comparison fields and logical operators may be
+ * mixed in the same object (Mongo semantics), e.g.
+ * `{ id: 101, $or: [...] }` → `id=101&(…^…)`.
+ */
+function serializeFilter(expr: FilterExpr): string {
+  return walkFilter(expr, urlVisitor)?.s ?? ''
 }
 
 function serializeComparison(field: string, op: string, value: unknown): string {
@@ -202,7 +212,13 @@ function serializeControls(controls: UniqueryControls): string {
   if (controls.$having) {
     const havingStr = serializeFilter(controls.$having)
     if (havingStr) {
-      const needsParens = '$and' in controls.$having
+      // A $having containing `&` must be grouped: without parens the parser
+      // stops the $having value at the first `&` and reads the rest as filter.
+      // This is deliberately a textual check, not a structural one, because
+      // the parser boundary is textual too — `splitTopLevel` in parse-url.ts
+      // splits on `&` outside parentheses and ignores quotes, so a quoted
+      // value such as `name='a&b'` needs the wrap as much as an AND does.
+      const needsParens = havingStr.includes('&')
       const part = needsParens
         ? `$having=(${havingStr})`
         : `$having=${havingStr}`

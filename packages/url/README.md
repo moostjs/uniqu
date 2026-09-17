@@ -113,6 +113,14 @@ age>25^score>550&status=VIP
 → { $and: [{ $or: [{ age: { $gt: 25 } }, { score: { $gt: 550 } }] }, { status: 'VIP' }] }
 ```
 
+Comparison fields and a logical operator in the same filter object are ANDed
+together (see the [`@uniqu/core` README](../core/README.md#filter-expressions)),
+so `buildUrl` emits them `&`-joined and parenthesizes an `$or` that has
+siblings: `{ id: 101, $or: [{ s: 'a' }, { s: 'b' }] }` → `id=101&(s=a^s=b)`.
+Conversely, a multi-part AND inside an `$or` is always parenthesized, whether
+it is an explicit `$and` or an implicit one:
+`{ $or: [{ $and: [{ a: 1 }, { b: 2 }] }, { c: 3 }] }` → `(a=1&b=2)^c=3`.
+
 Adjacent AND conditions on the same field are merged when safe:
 
 ```
@@ -485,6 +493,13 @@ const parsed = parseUrl(url)
 // parsed.filter → { age: { $gte: 18 } }
 // parsed.controls.$limit → 10
 ```
+
+Round-trips are semantic, not structural: `parseUrl` returns the canonical
+explicit-`$and` form, with logical branches first and the merged comparison
+fields last, so `{ id: 101, $or: [...] }` comes back as
+`{ $and: [{ $or: [...] }, { id: 101 }] }`. Likewise an explicit `$and` inside
+an `$or` is emitted parenthesized (`(a=1&b=2)^c=3`), which parses to the same
+tree as the unparenthesized form.
 
 ### Bundle optimization
 

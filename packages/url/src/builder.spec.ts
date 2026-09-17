@@ -85,7 +85,11 @@ describe('buildUrl', () => {
     expect(url).toBe('(category=electronics^category=clothing)&createdAt=0')
   })
 
-  it('$and inside $or needs no parens (& binds tighter)', () => {
+  it('explicit $and inside $or is grouped like an implicit one', () => {
+    // `&` binds tighter than `^`, so `a=1&b=2^c=3` would parse to the same
+    // tree — but a multi-part AND inside an $or is always parenthesized,
+    // whether it is an explicit $and or an implicit one (`{ b: 2, c: 3 }`),
+    // so both spell the same way.
     const url = buildUrl({
       filter: {
         $or: [
@@ -94,7 +98,7 @@ describe('buildUrl', () => {
         ],
       },
     })
-    expect(url).toBe('a=1&b=2^c=3')
+    expect(url).toBe('(a=1&b=2)^c=3')
   })
 
   it('multi-field comparison child inside $or is parenthesized', () => {
@@ -113,6 +117,39 @@ describe('buildUrl', () => {
       },
     })
     expect(url).toBe('(age>=18&age<=30)^role=admin')
+  })
+
+  it('mixed comparison + $or node groups the $or', () => {
+    const url = buildUrl({
+      filter: {
+        id: 101,
+        nextRefreshAt: { $lte: 1000 },
+        $or: [{ status: 'a' }, { status: 'b' }],
+      },
+    })
+    expect(url).toBe('id=101&nextRefreshAt<=1000&(status=a^status=b)')
+  })
+
+  it('mixed comparison + $and node inlines the $and members', () => {
+    const url = buildUrl({ filter: { a: 1, $and: [{ b: 2 }, { c: 3 }] } })
+    expect(url).toBe('a=1&b=2&c=3')
+  })
+
+  it('mixed comparison + $not node', () => {
+    const url = buildUrl({ filter: { a: 1, $not: { status: 'DELETED' } } })
+    expect(url).toBe('a=1&!(status=DELETED)')
+  })
+
+  it('mixed node inside an $or is grouped as a whole', () => {
+    const url = buildUrl({
+      filter: { $or: [{ x: 9 }, { a: 1, $or: [{ b: 2 }, { c: 3 }] }] },
+    })
+    expect(url).toBe('x=9^(a=1&(b=2^c=3))')
+  })
+
+  it('logical key with undefined value is skipped', () => {
+    const url = buildUrl({ filter: { a: 1, $and: undefined } as Uniquery['filter'] })
+    expect(url).toBe('a=1')
   })
 
   it('quotes string values that look like numbers', () => {
@@ -344,6 +381,30 @@ describe('buildUrl – aggregation', () => {
     expect(url).toBe('$having=(total>1000&count_star>=5)')
   })
 
+  it('$having implicit-AND comparison node wraps in parens and round-trips', () => {
+    const query: Uniquery = {
+      controls: { $having: { total: { $gt: 1000 }, count_star: { $gte: 5 } } },
+    }
+    const url = buildUrl(query)
+    expect(url).toBe('$having=(total>1000&count_star>=5)')
+    const parsed = parseUrl(url)
+    expect(parsed.controls?.$having).toEqual(query.controls?.$having)
+    // Nothing leaks from the $having value into the filter
+    expect(parsed.filter).toEqual({})
+  })
+
+  it('$having value containing & wraps in parens and round-trips', () => {
+    // The parser splits the query on `&` outside parentheses without regard
+    // to quotes, so a quoted value with `&` needs the wrap just like an AND.
+    const query: Uniquery = { controls: { $having: { name: 'a&b' } } }
+    const url = buildUrl(query)
+    expect(url).toBe("$having=(name='a&b')")
+    const parsed = parseUrl(url)
+    expect(parsed.controls?.$having).toEqual(query.controls?.$having)
+    // Nothing leaks from the $having value into the filter
+    expect(parsed.filter).toEqual({})
+  })
+
   it('$having OR does not wrap', () => {
     const url = buildUrl({
       controls: {
@@ -482,6 +543,44 @@ describe('buildUrl – round-trip with parseUrl', () => {
     expect(r.filter).toEqual(query.filter)
     expect(r.controls.$select).toEqual(['id', 'firstName', 'email'])
     expect(r.controls.$limit).toBe(20)
+  })
+
+  // The parser's `mergeConjunction` keeps logical nodes as separate $and members
+  // and appends the merged comparison fields last, so the canonical form of a
+  // mixed node is an $and with the logical branch first.
+  it('mixed comparison + $or node round-trips to the canonical $and form', () => {
+    const query: Uniquery = {
+      filter: {
+        id: 101,
+        nextRefreshAt: { $lte: 1000 },
+        $or: [{ status: 'a' }, { status: 'b' }],
+      },
+    }
+    expect(roundTrip(query).filter).toEqual({
+      $and: [
+        { $or: [{ status: 'a' }, { status: 'b' }] },
+        { id: 101, nextRefreshAt: { $lte: 1000 } },
+      ],
+    })
+  })
+
+  it('mixed comparison + $not node round-trips to the canonical $and form', () => {
+    const query: Uniquery = { filter: { a: 1, $not: { b: 2 } } }
+    expect(roundTrip(query).filter).toEqual({
+      $and: [{ $not: { b: 2 } }, { a: 1 }],
+    })
+  })
+
+  it('mixed node nested inside an $or round-trips', () => {
+    const query: Uniquery = {
+      filter: { $or: [{ x: 9 }, { a: 1, $or: [{ b: 2 }, { c: 3 }] }] },
+    }
+    expect(roundTrip(query).filter).toEqual({
+      $or: [
+        { x: 9 },
+        { $and: [{ $or: [{ b: 2 }, { c: 3 }] }, { a: 1 }] },
+      ],
+    })
   })
 
   it('$not filter round-trips', () => {

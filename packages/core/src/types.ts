@@ -64,8 +64,10 @@ export type ComparisonNode<T = Record<string, unknown>> = {
 
 /**
  * Branch node: logical combination of child expressions.
- * Each variant forbids the other logical keys via `never` to prevent
- * mixing comparison fields with logical operators at the type level.
+ * The `never` members allow at most one logical key per object at the type
+ * level (`{ $and, $or }` is rejected); comparison fields may still sit
+ * alongside it (`{ id: 1, $or: [...] }`). At runtime every member of a node
+ * is ANDed, so several logical keys in one object are accepted and combined.
  */
 export type LogicalNode<T = Record<string, unknown>> =
   | { $and: FilterExpr<T>[]; $or?: never; $not?: never }

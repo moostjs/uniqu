@@ -35,7 +35,7 @@ const query: Uniquery = {
 
 ### Filter Expressions
 
-A `FilterExpr` is either a **comparison node** (leaf) or a **logical node** (branch):
+A `FilterExpr` is a **comparison node** (leaf), a **logical node** (branch), or a mix of both in one object (see [below](#mixing-comparison-fields-with-logical-operators)):
 
 ```ts
 // Comparison — one or more field conditions
@@ -53,6 +53,27 @@ A `FilterExpr` is either a **comparison node** (leaf) or a **logical node** (bra
 // Negation — $not wrapping a single child
 { $not: { status: 'DELETED' } }
 ```
+
+#### Mixing comparison fields with logical operators
+
+Comparison fields and logical operators may appear in the **same** object. All
+members of an object are combined with an implicit **AND**, in key order
+(MongoDB semantics):
+
+```ts
+// Both the field conditions and the $or branch apply
+{ id: 101, nextRefreshAt: { $lte: now }, $or: [{ status: 'a' }, { status: 'b' }] }
+
+// …is equivalent to
+{ $and: [
+  { id: 101, nextRefreshAt: { $lte: now } },
+  { $or: [{ status: 'a' }, { status: 'b' }] },
+]}
+```
+
+The same holds for `$and` and `$not` members, and for several logical keys in
+one object — each is simply another AND member: `{ a: 1, $and: [...], $or: [...] }`
+means `a = 1` AND the `$and` branch AND the `$or` branch.
 
 ### Comparison Operators
 
@@ -290,11 +311,13 @@ interface FilterVisitor<R> {
 
 ### Walker Behavior
 
+- Every member of a node is ANDed, in key order — comparison fields and logical keys alike. A field with several operators (`{ age: { $gte: 18, $lte: 30 } }`) contributes one `comparison` call per operator
 - Bare primitive values (`{ name: 'John' }`) are normalized to `comparison(field, '$eq', value)` calls
-- Multi-field comparison nodes (`{ age: ..., status: ... }`) are expanded into individual `comparison` calls wrapped in `visitor.and(...)`
-- `$and` / `$or` nodes recurse into children and call the corresponding visitor method
-- `$not` nodes recurse into the single child and call `visitor.not(...)`
-- Empty nodes call `visitor.and([])`
+- A single-member node returns its result unwrapped: `and()` is not called for `{ a: 1 }` or a lone `{ $or: [...] }`, but it is called with one child for `{ $and: [x] }`
+- `$and` / `$or` recurse into their children and call `and(...)` / `or(...)`; `$not` recurses into its single child and calls `not(...)`
+- Children are visited before their parent (depth-first, post-order)
+- A logical key whose value is `undefined` is skipped
+- An empty node calls `and([])`
 
 ## Lazy Insights
 
@@ -370,7 +393,7 @@ const insights = getInsights(query)
 | `FieldValue` | `Primitive \| FieldOps` |
 | `FilterExpr<T>` | `ComparisonNode<T> \| LogicalNode<T>` |
 | `ComparisonNode<T>` | Leaf node — keys constrained to `keyof T` when typed |
-| `LogicalNode<T>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — variants are mutually exclusive via `never` |
+| `LogicalNode<T>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — at most one logical key per object at the type level (the others are `never`); comparison fields may sit alongside it, and the runtime ANDs several logical keys |
 | `AggregateFn` | `'sum' \| 'count' \| 'avg' \| 'min' \| 'max'` |
 | `AggregateExpr<Fn, Field, Alias>` | `{ $fn, $field, $as? }` — aggregate function call in `$select`. Generic params preserve literal types for result inference |
 | `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
