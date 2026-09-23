@@ -146,7 +146,10 @@ All parts are decoded with `decodeURIComponent()` before parsing. Encode special
 ```
 name=%27John%20Doe%27  → name: 'John Doe'
 name~=%2F%5EJo%2Fi     → name: { $regex: '/^Jo/i' }
+$search=Maison%20%26%20O%27Brien%20%231  → $search: "Maison & O'Brien #1"
 ```
+
+A `$with` relation body is itself a query string, so it is decoded once more when parsed: a value inside a body needs one more level of encoding than at the top (`$with=posts(name='50%2525')` → `'50%'`). Building a `$with` value with `URLSearchParams` or `encodeURIComponent` produces exactly that. A body segment that is not valid percent-encoding at that second decode is kept as written, so a hand-written `$with=posts(name='50%25')` also yields `'50%'`.
 
 ## Control Keywords
 
@@ -181,7 +184,28 @@ When no alias is given, one is auto-generated as `{fn}_{field}` (with `*` becomi
 
 Supported functions: `sum`, `count`, `avg`, `min`, `max`, plus any custom function name — consumers validate supported functions.
 
-When aggregates are present, `$select` always uses the array form (even if `-` prefixed fields are mixed in).
+When aggregates are present, `$select` always uses the array form (even if `-` prefixed fields are mixed in). Entries keep their URL order.
+
+### Calendar Buckets in `$select`
+
+`bucket(field,unit[,tz][,weekStart])[:alias]` groups a timestamp field by calendar day, week, month, quarter or year — see [calendar buckets](../core/README.md#calendar-buckets-bucketexpr) for units, zones and the `YYYY-MM-DD` label the server returns. Group, sort and filter by its alias:
+
+```
+$select=bucket(openedAt,week,'Europe/Berlin',sun):week,status,count(*):n
+  &$groupBy=week,status&$having=week>='2026-03-01'&$sort=week
+```
+
+```
+bucket(openedAt,day)                              → { $bucket: 'day', $field: 'openedAt', $as: 'day_openedAt' }
+bucket(openedAt,day,'Europe/Berlin'):day          → { $bucket: 'day', $field: 'openedAt', $tz: 'Europe/Berlin', $as: 'day' }
+bucket(openedAt,week,'America/New_York',sun):wk   → { $bucket: 'week', …, $tz: 'America/New_York', $weekStart: 'sun', $as: 'wk' }
+bucket(openedAt,week,,sun)                        → default zone (UTC), Sunday weeks
+```
+
+- The zone is quoted when it contains `/` (`UTC` may be bare); an empty slot means the default zone.
+- Without an alias it is `{unit}_{field}`; a dotted field (`stats.firstSeenAt`) needs an explicit `:alias`.
+- `bucket` is a reserved name: `bucket(…)` always parses as a bucket, never as a custom aggregate, and a one-argument `bucket(x)` is malformed (`SyntaxError`).
+- Parsing is syntactic only: an unknown unit, week start or zone passes through for the server to reject with a precise message. Malformed syntax — unbalanced parens, a missing field or unit, more than four arguments — throws.
 
 ### Grouping (`$groupBy`)
 
@@ -474,7 +498,10 @@ All features are supported:
 ### Value serialization
 
 - Strings that look like numbers, booleans, or `null` are automatically quoted (`'25'`, `'true'`, `'null'`)
-- Strings with special characters (`&`, `^`, `=`, spaces, quotes) are quoted and escaped
+- Strings with special characters (`&`, `^`, `=`, spaces, quotes) are quoted and escaped; inside quotes `%`, `&`, `(`, `)`, `#`, tab and line breaks are percent-encoded, so no value can end a segment or unbalance a paren group
+- Custom control values (`$search`, `$relevance`, any `$<custom>`) are percent-encoded for the same characters plus `'` — `"Maison & O'Brien #1"` becomes `$search=Maison %26 O%27Brien %231`. Up to 0.1.8 they were written raw, so a search term containing `&`, `%` or `'` broke the URL
+- A `$with` body gets one extra level of `%` encoding, matching the extra decode on parse
+- Calendar buckets are written as `bucket(field,unit[,tz][,weekStart]):alias`, always with the alias
 - Leading-zero numbers (`007`) stay as bare strings
 - `Date` values are serialized as quoted ISO strings
 - `RegExp` values are serialized as `/pattern/flags`

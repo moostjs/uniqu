@@ -103,7 +103,7 @@ means `a = 1` AND the `$and` branch AND the `$or` branch.
 | `$limit` | `number` | Limit to N results |
 | `$count` | `boolean` | Request total count |
 | `$select` | `SelectExpr<T>` | Field projection — array of strings/aggregates for inclusion, object for exclusion/mixed |
-| `$groupBy` | `(keyof T & string)[]` | Fields to group by for aggregate queries |
+| `$groupBy` | `string[]` | Fields — or [calendar bucket](#calendar-buckets-bucketexpr) aliases — to group by for aggregate queries |
 | `$having` | `FilterExpr` | Post-aggregation filter on aliases and dimension fields |
 | `$with` | `(WithRelation \| string)[]` | Relations to populate alongside the primary query |
 | `$<custom>` | `unknown` | Arbitrary pass-through keywords |
@@ -186,6 +186,55 @@ interface AggregateExpr {
 
 Known functions are `sum`, `count`, `avg`, `min`, `max` (`AggregateFn`), but `$fn` accepts any string for extensibility — consumers validate and execute supported functions.
 
+Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`). `resolveAlias(expr)` applies that rule for aggregates and buckets alike — use it instead of re-deriving aliases.
+
+#### Calendar buckets (`BucketExpr`)
+
+A bucket groups a timestamp field (epoch milliseconds) by calendar day, week, month, quarter or year in a chosen time zone. It is a computed entry in `$select` with an alias, and `$groupBy`, `$sort` and `$having` refer to that alias:
+
+```ts
+const query: Uniquery = {
+  filter: { openedAt: { $gte: from, $lt: to } }, // keep a range on the raw timestamp
+  controls: {
+    $select: [
+      { $bucket: 'week', $field: 'openedAt', $tz: 'Europe/Berlin', $weekStart: 'sun', $as: 'week' },
+      'status',
+      { $fn: 'count', $field: '*', $as: 'n' },
+    ],
+    $groupBy: ['week', 'status'],
+    $having: { week: { $gte: '2026-03-01' } },
+    $sort: { week: 1 },
+  },
+}
+// → rows like { week: '2026-03-22', status: 'open', n: 4 }
+```
+
+| Field | Values | Default |
+|-------|--------|---------|
+| `$bucket` | `'day' \| 'week' \| 'month' \| 'quarter' \| 'year'` | — |
+| `$field` | timestamp field (epoch ms) | — |
+| `$tz` | canonical IANA zone (`'Europe/Berlin'`, `'Asia/Kolkata'`) | `'UTC'` |
+| `$weekStart` | `'mon'` … `'sun'` — only with `$bucket: 'week'` | `'mon'` (ISO 8601) |
+| `$as` | alias; required when `$field` contains `.` | `${unit}_${field}` |
+
+**The value is a label, not a timestamp:** the local calendar date of the bucket's first day as `YYYY-MM-DD`, for every unit — `'2026-03-22'` for a week starting Sunday 22 March, `'2026-03-01'` for March, `'2026-01-01'` for Q1. Labels are DST-safe (only instant → local date is ever computed), sort chronologically as plain strings (so `$sort` and string comparisons in `$having` just work), and a week may start in the previous month or year (week(mon) of 2027-01-01 is `'2026-12-28'`). A null source, or an instant outside `[1970-01-02T00:00Z, 3000-01-01T00:00Z)`, gives a `null` label — those rows form one null group. `AggregateResult` types the label as `CalendarBucketLabel` (a string), `| null` when the source field is optional or nullable.
+
+Validation that needs no schema lives here, so every consumer rejects the same inputs with the same wording. `resolveBuckets(controls)` returns `{ ok: true, buckets }` or `{ ok: false, issues: [{ path, message }] }` — it rejects unknown units, zones and week starts, a `$weekStart` on a non-week unit, a bucket outside a grouped query or missing from `$groupBy`, duplicate aliases, and `$select` entries that are neither a field, an aggregate nor a bucket. Pass `{ isField: (name) => boolean }` to also reject an alias that collides with a real field of your schema (by default only fields selected in `$select` are checked), and `{ aggregate: true }` when the query is grouped by other means. `checkTimeZone(tz)` validates a zone and returns its canonical spelling (an alias such as `'US/Eastern'` is rejected with a hint naming `'America/New_York'`). Which fields may be bucketed (for example only timestamp-typed ones) is up to the consumer.
+
+`groupByFields(controls)` maps `$groupBy` to source fields — a bucket alias becomes its `$field` — for access-control whitelists. `isAggregateExpr` / `isBucketExpr` tell `$select` entries apart.
+
+The date math is exported too, so clients produce exactly the labels servers return:
+
+```ts
+import { bucketLabel, bucketer, nextBucketLabel, bucketStartInstant } from '@uniqu/core'
+
+bucketLabel(Date.UTC(2026, 2, 29, 0, 30), 'day', 'Europe/Berlin') // '2026-03-29'
+const weekOf = bucketer('week', 'Europe/Berlin', 'sun')            // resolve once, label many rows
+rows.map((r) => weekOf(r.openedAt))
+nextBucketLabel('2026-01-31', 'month')                             // '2026-02-01' — fill gaps in a chart
+bucketStartInstant('2026-03-29', 'Europe/Berlin')                  // first instant of that local date (ms)
+```
+
 #### Post-Aggregation Filter (`$having`)
 
 `$having` filters groups after aggregation — the equivalent of SQL `HAVING`. It operates on aggregate result aliases and dimension fields:
@@ -207,24 +256,21 @@ const query: Uniquery = {
 
 `$having` accepts a full `FilterExpr` — logical operators (`$and`, `$or`, `$not`) and all comparison operators are supported. It is untyped (`FilterExpr` without a generic) because its fields are aggregate aliases that don't exist on the entity type `T`.
 
-Insights track `$having` fields with the `'$having'` op:
+Insights record **source fields**, never aliases: an alias used in `$having`, `$sort` or `$groupBy` is resolved to the field behind it. Aggregate usage is recorded with bare function names (not `$`-prefixed), and a bucket with `'$bucket'`:
 
 ```ts
 // insights for the query above:
-// 'total'    => Set { '$having', '$order' }
+// 'status'   => Set { '$eq' }
 // 'currency' => Set { '$select', '$groupBy' }
-// 'amount'   => Set { 'sum' }
-```
+// 'amount'   => Set { 'sum', '$having', '$order' }   // 'total' resolves to 'amount'
 
-Insights track aggregate usage with bare function names (not `$`-prefixed), making it easy to distinguish controls from aggregates:
-
-```ts
-// insights for the query above:
-// 'currency' => Set { '$select', '$groupBy' }
-// 'amount'   => Set { 'sum' }
+// insights for the calendar-bucket query above:
+// 'openedAt' => Set { '$bucket', '$groupBy', '$having', '$order' }
+// 'status'   => Set { '$select', '$groupBy' }
 // '*'        => Set { 'count' }
-// 'total'    => Set { '$order' }
 ```
+
+Up to 0.1.8 an alias used in `$having` was recorded as if it were a field (`'total' => Set { '$having' }`).
 
 ## Type-Safe Filters
 

@@ -100,10 +100,9 @@ const { controls, insights } = parseUrl(
 //   $limit: 10,
 // }
 
-// insights → Map {
-//   'amount'   => Set { 'sum' },
+// insights → Map {           (aliases resolve to their source field)
+//   'amount'   => Set { 'sum', '$order' },
 //   'currency' => Set { '$select', '$groupBy' },
-//   'total'    => Set { '$order' },
 // }
 ```
 
@@ -117,6 +116,20 @@ const { controls } = parseUrl(
 );
 // controls.$having → { total: { $gt: 1000 } }
 ```
+
+Group a timestamp by calendar day, week, month, quarter or year in any IANA time zone with `bucket(...)` — the server returns each bucket as the local date it starts on (`'2026-03-01'`):
+
+```ts
+const { controls } = parseUrl(
+  "$select=bucket(openedAt,month,'Europe/Berlin'):month,count(*):n&$groupBy=month&$sort=month",
+);
+// controls.$select → [
+//   { $bucket: 'month', $field: 'openedAt', $tz: 'Europe/Berlin', $as: 'month' },
+//   { $fn: 'count', $field: '*', $as: 'n' },
+// ]
+```
+
+See [calendar buckets](./packages/core/README.md#calendar-buckets-bucketexpr) for units, week starts, validation and the date helpers.
 
 ## URL Builder
 
