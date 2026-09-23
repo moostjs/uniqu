@@ -91,14 +91,49 @@ export interface AggregateExpr<
   $as?: Alias
 }
 
+/** Calendar units a bucket truncates to. */
+export type BucketUnit = 'day' | 'week' | 'month' | 'quarter' | 'year'
+
+/** First day of a `week` bucket (ISO 8601 default: 'mon'). */
+export type WeekStart = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
+
+/**
+ * `YYYY-MM-DD`: the local calendar date of the bucket's first day, the same
+ * format for every unit. Zero-padded, so a plain string sort is chronological.
+ */
+export type CalendarBucketLabel = string
+
+/**
+ * A calendar bucket over an epoch-ms timestamp field: a derived grouping
+ * dimension. Lives in an aggregate query's `$select` and is grouped by its
+ * alias in `$groupBy`. Its value is a {@link CalendarBucketLabel}, or `null`
+ * when the source is null/missing or outside the supported instant range.
+ */
+export interface BucketExpr<Field extends string = string, Alias extends string = string> {
+  /** Calendar unit to truncate to. */
+  $bucket: BucketUnit
+  /** Source timestamp field (epoch milliseconds). */
+  $field: Field
+  /** IANA time zone name; default 'UTC'. */
+  $tz?: string
+  /** First day of the week. Only with `$bucket: 'week'`; default 'mon'. */
+  $weekStart?: WeekStart
+  /** Output alias; default `${unit}_${field}` (required when `$field` contains '.'). */
+  $as?: Alias
+}
+
+/** A computed `$select` entry: a row-reducing aggregate or a per-row calendar bucket. */
+export type ComputedExpr = AggregateExpr | BucketExpr
+
 /**
  * Projection definition.
- * - Array form: inclusion list with optional aggregates.
- *   Plain strings select fields; AggregateExpr objects define computed columns.
- * - Object form: inclusion/exclusion map (0 or 1 per field). No aggregates in this form.
+ * - Array form: inclusion list with optional computed columns.
+ *   Plain strings select fields; AggregateExpr / BucketExpr objects define computed columns
+ *   (buckets are valid only in aggregate queries).
+ * - Object form: inclusion/exclusion map (0 or 1 per field). No computed columns in this form.
  */
 export type SelectExpr<T = Record<string, unknown>> =
-  | ((keyof T & string) | AggregateExpr)[]
+  | ((keyof T & string) | AggregateExpr | BucketExpr<keyof T & string>)[]
   | Partial<Record<keyof T & string, 0 | 1>>
 
 /** Query controls (pagination, projection, sorting, grouping). Generic `T` constrains field names. */
@@ -111,8 +146,8 @@ export interface UniqueryControls<
   $limit?: number
   $count?: boolean
   $select?: SelectExpr<T>
-  /** Fields to group by for aggregate queries. */
-  $groupBy?: (keyof T & string)[]
+  /** Fields (or calendar-bucket aliases from `$select`) to group by for aggregate queries. */
+  $groupBy?: ((keyof T & string) | (string & {}))[]
   /** Post-aggregation filter. Operates on aggregate aliases and dimension fields. */
   $having?: FilterExpr
   /** Relations to populate alongside the query. */
@@ -174,19 +209,25 @@ export type WithRelation = {
  * Insight operator includes comparison ops, control ops ($-prefixed),
  * and aggregate function names (bare, e.g. 'sum', 'avg').
  */
-export type InsightOp = ComparisonOp | '$select' | '$order' | '$with' | '$groupBy' | '$having' | AggregateFn | (string & {})
+export type InsightOp = ComparisonOp | '$select' | '$order' | '$with' | '$groupBy' | '$having' | '$bucket' | AggregateFn | (string & {})
 
 /** Map of field names to the set of operators used on that field. */
 export type UniqueryInsights = Map<string, Set<InsightOp>>
 
-/** Aggregate query controls. Separate from UniqueryControls: $groupBy is required, $with is forbidden. */
+/**
+ * Aggregate query controls. Separate from UniqueryControls: $groupBy is required, $with is forbidden.
+ *
+ * `$groupBy` entries are dimension fields or calendar-bucket aliases declared in `$select`.
+ * The constraint admits any string because TypeScript cannot relate a sibling `$as`
+ * literal; use {@link ValidGroupBy} in a signature to restore the narrowing.
+ */
 export interface AggregateControls<
   T = Record<string, unknown>,
   D extends keyof T & string = keyof T & string,
   M extends keyof T & string = keyof T & string,
 > {
-  $groupBy: D[]
-  $select?: (D | AggregateExpr<AggregateFn, M | '*'>)[]
+  $groupBy: (D | (string & {}))[]
+  $select?: (D | AggregateExpr<AggregateFn, M | '*'> | BucketExpr<D>)[]
   $having?: FilterExpr
   $sort?: Record<string, 1 | -1>
   $skip?: number
@@ -206,22 +247,58 @@ export interface AggregateQuery<
   insights?: UniqueryInsights
 }
 
-/** Resolve the output alias of an AggregateExpr. Uses $as if provided, otherwise generates {fn}_{field}. */
-export type ResolveAlias<A extends AggregateExpr> =
+/**
+ * Resolve the output alias of a computed `$select` entry (type-level twin of `resolveAlias`).
+ * Uses `$as` if provided, otherwise `{fn}_{field}` for aggregates and `{unit}_{field}` for
+ * buckets, with `'*'` spelled `star` (`count(*)` → `count_star`).
+ */
+export type ResolveAlias<A> =
   A extends { $as: infer Alias extends string } ? Alias
-  : A extends { $fn: infer Fn extends string; $field: infer F extends string } ? `${Fn}_${F}`
+  : A extends { $fn: infer Fn extends string; $field: infer F extends string } ? `${Fn}_${F extends '*' ? 'star' : F}`
+  : A extends { $bucket: infer U extends string; $field: infer F extends string } ? `${U}_${F extends '*' ? 'star' : F}`
   : string
+
+/** Aliases of the calendar buckets in a `$select` array type. */
+type BucketAliasesOf<Select> = Select extends readonly unknown[]
+  ? ResolveAlias<Extract<Select[number], BucketExpr>>
+  : never
+
+/**
+ * Validation type for aggregate signatures: maps each `$groupBy` entry of `Q` that is
+ * neither a dimension (`D`) nor the alias of a calendar bucket in `Q['controls']['$select']`
+ * to `never`. Intersect it with the inferred query so a typo fails to compile:
+ *
+ * ```ts
+ * aggregate<const Q extends AggregateQuery<T>>(q: Q & ValidGroupBy<T, Q>): ...
+ * ```
+ */
+export type ValidGroupBy<T, Q, D extends string = keyof T & string> =
+  Q extends { controls: { $groupBy: infer G extends readonly unknown[]; $select?: infer S } }
+    ? {
+        controls: {
+          $groupBy: { [K in keyof G]: G[K] extends D | BucketAliasesOf<S> ? G[K] : never }
+        }
+      }
+    : unknown
 
 /**
  * Infer the result row type from an aggregate query's $select.
  * Dimension fields preserve their original type from T.
  * Aggregate expressions: min/max preserve original type, others → number.
+ * Calendar buckets: {@link CalendarBucketLabel}, `| null` when the source is optional or nullable.
  */
 export type AggregateResult<
   T,
-  Select extends readonly (string | AggregateExpr)[],
+  Select extends readonly (string | AggregateExpr | BucketExpr)[],
 > =
   { [K in Extract<Select[number], string> & keyof T]: T[K] }
   & { [A in Extract<Select[number], AggregateExpr> as ResolveAlias<A>]:
       A extends { $fn: 'min' | 'max'; $field: infer F extends keyof T & string } ? T[F] : number
+    }
+  & { [B in Extract<Select[number], BucketExpr> as ResolveAlias<B>]:
+      B extends { $field: infer F extends keyof T & string }
+        ? null extends T[F] ? CalendarBucketLabel | null
+          : undefined extends T[F] ? CalendarBucketLabel | null
+          : CalendarBucketLabel
+        : CalendarBucketLabel | null
     }

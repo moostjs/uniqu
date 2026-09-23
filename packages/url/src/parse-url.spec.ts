@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { computeInsights } from '@uniqu/core'
 import { parseUrl } from './parse-url'
 
 describe('parseUrl – happy-path filters', () => {
@@ -669,11 +670,11 @@ describe('parseUrl – aggregate functions in $select', () => {
     ])
   })
 
-  it('mixed plain fields and aggregates', () => {
+  it('mixed plain fields and aggregates keep their order', () => {
     const r = parseUrl('$select=sum(amount),currency,count(*)')
     expect(r.controls.$select).toEqual([
-      'currency',
       { $fn: 'sum', $field: 'amount', $as: 'sum_amount' },
+      'currency',
       { $fn: 'count', $field: '*', $as: 'count_star' },
     ])
     expect(r.insights.get('currency')).toEqual(new Set(['$select']))
@@ -705,8 +706,8 @@ describe('parseUrl – aggregate functions in $select', () => {
   it('full aggregation query with groupBy, sort, limit', () => {
     const r = parseUrl('$select=sum(amount):total,currency&$groupBy=currency&$sort=-total&$limit=10')
     expect(r.controls.$select).toEqual([
-      'currency',
       { $fn: 'sum', $field: 'amount', $as: 'total' },
+      'currency',
     ])
     expect(r.controls.$groupBy).toEqual(['currency'])
     expect(r.controls.$sort).toEqual({ total: -1 })
@@ -844,8 +845,9 @@ describe('parseUrl – $having', () => {
     expect(r.controls.$having).toEqual({ total: { $gt: 1000 } })
     expect(r.controls.$groupBy).toEqual(['currency'])
     expect(r.controls.$sort).toEqual({ total: -1 })
-    expect(r.insights.get('total')).toEqual(new Set(['$having']))
-    expect(r.insights.get('amount')).toEqual(new Set(['sum', '$order']))
+    // `total` is the alias of sum(amount): $having and $sort resolve to the source field
+    expect(r.insights.has('total')).toBe(false)
+    expect(r.insights.get('amount')).toEqual(new Set(['sum', '$having', '$order']))
     expect(r.insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
   })
 
@@ -871,6 +873,207 @@ describe('parseUrl – $having', () => {
     const r = parseUrl('$with=orders($select=sum(total):revenue&$groupBy=status&$having=revenue>500)')
     const orders = r.controls.$with![0] as { name: string; controls: Record<string, unknown> }
     expect(orders.controls.$having).toEqual({ revenue: { $gt: 500 } })
-    expect(r.insights.get('orders.revenue')).toEqual(new Set(['$having']))
+    // `revenue` is the alias of sum(total)
+    expect(r.insights.has('orders.revenue')).toBe(false)
+    expect(r.insights.get('orders.total')).toEqual(new Set(['sum', '$having']))
+  })
+})
+
+// A `$with` body is itself a query string embedded in the outer one, so it is
+// percent-decoded once per nesting level — clients that encode the whole
+// `$with` value (URLSearchParams, encodeURIComponent) rely on this.
+describe('parseUrl – $with body decoding', () => {
+  type Rel = { name: string; filter: Record<string, unknown>; controls: Record<string, any> }
+  const rels = (qs: string) => parseUrl(qs).controls.$with as Rel[]
+
+  it('decodes a relation body once more than its `$with` segment', () => {
+    expect(rels("$with=posts(t='%2541')")[0].filter).toEqual({ t: 'A' })
+    expect(rels("$with=posts(t='%41')")[0].filter).toEqual({ t: 'A' })
+  })
+
+  it('parses a `$with` value encoded as a whole by URLSearchParams', () => {
+    const qs = new URLSearchParams({
+      $with: "posts(status=active&$limit=2&name='50%25'),author",
+    }).toString()
+    // the value's structure is fully percent-encoded
+    expect(qs.slice('%24with='.length)).not.toMatch(/[(),&=$']/u)
+    const [posts, author] = rels(qs)
+    expect(posts).toMatchObject({
+      name: 'posts',
+      filter: { status: 'active', name: '50%' },
+      controls: { $limit: 2 },
+    })
+    expect(author).toMatchObject({ name: 'author', filter: {}, controls: {} })
+  })
+
+  it('parses a `$with` value encoded by encodeURIComponent (raw parens)', () => {
+    const [posts, author] = rels(
+      '$with=' + encodeURIComponent('posts($sort=-d&$limit=5&x=1),author'),
+    )
+    expect(posts).toMatchObject({ filter: { x: 1 }, controls: { $sort: { d: -1 }, $limit: 5 } })
+    expect(author.name).toBe('author')
+  })
+
+  it('parses mixed raw/encoded structure (`posts(a=1)%2Cauthor`)', () => {
+    expect(rels('$with=posts(a=1)%2Cauthor').map((r) => [r.name, r.filter])).toEqual([
+      ['posts', { a: 1 }],
+      ['author', {}],
+    ])
+  })
+
+  it('keeps a body segment that is not valid percent-encoding at its second decode', () => {
+    // Hand-written with a single level of encoding: 0.1.8 threw "URI malformed".
+    expect(rels("$with=posts(name='50%25')")[0].filter).toEqual({ name: '50%' })
+    const posts = rels("$with=posts($with=c(name='50%25'&x=1))")[0]
+    expect((posts.controls.$with[0] as Rel).filter).toEqual({ name: '50%', x: 1 })
+  })
+
+  it('still rejects malformed percent-encoding at the top level', () => {
+    expect(() => parseUrl("name='50%'")).toThrow(URIError)
+  })
+})
+
+describe('parseUrl – calendar buckets in $select', () => {
+  const select = (qs: string) => parseUrl(qs).controls.$select
+
+  it('parses every argument form (design §9.1 examples)', () => {
+    expect(select('$select=bucket(openedAt,day)')).toEqual([
+      { $bucket: 'day', $field: 'openedAt', $as: 'day_openedAt' },
+    ])
+    expect(select("$select=bucket(openedAt,day,'Europe/Berlin'):day")).toEqual([
+      { $bucket: 'day', $field: 'openedAt', $tz: 'Europe/Berlin', $as: 'day' },
+    ])
+    expect(select("$select=bucket(openedAt,week,'America/New_York',sun):wk")).toEqual([
+      { $bucket: 'week', $field: 'openedAt', $tz: 'America/New_York', $weekStart: 'sun', $as: 'wk' },
+    ])
+    expect(select('$select=bucket(openedAt,week,,sun)')).toEqual([
+      { $bucket: 'week', $field: 'openedAt', $weekStart: 'sun', $as: 'week_openedAt' },
+    ])
+  })
+
+  it('accepts a bare zone, and an empty trailing zone slot means the default', () => {
+    expect(select('$select=bucket(t,day,Europe/Berlin)')).toEqual([
+      { $bucket: 'day', $field: 't', $tz: 'Europe/Berlin', $as: 'day_t' },
+    ])
+    expect(select('$select=bucket(t,day,Etc/GMT+5):d')).toEqual([
+      { $bucket: 'day', $field: 't', $tz: 'Etc/GMT+5', $as: 'd' },
+    ])
+    expect(select('$select=bucket(t,day,)')).toEqual([{ $bucket: 'day', $field: 't', $as: 'day_t' }])
+  })
+
+  it('is syntactic only: unknown unit, week start and zone pass through', () => {
+    expect(select("$select=bucket(t,hour,'Mars/Olympus',funday):x")).toEqual([
+      { $bucket: 'hour', $field: 't', $tz: 'Mars/Olympus', $weekStart: 'funday', $as: 'x' },
+    ])
+    // a quoted zone may hold any chars (the core rejects them): commas, parens, escaped quotes
+    expect(select("$select=bucket(t,day,'a,b)\\'c'),n")).toEqual([
+      { $bucket: 'day', $field: 't', $tz: "a,b)'c", $as: 'day_t' },
+      'n',
+    ])
+    // a dotted source keeps the default alias; the core requires an explicit $as for it
+    expect(select('$select=bucket(stats.firstSeenAt,day)')).toEqual([
+      { $bucket: 'day', $field: 'stats.firstSeenAt', $as: 'day_stats.firstSeenAt' },
+    ])
+  })
+
+  it('keeps entry order when mixed with plain fields and aggregates', () => {
+    expect(select("$select=bucket(openedAt,week,'Europe/Berlin',sun):week,status,count(*):n")).toEqual([
+      { $bucket: 'week', $field: 'openedAt', $tz: 'Europe/Berlin', $weekStart: 'sun', $as: 'week' },
+      'status',
+      { $fn: 'count', $field: '*', $as: 'n' },
+    ])
+  })
+
+  it('forces the array form next to an exclusion, like aggregates', () => {
+    expect(Array.isArray(select('$select=bucket(t,day),-secret'))).toBe(true)
+  })
+
+  it('parses a percent-encoded bucket', () => {
+    expect(select('$select=bucket%28openedAt%2Cweek%2C%27Europe%2FBerlin%27%2Csun%29%3Aweek')).toEqual([
+      { $bucket: 'week', $field: 'openedAt', $tz: 'Europe/Berlin', $weekStart: 'sun', $as: 'week' },
+    ])
+  })
+
+  it('parses the design §0 query', () => {
+    const r = parseUrl(
+      'openedAt>=1772323200000&openedAt<1775001600000' +
+        "&$select=bucket(openedAt,week,'Europe/Berlin',sun):week,status,count(*):n" +
+        "&$groupBy=week,status&$having=(week>='2026-03-01'&n>0)&$sort=week,status&$limit=50",
+    )
+    expect(r.filter).toEqual({ openedAt: { $gte: 1772323200000, $lt: 1775001600000 } })
+    expect(r.controls).toEqual({
+      $select: [
+        { $bucket: 'week', $field: 'openedAt', $tz: 'Europe/Berlin', $weekStart: 'sun', $as: 'week' },
+        'status',
+        { $fn: 'count', $field: '*', $as: 'n' },
+      ],
+      $groupBy: ['week', 'status'],
+      $having: { week: { $gte: '2026-03-01' }, n: { $gt: 0 } },
+      $sort: { week: 1, status: 1 },
+      $limit: 50,
+    })
+  })
+
+  it('parses a bucket inside a $with relation', () => {
+    const r = parseUrl('$with=orders($select=bucket(createdAt,month):m,sum(total):s&$groupBy=m)')
+    const orders = r.controls.$with![0] as { name: string; controls: Record<string, unknown> }
+    expect(orders.controls.$select).toEqual([
+      { $bucket: 'month', $field: 'createdAt', $as: 'm' },
+      { $fn: 'sum', $field: 'total', $as: 's' },
+    ])
+    expect(r.insights.get('orders.createdAt')).toEqual(new Set(['$bucket', '$groupBy']))
+  })
+
+  it('throws on malformed bucket syntax', () => {
+    for (const item of [
+      'bucket(',
+      'bucket()',
+      'bucket(a)',
+      'bucket(,day)',
+      'bucket(a,)',
+      'bucket(a,day,UTC,sun,x)',
+      'bucket(a,day,UTC,)',
+      'bucket(a,day):',
+      'bucket(a,day):a-b',
+      'bucket(a,day):a:b',
+      'bucket(a,day)x',
+      'bucket(a,day,Europe Berlin)',
+      "bucket(a,day,'unterminated)",
+      'bucket(a(b),day)',
+      "bucket(a,'day')",
+      'bucket(a,day,UTC,s-n)',
+    ]) {
+      expect(() => parseUrl(`$select=${encodeURIComponent(item)}`), item).toThrow(SyntaxError)
+    }
+  })
+})
+
+describe('parseUrl – calendar bucket insights', () => {
+  it('captures the source field with $bucket and resolves alias references', () => {
+    const r = parseUrl(
+      "$select=bucket(openedAt,week):wk,sum(amount):total&$groupBy=wk&$sort=-wk,total&$having=(wk>='2026-03-01'&total>5)",
+    )
+    expect(r.insights.get('openedAt')).toEqual(new Set(['$bucket', '$groupBy', '$order', '$having']))
+    expect(r.insights.get('amount')).toEqual(new Set(['sum', '$order', '$having']))
+    expect(r.insights.has('wk')).toBe(false)
+    expect(r.insights.has('total')).toBe(false)
+  })
+
+  it('resolves alias references that come before $select', () => {
+    const r = parseUrl('$groupBy=d&$sort=d&$select=bucket(t,day):d')
+    expect(r.insights.get('t')).toEqual(new Set(['$bucket', '$groupBy', '$order']))
+    expect(r.insights.has('d')).toBe(false)
+  })
+
+  it('matches core computeInsights for the same query', () => {
+    // toEqual compares Maps and Sets regardless of insertion order
+    for (const qs of [
+      "status=open&$select=bucket(openedAt,week,'Europe/Berlin',sun):week,status,count(*):n" +
+        "&$groupBy=week,status&$having=(week>='2026-03-01'&n>0)&$sort=-week",
+      '$sort=-total&$select=-secret&a>1&$with=posts($select=sum(v):total&$groupBy=k&$sort=total&x=1),tags',
+    ]) {
+      const r = parseUrl(qs)
+      expect(r.insights, qs).toEqual(computeInsights(r.filter, r.controls))
+    }
   })
 })

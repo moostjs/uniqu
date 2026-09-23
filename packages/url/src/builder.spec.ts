@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import { buildUrl } from './builder'
 import { parseUrl } from './parse-url'
-import type { Uniquery } from '@uniqu/core'
+import { resolveAlias } from '@uniqu/core'
+import type { BucketExpr, Uniquery, WithRelation } from '@uniqu/core'
+
+/** The query string a server sees after a real WHATWG URL parse (`fetch`, the address bar, `req.url`). */
+const viaRealUrl = (qs: string) => new URL('http://host/path?' + qs).search.slice(1)
+const roundTrip = (query: Uniquery) => parseUrl(buildUrl(query))
+const roundTripViaUrl = (query: Uniquery) => parseUrl(viaRealUrl(buildUrl(query)))
 
 describe('buildUrl', () => {
   it('empty query', () => {
@@ -181,8 +187,10 @@ describe('buildUrl', () => {
     expect(url).toBe('name=Alice&age=30')
   })
 
-  it('quotes string with ampersand', () => {
-    expect(buildUrl({ filter: { name: 'A&B' } })).toBe("name='A&B'")
+  it('quotes string with ampersand (and percent-encodes the `&`)', () => {
+    // parseUrl splits on `&` before decoding and ignores quotes, so a literal
+    // `&` inside the quoted value would cut it at the split.
+    expect(buildUrl({ filter: { name: 'A&B' } })).toBe("name='A%26B'")
   })
 
   it('quotes string with caret (OR)', () => {
@@ -206,8 +214,10 @@ describe('buildUrl', () => {
     expect(buildUrl({ filter: { name: 'a~b' } })).toBe("name='a~b'")
   })
 
-  it('quotes string with parentheses', () => {
-    expect(buildUrl({ filter: { name: 'a(b)' } })).toBe("name='a(b)'")
+  it('quotes string with parentheses (and percent-encodes them)', () => {
+    // parseUrl's top-level split tracks paren depth without regard to quotes,
+    // so an unbalanced paren inside a value would swallow following parts.
+    expect(buildUrl({ filter: { name: 'a(b)' } })).toBe("name='a%28b%29'")
   })
 
   it('quotes string with curly braces', () => {
@@ -393,12 +403,12 @@ describe('buildUrl – aggregation', () => {
     expect(parsed.filter).toEqual({})
   })
 
-  it('$having value containing & wraps in parens and round-trips', () => {
+  it('$having value containing & is percent-encoded and round-trips', () => {
     // The parser splits the query on `&` outside parentheses without regard
-    // to quotes, so a quoted value with `&` needs the wrap just like an AND.
-    const query: Uniquery = { controls: { $having: { name: 'a&b' } } }
+    // to quotes; the value's `&` is percent-encoded, so no wrap is needed.
+    const query: Uniquery = { controls: { $having: { name: 'a&b' }, $limit: 5 } }
     const url = buildUrl(query)
-    expect(url).toBe("$having=(name='a&b')")
+    expect(url).toBe("$having=name='a%26b'&$limit=5")
     const parsed = parseUrl(url)
     expect(parsed.controls?.$having).toEqual(query.controls?.$having)
     // Nothing leaks from the $having value into the filter
@@ -435,11 +445,6 @@ describe('buildUrl – aggregation', () => {
 })
 
 describe('buildUrl – round-trip with parseUrl', () => {
-  function roundTrip(query: Uniquery) {
-    const url = buildUrl(query)
-    return parseUrl(url)
-  }
-
   it('simple filter round-trips', () => {
     const query: Uniquery = { filter: { status: 'active', age: { $gte: 18 } } }
     expect(roundTrip(query).filter).toEqual(query.filter)
@@ -869,13 +874,6 @@ describe('buildUrl – round-trip with parseUrl', () => {
 // `URL` — the same normalization `fetch`, the address bar, and the server's
 // `req.url` apply — before handing the search string to parseUrl.
 describe('buildUrl – round-trip through a real URL parser', () => {
-  function roundTripViaUrl(query: Uniquery) {
-    const qs = buildUrl(query)
-    // `.search` is exactly what a server sees as the query portion of `req.url`.
-    const search = new URL('http://host/path?' + qs).search.slice(1)
-    return parseUrl(search)
-  }
-
   it('value containing `#` survives (BUG.md: jobName#runId ids)', () => {
     const query: Uniquery = {
       filter: { jobId: { $in: ['inventory-images:store#0-1000', 'inventory-images:plan#ALL:0:1'] } },
@@ -892,6 +890,11 @@ describe('buildUrl – round-trip through a real URL parser', () => {
     expect((r.filter as Record<string, unknown>).jobId).toEqual({ $in: ['a#b'] })
   })
 
+  // The builder percent-encodes only `% & ( ) # \t \n \r` (plus `'` in bare control
+  // values). Deliberately not encoded: `+` (parseUrl's `decodeURIComponent` keeps it
+  // literal), `=` (a control splits at its first `=`; filter values are quoted),
+  // `? / ^ ,` (not significant at the top-level split), and chars the URL layer
+  // percent-encodes in transit (space, `"`, `<`, `>`, non-ASCII), which parseUrl decodes.
   // Locks the full contract for the whole class of transit-hostile chars:
   // `#` (fragment), `\t \n \r` (stripped), plus `& ? % + ' \ space " < >` which
   // the URL layer either passes through or percent-encodes and parseUrl decodes.
@@ -921,5 +924,379 @@ describe('buildUrl – round-trip through a real URL parser', () => {
       const r = roundTripViaUrl(query)
       expect((r.filter as Record<string, unknown>).v, `char ${JSON.stringify(ch)} (0x${code.toString(16)})`).toBe(v)
     }
+  })
+})
+
+// Control values (`$search`, `$search:<index>`, any pass-through `$`-control)
+// are written bare, not inside a quoted literal. They must be percent-encoded
+// symmetrically with parseUrl's per-segment `decodeURIComponent`, and must not
+// leave a raw `&`, `'` or `#` for downstream (quote-aware) query splitters.
+function stripInsights(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(stripInsights)
+  if (v && typeof v === 'object' && !(v instanceof RegExp)) {
+    return Object.fromEntries(
+      Object.entries(v)
+        .filter(([k]) => k !== 'insights')
+        .map(([k, x]) => [k, stripInsights(x)]),
+    )
+  }
+  return v
+}
+
+describe('buildUrl – control value encoding', () => {
+  function searchOf(query: Uniquery, key = '$search') {
+    return (roundTrip(query).controls as Record<string, unknown>)[key]
+  }
+
+  it('term with `&`, `\'` and `#` round-trips and emits no raw structural chars', () => {
+    const term = "Maison & O'Brien #1"
+    const query: Uniquery = { controls: { $search: term } }
+    expect(buildUrl(query)).toBe('$search=Maison %26 O%27Brien %231')
+    expect(searchOf(query)).toBe(term)
+  })
+
+  it('term with a stray `%` round-trips', () => {
+    const query: Uniquery = { controls: { $search: '100% done' } }
+    expect(buildUrl(query)).toBe('$search=100%25 done')
+    expect(searchOf(query)).toBe('100% done')
+  })
+
+  it('pre-encoded-looking term round-trips literally (no double decode)', () => {
+    for (const term of ['50%25 off', '%41', '%2525', 'a%26b', '%']) {
+      expect(searchOf({ controls: { $search: term } }), term).toBe(term)
+    }
+  })
+
+  it('fuzz: every printable ASCII char embedded, leading and trailing in $search round-trips', () => {
+    for (let code = 0x20; code <= 0x7e; code++) {
+      const ch = String.fromCharCode(code)
+      for (const term of [`a${ch}b`, `${ch}rest`, `rest${ch}`]) {
+        const query: Uniquery = { controls: { $search: term, $limit: 5 } }
+        const r = roundTrip(query)
+        const label = `char ${JSON.stringify(ch)} (0x${code.toString(16)}) in ${JSON.stringify(term)}`
+        expect((r.controls as Record<string, unknown>).$search, label).toBe(term)
+        expect(r.controls.$limit, label).toBe(5)
+        expect(r.filter, label).toEqual({})
+      }
+    }
+  })
+
+  it('fuzz: emitted $search segment carries no raw `&`, `\'`, `#`, `(`, `)`', () => {
+    for (let code = 0x20; code <= 0x7e; code++) {
+      const term = `a${String.fromCharCode(code)}b`
+      const url = buildUrl({ controls: { $search: term } })
+      expect(url, JSON.stringify(term)).not.toMatch(/[&'#()]/u)
+    }
+  })
+
+  it('tab, CR and LF round-trip (directly and through a real URL)', () => {
+    for (const term of ['a\tb', 'a\rb', 'a\nb', '\r\n', 'x\t']) {
+      const query: Uniquery = { controls: { $search: term } }
+      expect(searchOf(query), JSON.stringify(term)).toBe(term)
+      expect((roundTripViaUrl(query).controls as Record<string, unknown>).$search, JSON.stringify(term)).toBe(term)
+    }
+  })
+
+  it('non-ASCII terms round-trip (directly and through a real URL)', () => {
+    for (const term of ['Crème brûlée', '日本語', 'emoji 🚀 rocket', 'Ω & ß']) {
+      const query: Uniquery = { controls: { $search: term } }
+      expect(searchOf(query), term).toBe(term)
+      expect((roundTripViaUrl(query).controls as Record<string, unknown>).$search, term).toBe(term)
+    }
+  })
+
+  it('fuzz: every printable ASCII char in $search survives a real URL round-trip', () => {
+    for (let code = 0x20; code <= 0x7e; code++) {
+      const term = `a${String.fromCharCode(code)}b`
+      const r = roundTripViaUrl({ controls: { $search: term, $skip: 10 } })
+      expect((r.controls as Record<string, unknown>).$search, JSON.stringify(term)).toBe(term)
+      expect(r.controls.$skip, JSON.stringify(term)).toBe(10)
+    }
+  })
+
+  it('$search:<indexName> keeps its key structure and round-trips a special-char term', () => {
+    const term = "Maison & O'Brien #1 (100%)"
+    const query: Uniquery = { controls: { '$search:products_idx': term } }
+    expect(buildUrl(query)).toBe('$search:products_idx=Maison %26 O%27Brien %231 %28100%25%29')
+    expect(searchOf(query, '$search:products_idx')).toBe(term)
+  })
+
+  it('$search:<indexName> with special chars in the index name round-trips', () => {
+    const key = "$search:my idx&(v2)'%"
+    expect(searchOf({ controls: { [key]: 'a&b' } }, key)).toBe('a&b')
+  })
+
+  it('other pass-through controls are encoded too', () => {
+    const query: Uniquery = { controls: { $relevance: "x&y'#", $custom: 'a(b' } }
+    const r = roundTrip(query).controls as Record<string, unknown>
+    expect(r.$relevance).toBe("x&y'#")
+    expect(r.$custom).toBe('a(b')
+  })
+
+  it('combined query loses nothing after a special-char $search term', () => {
+    const query: Uniquery = {
+      filter: { status: 'active', name: "O'Neil & Sons (UK)" },
+      controls: {
+        $sort: { createdAt: -1 },
+        $search: "Maison & O'Brien #1 100%",
+        $skip: 20,
+        $limit: 10,
+        '$search:alt': "it's (50%25) off",
+      },
+    }
+    const r = roundTrip(query)
+    expect(r.filter).toEqual(query.filter)
+    expect(r.controls).toEqual(query.controls)
+    const rv = roundTripViaUrl(query)
+    expect(rv.filter).toEqual(query.filter)
+    expect(rv.controls).toEqual(query.controls)
+  })
+
+  it('filter values with unbalanced parens or `&$…` do not swallow following controls', () => {
+    for (const v of ['a(b', 'a)b', '((', 'a&$limit=9', 'x&y']) {
+      const query: Uniquery = { filter: { name: v }, controls: { $sort: { x: 1 }, $limit: 5 } }
+      const r = roundTrip(query)
+      expect(r.filter, v).toEqual({ name: v })
+      expect(r.controls, v).toEqual({ $sort: { x: 1 }, $limit: 5 })
+    }
+  })
+
+  it('$having value with an unbalanced paren does not swallow following controls', () => {
+    const query: Uniquery = { controls: { $having: { n: 'a(b' }, $limit: 5 } }
+    const r = roundTrip(query)
+    expect(r.controls).toEqual({ $having: { n: 'a(b' }, $limit: 5 })
+  })
+
+  // A `$with` body is a query string embedded in the outer one: parseUrl
+  // decodes it once per nesting level, so the builder escapes the body's `%`.
+  it('$with relation body round-trips `%`, parens and a special-char $search', () => {
+    const rel = {
+      name: 'posts',
+      filter: { title: '50% (off)', code: '%41' },
+      controls: { $search: "Maison & O'Brien #1 %25", $limit: 3 },
+    }
+    const query: Uniquery = { controls: { $with: [rel, 'author'], $skip: 1, $search: 'top & level' } }
+    const r = roundTrip(query)
+    const w = r.controls.$with as Array<Record<string, unknown>>
+    expect(w[0].filter).toEqual(rel.filter)
+    expect(w[0].controls).toEqual(rel.controls)
+    expect(w[1]).toMatchObject({ name: 'author' })
+    expect(r.controls.$skip).toBe(1)
+    expect((r.controls as Record<string, unknown>).$search).toBe('top & level')
+  })
+
+  const NESTED_VALUES = [
+    'a&x=1',
+    '&$limit=9',
+    '50%',
+    '%41',
+    '%2541',
+    "O'Brien (x), y",
+    'a(b',
+    'x)y',
+    'a,b',
+    'a#b',
+    'a=b+c',
+    'tab\there',
+    'Crème 🚀',
+  ]
+
+  it('fuzz: special chars in nested filter, $having and pass-through values round-trip at 1 and 2 levels', () => {
+    for (const v of NESTED_VALUES) {
+      const body = {
+        filter: { t: v, n: 1 },
+        controls: { $having: { h: v }, $search: v, '$search:idx': v, $limit: 2 },
+      }
+      const level1: Uniquery = {
+        filter: { top: v },
+        controls: {
+          $with: [{ name: 'posts', ...body }, { name: 'author', filter: {}, controls: {} }],
+          $search: v,
+          $skip: 3,
+        },
+      }
+      const level2: Uniquery = {
+        filter: {},
+        controls: {
+          $with: [{ name: 'posts', filter: { p: v }, controls: { $with: [{ name: 'c', ...body }], $search: v } }],
+          $limit: 1,
+        },
+      }
+      for (const query of [level1, level2]) {
+        const qs = buildUrl(query)
+        const viaUrl = viaRealUrl(qs)
+        for (const parsed of [parseUrl(qs), parseUrl(viaUrl)]) {
+          const { insights: _i, ...rest } = parsed
+          expect(stripInsights(rest), `${JSON.stringify(v)} -> ${qs}`).toEqual(stripInsights(query))
+        }
+      }
+    }
+  })
+
+  it('two-level nested $with round-trips special chars', () => {
+    const query: Uniquery = {
+      controls: {
+        $with: [
+          {
+            name: 'posts',
+            filter: {},
+            controls: {
+              $with: [{ name: 'comments', filter: { body: "100% & 'more'" }, controls: { $search: 'a%25(b' } }],
+            },
+          },
+        ],
+      },
+    }
+    const posts = (roundTrip(query).controls.$with as Array<Record<string, any>>)[0]
+    const comments = posts.controls.$with[0]
+    expect(comments.filter).toEqual({ body: "100% & 'more'" })
+    expect(comments.controls.$search).toBe('a%25(b')
+  })
+})
+
+describe('buildUrl – calendar buckets', () => {
+  /** `q` with every computed `$select` entry's `$as` filled (the parser's canonical form), recursively. */
+  function canonical(q: Uniquery): Uniquery {
+    const controls = { ...q.controls }
+    if (Array.isArray(controls.$select)) {
+      controls.$select = controls.$select.map((e) =>
+        typeof e === 'string' ? e : { ...e, $as: resolveAlias(e) },
+      ) as typeof controls.$select
+    }
+    if (controls.$with) {
+      controls.$with = controls.$with.map((r) =>
+        typeof r === 'string' ? r : { name: r.name, ...canonical(r) },
+      ) as typeof controls.$with
+    }
+    return { filter: q.filter ?? {}, controls }
+  }
+  function expectRoundTrip(q: Uniquery) {
+    const qs = buildUrl(q)
+    const viaUrl = viaRealUrl(qs)
+    for (const parsed of [parseUrl(qs), parseUrl(viaUrl)]) {
+      const { insights: _i, ...rest } = parsed
+      expect(stripInsights(rest), qs).toEqual(canonical(q))
+    }
+  }
+
+  it('emits bucket(field,unit[,tz][,weekStart]):alias', () => {
+    const sel = (b: BucketExpr) => buildUrl({ controls: { $select: [b] } })
+    expect(sel({ $bucket: 'day', $field: 'openedAt' })).toBe('$select=bucket(openedAt,day):day_openedAt')
+    expect(sel({ $bucket: 'day', $field: 'openedAt', $tz: 'UTC' })).toBe(
+      '$select=bucket(openedAt,day,UTC):day_openedAt',
+    )
+    expect(sel({ $bucket: 'day', $field: 'openedAt', $tz: 'Europe/Berlin', $as: 'day' })).toBe(
+      "$select=bucket(openedAt,day,'Europe/Berlin'):day",
+    )
+    expect(
+      sel({ $bucket: 'week', $field: 'openedAt', $tz: 'America/New_York', $weekStart: 'sun', $as: 'wk' }),
+    ).toBe("$select=bucket(openedAt,week,'America/New_York',sun):wk")
+    expect(sel({ $bucket: 'week', $field: 'openedAt', $weekStart: 'sun' })).toBe(
+      '$select=bucket(openedAt,week,,sun):week_openedAt',
+    )
+  })
+
+  const DESIGN_QUERY: Uniquery = {
+    filter: { openedAt: { $gte: 1772323200000, $lt: 1775001600000 } },
+    controls: {
+      $select: [
+        { $bucket: 'week', $field: 'openedAt', $tz: 'Europe/Berlin', $weekStart: 'sun', $as: 'week' },
+        'status',
+        { $fn: 'count', $field: '*', $as: 'n' },
+      ],
+      $groupBy: ['week', 'status'],
+      $having: { week: { $gte: '2026-03-01' }, n: { $gt: 0 } },
+      $sort: { week: 1, status: 1 },
+      $limit: 50,
+    },
+  }
+
+  it('emits the design §0 URL for the §0 query', () => {
+    expect(buildUrl(DESIGN_QUERY)).toBe(
+      'openedAt>=1772323200000&openedAt<1775001600000' +
+        "&$select=bucket(openedAt,week,'Europe/Berlin',sun):week,status,count(*):n" +
+        "&$groupBy=week,status&$having=(week>='2026-03-01'&n>0)&$sort=week,status&$limit=50",
+    )
+    expectRoundTrip(DESIGN_QUERY)
+  })
+
+  it('round-trips units × zone × week start × alias', () => {
+    for (const $bucket of ['day', 'week', 'month', 'quarter', 'year'] as const) {
+      for (const $tz of [undefined, 'UTC', 'Europe/Berlin', 'America/New_York', 'Etc/GMT+5']) {
+        for (const $weekStart of [undefined, 'sun', 'mon'] as const) {
+          for (const $as of [undefined, 'b']) {
+            const b: BucketExpr = { $bucket, $field: 'openedAt' }
+            if ($tz !== undefined) b.$tz = $tz
+            if ($weekStart !== undefined) b.$weekStart = $weekStart
+            if ($as !== undefined) b.$as = $as
+            expectRoundTrip({ controls: { $select: [b, 'status'], $groupBy: [resolveAlias(b), 'status'] } })
+          }
+        }
+      }
+    }
+  })
+
+  it('round-trips the §9.1 examples, a dotted source and syntactically odd zones', () => {
+    for (const b of [
+      { $bucket: 'day', $field: 'openedAt' },
+      { $bucket: 'day', $field: 'openedAt', $tz: 'Europe/Berlin', $as: 'day' },
+      { $bucket: 'week', $field: 'openedAt', $tz: 'America/New_York', $weekStart: 'sun', $as: 'wk' },
+      { $bucket: 'week', $field: 'openedAt', $weekStart: 'sun' },
+      { $bucket: 'day', $field: 'stats.firstSeenAt', $as: 'first' },
+      // zones the core rejects still survive the URL untouched
+      { $bucket: 'day', $field: 't', $tz: "a,b)'c(&#%" },
+      { $bucket: 'day', $field: 't', $tz: '' },
+      { $bucket: 'day', $field: 't', $tz: 'null' },
+      { $bucket: 'day', $field: 't', $tz: '123' },
+    ] as BucketExpr[]) {
+      expectRoundTrip({ controls: { $select: [b, { $fn: 'count', $field: '*' }], $groupBy: [resolveAlias(b)] } })
+    }
+  })
+
+  it('round-trips $having and $sort on the bucket alias with filters, $search and $skip', () => {
+    expectRoundTrip({
+      filter: { status: 'open', name: "O'Brien & Co (UK)" },
+      controls: {
+        $select: [
+          { $bucket: 'month', $field: 'openedAt', $tz: 'Europe/Berlin', $as: 'month' },
+          { $fn: 'sum', $field: 'amount', $as: 'total' },
+        ],
+        $groupBy: ['month'],
+        $having: { $or: [{ month: { $gte: '2026-03-01' } }, { total: { $gt: 100 } }] },
+        $sort: { month: -1 },
+        $skip: 10,
+        $search: "Maison & O'Brien #1 100%",
+      },
+    })
+  })
+
+  it('round-trips buckets inside $with at 1 and 2 levels', () => {
+    const body = (tz: string): Omit<WithRelation, 'name'> => ({
+      filter: { kind: 'a&b' },
+      controls: {
+        $select: [{ $bucket: 'week', $field: 'createdAt', $tz: tz, $weekStart: 'sun' }, { $fn: 'count', $field: '*' }],
+        $groupBy: ['week_createdAt'],
+        $having: { week_createdAt: { $gte: '2026-01-01' }, count_star: { $gt: 1 } },
+        $search: 'x & y',
+      },
+    })
+    expectRoundTrip({
+      controls: {
+        $with: [{ name: 'orders', ...body('Europe/Berlin') }],
+        $limit: 5,
+      },
+    })
+    expectRoundTrip({
+      filter: {},
+      controls: {
+        $with: [
+          {
+            name: 'customers',
+            filter: {},
+            controls: { $with: [{ name: 'orders', ...body('America/New_York') }], $sort: { name: 1 } },
+          },
+        ],
+      },
+    })
   })
 })

@@ -1,5 +1,5 @@
+import { computedAliases, isAggregateExpr, isBucketExpr } from './aggregate'
 import type {
-  AggregateExpr,
   FilterExpr,
   UniqueryControls,
   UniqueryInsights,
@@ -38,13 +38,18 @@ export function computeInsights(
   }
   if (filter) walkFilter(filter, visitor)
 
+  // Computed-column alias → source field, so alias references in
+  // $groupBy / $having / $sort are reported against the real field.
+  const aliasToField = computedAliases(controls?.$select)
   if (controls?.$select) {
     if (Array.isArray(controls.$select)) {
       for (const entry of controls.$select) {
         if (typeof entry === 'string') {
           capture(entry, '$select')
-        } else {
-          capture((entry as AggregateExpr).$field, (entry as AggregateExpr).$fn)
+        } else if (isBucketExpr(entry)) {
+          capture(entry.$field, '$bucket')
+        } else if (isAggregateExpr(entry)) {
+          capture(entry.$field, entry.$fn)
         }
       }
     } else {
@@ -55,12 +60,12 @@ export function computeInsights(
   }
   if (controls?.$groupBy) {
     for (const field of controls.$groupBy) {
-      capture(field, '$groupBy')
+      if (typeof field === 'string') capture(aliasToField.get(field) ?? field, '$groupBy')
     }
   }
   if (controls?.$having) {
     const havingVisitor: FilterVisitor<void> = {
-      comparison(field) { capture(field, '$having') },
+      comparison(field) { capture(aliasToField.get(field) ?? field, '$having') },
       and() {},
       or() {},
       not() {},
@@ -68,17 +73,8 @@ export function computeInsights(
     walkFilter(controls.$having, havingVisitor)
   }
   if (controls?.$sort) {
-    // Resolve sort-by-alias: build alias→field map from $select aggregates
-    let aliasToField: Map<string, string> | undefined
-    if (Array.isArray(controls.$select)) {
-      for (const entry of controls.$select) {
-        if (typeof entry !== 'string' && entry.$as) {
-          ;(aliasToField ??= new Map()).set(entry.$as, entry.$field)
-        }
-      }
-    }
     for (const field of Object.keys(controls.$sort)) {
-      capture(aliasToField?.get(field) ?? field, '$order')
+      capture(aliasToField.get(field) ?? field, '$order')
     }
   }
   if (controls?.$with) {

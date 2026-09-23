@@ -1,12 +1,13 @@
 import type {
   AggregateExpr,
+  BucketExpr,
   FilterExpr,
   FilterVisitor,
   Uniquery,
   UniqueryControls,
   WithRelation,
 } from '@uniqu/core'
-import { walkFilter } from '@uniqu/core'
+import { isBucketExpr, resolveAlias, walkFilter } from '@uniqu/core'
 
 /**
  * Build a URL query string from a Uniquery object.
@@ -128,30 +129,27 @@ const WORD_RE = /^[A-Za-z0-9_.]+$/u
 // the tokenizer rejects them, so they parse cleanly as `word` tokens.
 const NUMBER_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/u
 
+// Chars percent-encoded in every emitted value (parseUrl decodes each segment once):
+//   `%`         — a stray `%` makes parseUrl's `decodeURIComponent` throw; `%XX` would be decoded.
+//   `&`         — the top-level segment separator: the value would be cut there.
+//   `( )`       — the top-level split tracks paren depth, not quotes: an unbalanced paren
+//                 swallows (or detaches) every following segment.
+//   `#`         — the URL fragment delimiter: everything after it never reaches the server.
+//   `\t \n \r`  — stripped from a URL by the WHATWG parser.
+// Single pass, so the `%` introduced here is never re-encoded.
+const VALUE_UNSAFE_RE = /[%&()#\t\n\r]/gu
+// Control values are written bare (not inside a quoted literal), so `'` is
+// encoded too: a quote-aware consumer of the query string would otherwise treat
+// it as an opening quote and swallow every following control. Filter values
+// don't need it — `'` is backslash-escaped inside their quoted literal.
+const CONTROL_UNSAFE_RE = /[%&()#'\t\n\r]/gu
+
+function percentEncode(str: string, unsafe: RegExp): string {
+  return str.replace(unsafe, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)
+}
+
 function quote(str: string): string {
-  // parseUrl runs `decodeURIComponent` on each top-level segment before lexing,
-  // so any `%XX` we emit here is decoded back to its literal char before the
-  // lexer ever sees it. We percent-encode exactly the chars a real URL (WHATWG
-  // `new URL` / `fetch` / the address bar) would otherwise mangle *in transit*,
-  // before parseUrl runs at all:
-  //   `%`         — a stray `%` not followed by two hex digits makes the
-  //                 `decodeURIComponent` in parseUrl throw; must go first so the
-  //                 `%` we introduce below (`%23` etc.) isn't itself re-encoded.
-  //   `#`         — the fragment delimiter: the browser/URL parser cuts the query
-  //                 string here, so everything after `#` never reaches the server.
-  //   `\t \n \r`  — ASCII tab/newline are stripped from the input entirely by the
-  //                 URL parser, silently corrupting the value.
-  // Other URL-syntactic chars (`&`, `?`, `+`) survive the query string untouched,
-  // and the ones the URL parser percent-encodes (space, `"`, `<`, `>`, …) are
-  // decoded back by parseUrl's `decodeURIComponent`, so none need encoding here.
-  return `'${str
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, "\\'")
-    .replace(/%/g, '%25')
-    .replace(/#/g, '%23')
-    .replace(/\t/g, '%09')
-    .replace(/\n/g, '%0A')
-    .replace(/\r/g, '%0D')}'`
+  return `'${percentEncode(str.replace(/\\/g, '\\\\').replace(/'/g, "\\'"), VALUE_UNSAFE_RE)}'`
 }
 
 function serializeValue(value: unknown): string {
@@ -173,6 +171,21 @@ function serializeValue(value: unknown): string {
   return str
 }
 
+/**
+ * `bucket(<field>,<unit>[,<tz>][,<weekStart>]):<alias>` — always with the alias
+ * (`$as` or the default), so a round-trip keeps it. The zone follows the filter
+ * value rule (`UTC` bare, `'Europe/Berlin'` quoted); an absent zone with a week
+ * start leaves an empty slot.
+ */
+function serializeBucket(b: BucketExpr): string {
+  let args = `${b.$field},${b.$bucket}`
+  if (b.$tz !== undefined || b.$weekStart !== undefined) {
+    args += ',' + (b.$tz === undefined ? '' : serializeValue(b.$tz))
+    if (b.$weekStart !== undefined) args += ',' + b.$weekStart
+  }
+  return `bucket(${args}):${resolveAlias(b)}`
+}
+
 const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$having', '$sort', '$limit', '$skip', '$count', '$with'])
 
 function serializeControls(controls: UniqueryControls): string {
@@ -185,6 +198,8 @@ function serializeControls(controls: UniqueryControls): string {
         let s: string
         if (typeof entry === 'string') {
           s = entry
+        } else if (isBucketExpr(entry)) {
+          s = serializeBucket(entry)
         } else {
           const agg = entry as AggregateExpr
           s = agg.$as ? `${agg.$fn}(${agg.$field}):${agg.$as}` : `${agg.$fn}(${agg.$field})`
@@ -216,8 +231,8 @@ function serializeControls(controls: UniqueryControls): string {
       // stops the $having value at the first `&` and reads the rest as filter.
       // This is deliberately a textual check, not a structural one, because
       // the parser boundary is textual too — `splitTopLevel` in parse-url.ts
-      // splits on `&` outside parentheses and ignores quotes, so a quoted
-      // value such as `name='a&b'` needs the wrap as much as an AND does.
+      // splits on `&` outside parentheses. Values percent-encode `&` (see
+      // `quote`), so any `&` left here is a structural AND.
       const needsParens = havingStr.includes('&')
       const part = needsParens
         ? `$having=(${havingStr})`
@@ -261,7 +276,11 @@ function serializeControls(controls: UniqueryControls): string {
       } else {
         const rel = entry as WithRelation
         const inner = buildUrl({ filter: rel.filter, controls: rel.controls })
-        s = inner ? `${rel.name}(${inner})` : rel.name
+        // A relation body is itself a query string embedded in this one, so
+        // parseUrl decodes it once per nesting level (the `$with=…` segment,
+        // then each segment of the body). Escaping the body's `%` keeps every
+        // `%XX` the nested builder emitted intact through the outer decode.
+        s = inner ? `${rel.name}(${inner.replace(/%/g, '%25')})` : rel.name
       }
       seg = seg ? seg + ',' + s : s
     }
@@ -271,10 +290,16 @@ function serializeControls(controls: UniqueryControls): string {
     }
   }
 
-  // Pass-through unknown $-prefixed controls
+  // Pass-through unknown $-prefixed controls ($search, $search:<index>, …).
+  // Key and value are free-form strings, so both are percent-encoded; `$` and
+  // `:` are never in the unsafe set, so the key structure is left intact.
   for (const [key, value] of Object.entries(controls)) {
     if (key.startsWith('$') && !KNOWN_CONTROL_KEYS.has(key)) {
-      const part = value !== undefined && value !== '' ? `${key}=${value}` : key
+      const k = percentEncode(key, CONTROL_UNSAFE_RE)
+      const part =
+        value !== undefined && value !== ''
+          ? `${k}=${percentEncode(String(value), CONTROL_UNSAFE_RE)}`
+          : k
       result = result ? result + '&' + part : part
     }
   }

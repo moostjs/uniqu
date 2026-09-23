@@ -265,9 +265,10 @@ describe('computeInsights', () => {
     }
     const insights = computeInsights({}, controls)
 
-    expect(insights.get('total')).toEqual(new Set(['$having']))
+    // the aggregate alias resolves to its source field instead of leaking as a field name
+    expect(insights.get('total')).toBeUndefined()
     expect(insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
-    expect(insights.get('amount')).toEqual(new Set(['sum']))
+    expect(insights.get('amount')).toEqual(new Set(['sum', '$having']))
   })
 
   it('captures $having with multiple fields', () => {
@@ -299,6 +300,44 @@ describe('computeInsights', () => {
     expect(insights.get('currency')).toEqual(new Set(['$select', '$groupBy']))
     expect(insights.get('amount')).toEqual(new Set(['sum', '$order']))
     expect(insights.has('total')).toBe(false)
+  })
+  describe('calendar buckets', () => {
+    const controls: UniqueryControls = {
+      $select: [
+        { $bucket: 'week', $field: 'openedAt', $tz: 'Europe/Berlin', $weekStart: 'sun', $as: 'week' },
+        { $bucket: 'day', $field: 'closedAt' },
+        'status',
+        { $fn: 'count', $field: '*', $as: 'n' },
+        { $fn: 'sum', $field: 'points' },
+      ],
+      $groupBy: ['week', 'day_closedAt', 'status'],
+      $having: { $and: [{ week: { $gte: '2026-03-01' } }, { n: { $gt: 0 } }, { sum_points: { $lt: 9 } }] },
+      $sort: { week: 1, day_closedAt: -1, n: -1 },
+    }
+
+    it("captures a bucket's source field as '$bucket'", () => {
+      const insights = computeInsights({}, controls)
+      expect(insights.get('openedAt')).toEqual(new Set(['$bucket', '$groupBy', '$having', '$order']))
+      expect(insights.get('closedAt')).toEqual(new Set(['$bucket', '$groupBy', '$order']))
+    })
+
+    it('resolves bucket and aggregate aliases (explicit and default) in $groupBy, $having and $sort', () => {
+      const insights = computeInsights({}, controls)
+      for (const alias of ['week', 'day_closedAt', 'n', 'sum_points']) {
+        expect(insights.has(alias)).toBe(false)
+      }
+      expect(insights.get('status')).toEqual(new Set(['$select', '$groupBy']))
+      expect(insights.get('*')).toEqual(new Set(['count', '$having', '$order']))
+      expect(insights.get('points')).toEqual(new Set(['sum', '$having']))
+    })
+
+    it('ignores unsupported $select entries and non-string $groupBy entries', () => {
+      const insights = computeInsights({}, {
+        $select: ['a', { nope: 1 } as never, null as never],
+        $groupBy: ['a', 7 as never],
+      })
+      expect([...insights.keys()]).toEqual(['a'])
+    })
   })
 })
 

@@ -230,7 +230,8 @@ export class Parser {
   }
 }
 
-function unescapeString(str: string): string {
+/** Body of a single-quoted literal `'…'`: the quotes stripped and `\\x` escapes unescaped. */
+export function unescapeString(str: string): string {
   return str.replace(/(^'|'$)/gu, '').replace(/\\(.)/gu, '$1')
 }
 

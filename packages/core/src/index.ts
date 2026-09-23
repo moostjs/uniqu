@@ -9,6 +9,11 @@ export type {
   LogicalNode,
   AggregateFn,
   AggregateExpr,
+  BucketUnit,
+  WeekStart,
+  CalendarBucketLabel,
+  BucketExpr,
+  ComputedExpr,
   SelectExpr,
   WithRelation,
   TypedWithRelation,
@@ -21,7 +26,33 @@ export type {
   AggregateQuery,
   AggregateResult,
   ResolveAlias,
+  ValidGroupBy,
 } from './types'
 
 export { walkFilter, isPrimitive, isLogicalKey, type FilterVisitor } from './walk'
 export { computeInsights, getInsights } from './insights'
+export {
+  isAggregateExpr,
+  isBucketExpr,
+  resolveAlias,
+  groupByFields,
+  resolveBuckets,
+  type QueryIssue,
+  type ResolvedBucket,
+  type ResolveBucketsOptions,
+  type BucketResolution,
+} from './aggregate'
+export {
+  bucketLabel,
+  bucketer,
+  nextBucketLabel,
+  bucketStartInstant,
+  checkTimeZone,
+  BUCKET_MIN_INSTANT,
+  BUCKET_MAX_INSTANT,
+  BUCKET_UNITS,
+  WEEK_STARTS,
+  TIME_ZONE_NAME_RE,
+  type IsoWeekday,
+  type TimeZoneCheck,
+} from './calendar'

@@ -10,5 +10,12 @@ export default defineConfig({
   },
   test: {
     passWithNoTests: true,
+    typecheck: {
+      // Type-level tests (`*.test-d.ts`) run through tsc alongside the runtime tests.
+      enabled: true,
+      include: ['packages/*/src/**/*.test-d.ts'],
+      // Source type errors are the build's concern; only assertions in test-d files fail the run.
+      ignoreSourceErrors: true,
+    },
   },
 })
