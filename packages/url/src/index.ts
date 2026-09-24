@@ -1,1 +1,1 @@
-export { parseUrl, type UrlQuery } from './parse-url'
+export { parseUrl, splitUrlSegments, type UrlQuery } from './parse-url'

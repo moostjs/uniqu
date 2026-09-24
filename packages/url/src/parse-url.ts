@@ -43,7 +43,7 @@ export function parseUrl(raw: string): UrlQuery {
  * parsed before changes.
  */
 function parseQuery(raw: string, nested: boolean): UrlQuery {
-  const parts = splitTopLevel(raw, '&')
+  const parts = splitUrlSegments(raw)
 
   const controlParts: string[] = []
   const exprParts: string[] = []
@@ -91,6 +91,18 @@ function decodeLenient(s: string): string {
   } catch {
     return s
   }
+}
+
+/**
+ * Split a raw query string into its top-level `&` segments, exactly as
+ * {@link parseUrl} does: an `&` inside a parenthesized group
+ * (`(a=1&b=2)^c=3`) does not separate. Segments are returned raw (not
+ * percent-decoded); empty ones (from a leading, trailing or doubled `&`) are
+ * kept. Use it to address the individual keys of a URL the parser reads, e.g.
+ * to replace a query's own segments while keeping foreign ones.
+ */
+export function splitUrlSegments(raw: string): string[] {
+  return splitTopLevel(raw, '&')
 }
 
 /**

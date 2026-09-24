@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { computeInsights } from '@uniqu/core'
-import { parseUrl } from './parse-url'
+import { parseUrl, splitUrlSegments } from './parse-url'
 
 describe('parseUrl – happy-path filters', () => {
   it('simple equality / numeric inference', () => {
@@ -94,6 +94,42 @@ describe('parseUrl – happy-path filters', () => {
         { status: 'VIP' },
       ],
     })
+  })
+})
+
+describe('parseUrl – repeated operator on one field', () => {
+  it('keeps every clause of a same-field equality clash', () => {
+    expect(parseUrl('status=A&status=B').filter).toEqual({
+      $and: [{ status: 'A' }, { status: 'B' }],
+    })
+  })
+
+  it('keeps every clause of a same-operator comparison clash', () => {
+    expect(parseUrl('a>1&a>2').filter).toEqual({ $and: [{ a: { $gt: 1 } }, { a: { $gt: 2 } }] })
+  })
+
+  it('keeps the other fields merged around the clash', () => {
+    expect(parseUrl('status=A&x=1&status=B&y=2').filter).toEqual({
+      $and: [{ status: 'A', x: 1 }, { status: 'B', y: 2 }],
+    })
+  })
+
+  it('still merges different operators on one field', () => {
+    expect(parseUrl('a>1&a<5').filter).toEqual({ a: { $gt: 1, $lt: 5 } })
+  })
+})
+
+describe('splitUrlSegments', () => {
+  it('splits on top-level & only, keeping groups whole', () => {
+    expect(splitUrlSegments('a=1&(b=2&c=3)^(d=4&e=5)&$limit=5')).toEqual([
+      'a=1',
+      '(b=2&c=3)^(d=4&e=5)',
+      '$limit=5',
+    ])
+  })
+
+  it('keeps empty segments and does not decode', () => {
+    expect(splitUrlSegments('&a=%20&')).toEqual(['', 'a=%20', ''])
   })
 })
 

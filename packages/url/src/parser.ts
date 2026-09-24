@@ -258,8 +258,10 @@ function mergeConjunction(nodes: FilterExpr[]): FilterExpr | null {
           : new Set(Object.keys(val as object))
         const intersects: boolean = currentOps.some((op) => otherOps.has(op))
         if (intersects) {
+          // Same operator twice on one field: close the current object and
+          // start the next one with this clause (never drop it).
           merged.push(currentMerge)
-          currentMerge = {}
+          currentMerge = { [key]: val }
         } else {
           const m: Record<string, unknown> = {}
           for (const op of currentOps) {

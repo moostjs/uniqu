@@ -462,6 +462,17 @@ Produces:
 }
 ```
 
+## Splitting a query into segments
+
+`splitUrlSegments(raw)` returns the top-level `&` segments of a query string exactly as `parseUrl` sees them. A group such as `(a=1&b=2)^c=3` stays one segment. Segments are raw (not decoded), and empty ones are kept. Use it when you rewrite a URL key by key, for example to replace the segments a table owns while keeping the page's other keys:
+
+```ts
+import { splitUrlSegments } from '@uniqu/url'
+
+splitUrlSegments('page=2&(status=A&total>5)^status=B')
+// ['page=2', '(status=A&total>5)^status=B']
+```
+
 ## URL Builder
 
 Build URL query strings from `Uniquery` objects — the inverse of `parseUrl`. Available as a separate entry point for optimal bundle size:
