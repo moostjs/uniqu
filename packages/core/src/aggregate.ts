@@ -1,5 +1,15 @@
 import { BUCKET_UNITS, WEEK_STARTS, checkTimeZone, type IsoWeekday } from './calendar'
-import type { AggregateExpr, BucketExpr, BucketUnit, ComputedExpr, WeekStart } from './types'
+import type { AggregateExpr, AggregateFn, BucketExpr, BucketUnit, ComputedExpr, WeekStart } from './types'
+
+/** The known aggregate functions (`AggregateFn`), for allow-listing `$fn`. */
+export const AGGREGATE_FNS: readonly AggregateFn[] = ['sum', 'count', 'countDistinct', 'avg', 'min', 'max']
+/** The known aggregate functions that accept `'*'` as their `$field`. */
+export const STAR_AGGREGATE_FNS: readonly AggregateFn[] = ['count']
+
+/** True when `name` is one of the known {@link AGGREGATE_FNS}. */
+export function isAggregateFn(name: unknown): name is AggregateFn {
+  return (AGGREGATE_FNS as readonly unknown[]).includes(name)
+}
 
 /** True for an aggregate `$select` entry: `$fn` and `$field` strings, no `$bucket`. */
 export function isAggregateExpr(v: unknown): v is AggregateExpr {
@@ -103,6 +113,15 @@ export interface ResolvedBucket {
 
 type BucketExprCheck = { ok: true; bucket: ResolvedBucket } | { ok: false; message: string }
 
+/** Result of {@link validateAggregateExpr}. */
+export type AggregateExprCheck = { ok: true } | { ok: false; message: string }
+
+/** Options of {@link validateAggregateExpr}. */
+export interface ValidateAggregateOptions {
+  /** Allowed `$fn` names. Default: any name (custom functions pass). */
+  fns?: readonly string[]
+}
+
 /** Result of {@link resolveBuckets}. */
 export type BucketResolution =
   | { ok: true; buckets: ResolvedBucket[] }
@@ -110,7 +129,8 @@ export type BucketResolution =
 
 const ALIAS_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
 /** `a, b or c` */
-const orList = (items: readonly string[]) => `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`
+const orList = (items: readonly string[]) =>
+  items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`
 const UNIT_LIST = orList(BUCKET_UNITS)
 const WEEK_START_LIST = orList(WEEK_STARTS)
 
@@ -158,6 +178,27 @@ function validateBucketExpr(expr: BucketExpr): BucketExprCheck {
   return { ok: true, bucket: { alias, field: expr.$field, unit, tz, weekStart, weekStartIso } }
 }
 
+/**
+ * Validate one `AggregateExpr` — the rules knowable without a table schema:
+ * `$fn` is in `fns` (only when given), and `'*'` is used only by a known
+ * function that accepts it ({@link STAR_AGGREGATE_FNS}). A custom function's
+ * `$field` is the consumer's concern.
+ */
+export function validateAggregateExpr(
+  expr: AggregateExpr,
+  opts: ValidateAggregateOptions = {},
+): AggregateExprCheck {
+  const fn = expr.$fn
+  if (opts.fns && !opts.fns.includes(fn)) {
+    return { ok: false, message: `Unknown aggregate function "${fn}" — use ${orList(opts.fns)}` }
+  }
+  if (expr.$field === '*' && isAggregateFn(fn) && !STAR_AGGREGATE_FNS.includes(fn)) {
+    const message = `Aggregate "${fn}" needs a field — only ${orList(STAR_AGGREGATE_FNS)} accepts *`
+    return { ok: false, message }
+  }
+  return { ok: true }
+}
+
 /** Options of {@link resolveBuckets}. */
 export interface ResolveBucketsOptions {
   /** Whether the query is an aggregate query. Default: `$groupBy` is non-empty. */
@@ -167,6 +208,8 @@ export interface ResolveBucketsOptions {
    * shadow one. Default: the plain fields listed in `$select`.
    */
   isField?: (name: string) => boolean
+  /** Allowed aggregate `$fn` names, checked by {@link validateAggregateExpr}. Default: any name. */
+  fns?: readonly string[]
 }
 
 /**
@@ -174,6 +217,7 @@ export interface ResolveBucketsOptions {
  * normalized:
  *
  * - each `$select` array entry is a string, an `AggregateExpr` or a `BucketExpr`;
+ * - each aggregate passes {@link validateAggregateExpr} (with `fns`, when given);
  * - each bucket has a known unit, a valid time zone (canonicalized, see
  *   `checkTimeZone`), a week start only with unit `'week'`, and an identifier
  *   alias (`^[A-Za-z_][A-Za-z0-9_]*$`; a dotted `$field` needs an explicit `$as`);
@@ -209,7 +253,10 @@ export function resolveBuckets(
         const res = validateBucketExpr(entry)
         if (res.ok) buckets.push(res.bucket)
         else issues.push({ path: '$select', message: res.message })
-      } else if (!isAggregateExpr(entry)) {
+      } else if (isAggregateExpr(entry)) {
+        const res = validateAggregateExpr(entry, { fns: opts.fns })
+        if (!res.ok) issues.push({ path: '$select', message: res.message })
+      } else {
         issues.push({ path: '$select', message: `Unsupported $select entry at index ${i}` })
       }
     }

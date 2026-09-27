@@ -177,12 +177,14 @@ Prefix a field with `-` in `$select` to exclude it. When any exclusion is presen
 $select=sum(amount)                → [{ $fn: 'sum', $field: 'amount', $as: 'sum_amount' }]
 $select=sum(amount):total          → [{ $fn: 'sum', $field: 'amount', $as: 'total' }]
 $select=count(*)                   → [{ $fn: 'count', $field: '*', $as: 'count_star' }]
+$select=countDistinct(customerId)  → [{ $fn: 'countDistinct', $field: 'customerId', $as: 'countDistinct_customerId' }]
+$select=countDistinct(customerId):n → [{ $fn: 'countDistinct', $field: 'customerId', $as: 'n' }]
 $select=sum(amount),currency       → [{ $fn: 'sum', $field: 'amount', $as: 'sum_amount' }, 'currency']
 ```
 
 When no alias is given, one is auto-generated as `{fn}_{field}` (with `*` becoming `star`).
 
-Supported functions: `sum`, `count`, `avg`, `min`, `max`, plus any custom function name — consumers validate supported functions.
+Supported functions: `sum`, `count`, `countDistinct`, `avg`, `min`, `max`, plus any custom function name — consumers validate supported functions. See the [core README](../core/README.md#aggregation-groupby--select) for their semantics and for `validateAggregateExpr`. The parser checks syntax only: any `fn(*)` parses, although only `count(*)` is valid.
 
 When aggregates are present, `$select` always uses the array form (even if `-` prefixed fields are mixed in). Entries keep their URL order.
 

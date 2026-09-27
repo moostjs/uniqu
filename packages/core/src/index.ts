@@ -9,6 +9,7 @@ export type {
   LogicalNode,
   AggregateFn,
   AggregateExpr,
+  AggregateSelectExpr,
   BucketUnit,
   WeekStart,
   CalendarBucketLabel,
@@ -32,12 +33,18 @@ export type {
 export { walkFilter, isPrimitive, isLogicalKey, type FilterVisitor } from './walk'
 export { computeInsights, getInsights } from './insights'
 export {
+  AGGREGATE_FNS,
+  STAR_AGGREGATE_FNS,
+  isAggregateFn,
+  validateAggregateExpr,
   isAggregateExpr,
   isBucketExpr,
   resolveAlias,
   groupByFields,
   resolveBuckets,
   type QueryIssue,
+  type AggregateExprCheck,
+  type ValidateAggregateOptions,
   type ResolvedBucket,
   type ResolveBucketsOptions,
   type BucketResolution,

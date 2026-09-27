@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import {
+  AGGREGATE_FNS,
+  STAR_AGGREGATE_FNS,
   groupByFields,
   isAggregateExpr,
+  isAggregateFn,
   isBucketExpr,
   resolveAlias,
   resolveBuckets,
+  validateAggregateExpr,
 } from './aggregate'
 import { WEEK_STARTS } from './calendar'
 import type { BucketExpr } from './types'
@@ -44,6 +48,66 @@ describe('resolveAlias', () => {
 
   it("spells '*' as star, matching the URL parser (count(*) → count_star)", () => {
     expect(resolveAlias({ $fn: 'count', $field: '*' })).toBe('count_star')
+  })
+
+  it('keeps the function name verbatim for countDistinct (countDistinct_{field})', () => {
+    expect(resolveAlias({ $fn: 'countDistinct', $field: 'customerId' })).toBe('countDistinct_customerId')
+    expect(resolveAlias({ $fn: 'countDistinct', $field: 'customerId', $as: 'n' })).toBe('n')
+  })
+})
+
+describe('AGGREGATE_FNS / isAggregateFn', () => {
+  it('lists the known aggregate functions', () => {
+    expect(AGGREGATE_FNS).toEqual(['sum', 'count', 'countDistinct', 'avg', 'min', 'max'])
+  })
+
+  it('accepts exactly the known names', () => {
+    for (const fn of AGGREGATE_FNS) expect(isAggregateFn(fn)).toBe(true)
+    expect(isAggregateFn('stddev')).toBe(false)
+    expect(isAggregateFn('countdistinct')).toBe(false)
+    expect(isAggregateFn('COUNT')).toBe(false)
+    expect(isAggregateFn('')).toBe(false)
+    expect(isAggregateFn(undefined)).toBe(false)
+    expect(isAggregateFn(1)).toBe(false)
+  })
+
+  it('only count accepts *', () => {
+    expect(STAR_AGGREGATE_FNS).toEqual(['count'])
+  })
+})
+
+describe('validateAggregateExpr', () => {
+  it('accepts count(*) and known functions over a field', () => {
+    expect(validateAggregateExpr({ $fn: 'count', $field: '*' })).toEqual({ ok: true })
+    for (const fn of AGGREGATE_FNS) expect(validateAggregateExpr({ $fn: fn, $field: 'amount' })).toEqual({ ok: true })
+  })
+
+  it('rejects * for known functions other than count', () => {
+    expect(validateAggregateExpr({ $fn: 'sum', $field: '*' })).toEqual({
+      ok: false,
+      message: 'Aggregate "sum" needs a field — only count accepts *',
+    })
+    expect(validateAggregateExpr({ $fn: 'countDistinct', $field: '*' })).toEqual({
+      ok: false,
+      message: 'Aggregate "countDistinct" needs a field — only count accepts *',
+    })
+  })
+
+  it('lets a custom function through without fns, including over *', () => {
+    expect(validateAggregateExpr({ $fn: 'stddev', $field: 'score' })).toEqual({ ok: true })
+    expect(validateAggregateExpr({ $fn: 'approxCount', $field: '*' })).toEqual({ ok: true })
+  })
+
+  it('rejects a function missing from fns', () => {
+    expect(validateAggregateExpr({ $fn: 'stddev', $field: 'score' }, { fns: AGGREGATE_FNS })).toEqual({
+      ok: false,
+      message: 'Unknown aggregate function "stddev" — use sum, count, countDistinct, avg, min or max',
+    })
+    expect(validateAggregateExpr({ $fn: 'sum', $field: 'amount' }, { fns: ['count'] })).toEqual({
+      ok: false,
+      message: 'Unknown aggregate function "sum" — use count',
+    })
+    expect(validateAggregateExpr({ $fn: 'stddev', $field: 'score' }, { fns: ['stddev'] })).toEqual({ ok: true })
   })
 })
 
@@ -289,6 +353,23 @@ describe('resolveBuckets', () => {
     expect(!vsField.ok && vsField.issues).toEqual([
       { path: '$select', message: 'Alias "status" collides with field "status"' },
     ])
+  })
+
+  it('validates aggregates via validateAggregateExpr, with the optional fns allow-list', () => {
+    const select = ['region', { $fn: 'countDistinct', $field: '*', $as: 'n' }, { $fn: 'stddev', $field: 'x' }]
+    const res = resolveBuckets({ $select: select, $groupBy: ['region'] })
+    expect(!res.ok && res.issues).toEqual([
+      { path: '$select', message: 'Aggregate "countDistinct" needs a field — only count accepts *' },
+    ])
+    const withFns = resolveBuckets({ $select: select, $groupBy: ['region'] }, { fns: AGGREGATE_FNS })
+    expect(!withFns.ok && withFns.issues).toEqual([
+      { path: '$select', message: 'Aggregate "countDistinct" needs a field — only count accepts *' },
+      {
+        path: '$select',
+        message: 'Unknown aggregate function "stddev" — use sum, count, countDistinct, avg, min or max',
+      },
+    ])
+    expect(resolveBuckets({ $select: [{ $fn: 'count', $field: '*' }], $groupBy: [] }).ok).toBe(true)
   })
 
   it('checks alias collisions against the caller\'s field universe (isField)', () => {

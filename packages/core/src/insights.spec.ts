@@ -254,6 +254,19 @@ describe('computeInsights', () => {
     expect(insights.get('*')).toEqual(new Set(['count']))
   })
 
+  it('captures countDistinct against its field and resolves its default alias', () => {
+    const controls: UniqueryControls = {
+      $select: ['region', { $fn: 'countDistinct', $field: 'customerId' }],
+      $groupBy: ['region'],
+      $having: { countDistinct_customerId: { $gt: 10 } },
+      $sort: { countDistinct_customerId: -1 },
+    }
+    const insights = computeInsights({}, controls)
+
+    expect(insights.get('customerId')).toEqual(new Set(['countDistinct', '$having', '$order']))
+    expect(insights.has('countDistinct_customerId')).toBe(false)
+  })
+
   it('captures $having fields', () => {
     const controls: UniqueryControls = {
       $groupBy: ['currency'],

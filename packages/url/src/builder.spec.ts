@@ -654,6 +654,28 @@ describe('buildUrl – round-trip with parseUrl', () => {
     expect(r.controls.$sort).toEqual({ total: -1 })
   })
 
+  it('countDistinct round-trips, with and without alias', () => {
+    const query: Uniquery = {
+      controls: {
+        $select: [
+          'region',
+          { $fn: 'countDistinct', $field: 'customerId' },
+          { $fn: 'countDistinct', $field: 'customerId', $as: 'n' },
+        ],
+        $groupBy: ['region'],
+        $sort: { n: -1 },
+      },
+    }
+    expect(buildUrl(query)).toBe('$select=region,countDistinct(customerId),countDistinct(customerId):n&$groupBy=region&$sort=-n')
+    const r = roundTrip(query)
+    expect(r.controls.$select).toEqual([
+      'region',
+      { $fn: 'countDistinct', $field: 'customerId', $as: 'countDistinct_customerId' },
+      { $fn: 'countDistinct', $field: 'customerId', $as: 'n' },
+    ])
+    expect(roundTrip({ controls: r.controls }).controls.$select).toEqual(r.controls.$select)
+  })
+
   it('filter + controls combined round-trip', () => {
     const query: Uniquery = {
       filter: { age: { $gte: 18 }, status: { $ne: 'DELETED' } },

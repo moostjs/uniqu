@@ -178,15 +178,17 @@ const query: Uniquery = {
 
 ```ts
 interface AggregateExpr {
-  $fn: AggregateFn | (string & {})  // 'sum' | 'count' | 'avg' | 'min' | 'max' | custom
+  $fn: AggregateFn | (string & {})  // 'sum' | 'count' | 'countDistinct' | 'avg' | 'min' | 'max' | custom
   $field: string                     // field name, or '*' for count(*)
   $as?: string                       // optional alias for the result
 }
 ```
 
-Known functions are `sum`, `count`, `avg`, `min`, `max` (`AggregateFn`), but `$fn` accepts any string for extensibility — consumers validate and execute supported functions.
+Known functions are `sum`, `count`, `countDistinct`, `avg`, `min`, `max` (`AggregateFn`), but `$fn` accepts any string for extensibility — consumers validate and execute supported functions. `AGGREGATE_FNS` lists the known names at runtime and `isAggregateFn(name)` checks one.
 
-Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`). `resolveAlias(expr)` applies that rule for aggregates and buckets alike — use it instead of re-deriving aliases.
+`countDistinct` counts the distinct non-null values of `$field`; the result is a number. In `AggregateControls` it may target a dimension or a measure field (other aggregates take measures only). Only `count` accepts `'*'` (`STAR_AGGREGATE_FNS`): `countDistinct(*)` is not valid.
+
+Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`, `countDistinct(customerId)` → `countDistinct_customerId`). `resolveAlias(expr)` applies that rule for aggregates and buckets alike — use it instead of re-deriving aliases.
 
 #### Calendar buckets (`BucketExpr`)
 
@@ -219,7 +221,9 @@ const query: Uniquery = {
 
 **The value is a label, not a timestamp:** the local calendar date of the bucket's first day as `YYYY-MM-DD`, for every unit — `'2026-03-22'` for a week starting Sunday 22 March, `'2026-03-01'` for March, `'2026-01-01'` for Q1. Labels are DST-safe (only instant → local date is ever computed), sort chronologically as plain strings (so `$sort` and string comparisons in `$having` just work), and a week may start in the previous month or year (week(mon) of 2027-01-01 is `'2026-12-28'`). A null source, or an instant outside `[1970-01-02T00:00Z, 3000-01-01T00:00Z)`, gives a `null` label — those rows form one null group. `AggregateResult` types the label as `CalendarBucketLabel` (a string), `| null` when the source field is optional or nullable.
 
-Validation that needs no schema lives here, so every consumer rejects the same inputs with the same wording. `resolveBuckets(controls)` returns `{ ok: true, buckets }` or `{ ok: false, issues: [{ path, message }] }` — it rejects unknown units, zones and week starts, a `$weekStart` on a non-week unit, a bucket outside a grouped query or missing from `$groupBy`, duplicate aliases, and `$select` entries that are neither a field, an aggregate nor a bucket. Pass `{ isField: (name) => boolean }` to also reject an alias that collides with a real field of your schema (by default only fields selected in `$select` are checked), and `{ aggregate: true }` when the query is grouped by other means. `checkTimeZone(tz)` validates a zone and returns its canonical spelling (an alias such as `'US/Eastern'` is rejected with a hint naming `'America/New_York'`). Which fields may be bucketed (for example only timestamp-typed ones) is up to the consumer.
+Validation that needs no schema lives here, so every consumer rejects the same inputs with the same wording. `resolveBuckets(controls)` returns `{ ok: true, buckets }` or `{ ok: false, issues: [{ path, message }] }` — it rejects unknown units, zones and week starts, a `$weekStart` on a non-week unit, a bucket outside a grouped query or missing from `$groupBy`, duplicate aliases, `$select` entries that are neither a field, an aggregate nor a bucket, and aggregates that fail `validateAggregateExpr`. Pass `{ isField: (name) => boolean }` to also reject an alias that collides with a real field of your schema (by default only fields selected in `$select` are checked), `{ aggregate: true }` when the query is grouped by other means, and `{ fns: AGGREGATE_FNS }` (or your own list) to reject unknown aggregate functions. `checkTimeZone(tz)` validates a zone and returns its canonical spelling (an alias such as `'US/Eastern'` is rejected with a hint naming `'America/New_York'`). Which fields may be bucketed (for example only timestamp-typed ones) is up to the consumer.
+
+`validateAggregateExpr(expr, { fns? })` checks one aggregate: its `$fn` is in `fns` (only when given — by default any name passes, so custom functions work), and a known function other than `count` is not applied to `'*'`. It returns `{ ok: true }` or `{ ok: false, message }`.
 
 `groupByFields(controls)` maps `$groupBy` to source fields — a bucket alias becomes its `$field` — for access-control whitelists. `isAggregateExpr` / `isBucketExpr` tell `$select` entries apart.
 
@@ -440,14 +444,15 @@ const insights = getInsights(query)
 | `FilterExpr<T>` | `ComparisonNode<T> \| LogicalNode<T>` |
 | `ComparisonNode<T>` | Leaf node — keys constrained to `keyof T` when typed |
 | `LogicalNode<T>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — at most one logical key per object at the type level (the others are `never`); comparison fields may sit alongside it, and the runtime ANDs several logical keys |
-| `AggregateFn` | `'sum' \| 'count' \| 'avg' \| 'min' \| 'max'` |
+| `AggregateFn` | `'sum' \| 'count' \| 'countDistinct' \| 'avg' \| 'min' \| 'max'` |
 | `AggregateExpr<Fn, Field, Alias>` | `{ $fn, $field, $as? }` — aggregate function call in `$select`. Generic params preserve literal types for result inference |
 | `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
 | `UniqueryControls<T>` | Pagination, sorting, projection, grouping, `$having` — `$select`/`$sort`/`$groupBy` constrained to `keyof T` when typed |
 | `Uniquery<T>` | `{ name?, filter, controls, insights? }` — root query (no name) or nested relation (with name) |
 | `TypedWithRelation<Nav>` | Typed `$with` entry — `keyof Nav & string` or object with typed filter/controls |
 | `WithRelation` | Untyped `$with` relation with `{ name: string, filter?, controls?, insights? }` |
-| `AggregateControls<T, D, M>` | Typed aggregate controls — `$groupBy` required, `$with` forbidden, `$select` constrained to dimensions + aggregates |
+| `AggregateSelectExpr<D, M>` | Aggregate allowed in a typed `$select` — `count` over a measure or `'*'`, `countDistinct` over a dimension or measure, the rest over a measure |
+| `AggregateControls<T, D, M>` | Typed aggregate controls — `$groupBy` required, `$with` forbidden, `$select` constrained to dimensions, `AggregateSelectExpr<D, M>` and buckets |
 | `AggregateQuery<T, D, M>` | Typed aggregate query — `{ filter?, controls, insights? }` with dimension/measure constraints |
 | `AggregateResult<T, Select>` | Infer result row type from `$select` — dimensions preserve original types, aggregates → `number` (min/max preserve field type) |
 | `ResolveAlias<A>` | Resolve the output alias of an `AggregateExpr` — uses `$as` if provided, otherwise `{fn}_{field}` |
@@ -462,6 +467,10 @@ const insights = getInsights(query)
 | `computeInsights` | `(filter: FilterExpr, controls?: UniqueryControls) => UniqueryInsights` | Lazily compute field/operator usage map |
 | `getInsights` | `(query: Uniquery) => UniqueryInsights` | Return pre-computed or lazily computed insights |
 | `isPrimitive` | `(x: unknown) => x is Primitive` | Type guard for primitive values |
+| `AGGREGATE_FNS` | `readonly AggregateFn[]` | The known aggregate function names |
+| `isAggregateFn` | `(name: unknown) => name is AggregateFn` | True for a known aggregate function name |
+| `STAR_AGGREGATE_FNS` | `readonly AggregateFn[]` | Known functions that accept `'*'` as `$field` (`count`) |
+| `validateAggregateExpr` | `(expr: AggregateExpr, opts?: { fns?: readonly string[] }) => AggregateExprCheck` | Schema-free aggregate check — `$fn` allow-list (when `fns` given) and the `'*'` rule; returns `{ ok: true }` or `{ ok: false, message }` |
 
 ## License
 

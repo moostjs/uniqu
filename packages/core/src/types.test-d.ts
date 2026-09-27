@@ -40,6 +40,10 @@ describe('ResolveAlias', () => {
   it('spells count(*) as count_star, matching the runtime and the URL parser', () => {
     expectTypeOf<ResolveAlias<{ $fn: 'count'; $field: '*' }>>().toEqualTypeOf<'count_star'>()
   })
+
+  it('defaults countDistinct to countDistinct_{field}', () => {
+    expectTypeOf<ResolveAlias<{ $fn: 'countDistinct'; $field: 'status' }>>().toEqualTypeOf<'countDistinct_status'>()
+  })
 })
 
 describe('AggregateResult', () => {
@@ -77,6 +81,16 @@ describe('AggregateResult', () => {
     expectTypeOf(rows[0].week).toEqualTypeOf<string>()
     expectTypeOf(rows[0].status).toEqualTypeOf<string>()
     expectTypeOf(rows[0].n).toEqualTypeOf<number>()
+  })
+
+  it('types countDistinct as a number, under its default alias', () => {
+    const rows = aggregate({
+      controls: {
+        $select: ['status', { $fn: 'countDistinct', $field: 'openedAt' }],
+        $groupBy: ['status'],
+      },
+    })
+    expectTypeOf(rows[0].countDistinct_openedAt).toEqualTypeOf<number>()
   })
 })
 
@@ -127,6 +141,42 @@ describe('control types', () => {
       $select: [{ $bucket: 'day', $field: 'points', $as: 'day' }],
     }
     expectTypeOf(bad).toExtend<object>()
+  })
+
+  it('AggregateControls.$select: countDistinct over dimensions and measures, * only for count', () => {
+    const ok: AggregateControls<Ticket, 'status', 'points'> = {
+      $groupBy: ['status'],
+      $select: [
+        { $fn: 'count', $field: '*' },
+        { $fn: 'countDistinct', $field: 'points' },
+        { $fn: 'countDistinct', $field: 'status' },
+      ],
+    }
+    expectTypeOf(ok).toExtend<AggregateControls<Ticket, 'status', 'points'>>()
+    const notAField: AggregateControls<Ticket, 'status', 'points'> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — 'openedAt' is neither a dimension nor a measure here
+      $select: [{ $fn: 'countDistinct', $field: 'openedAt' }],
+    }
+    expectTypeOf(notAField).toExtend<object>()
+    const dimSum: AggregateControls<Ticket, 'status', 'points'> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — other aggregates stay limited to measures
+      $select: [{ $fn: 'sum', $field: 'status' }],
+    }
+    expectTypeOf(dimSum).toExtend<object>()
+    const bad: AggregateControls<Ticket> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — a distinct count needs a field
+      $select: [{ $fn: 'countDistinct', $field: '*' }],
+    }
+    expectTypeOf(bad).toExtend<object>()
+    const sumStar: AggregateControls<Ticket> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — only count accepts '*'
+      $select: [{ $fn: 'sum', $field: '*' }],
+    }
+    expectTypeOf(sumStar).toExtend<object>()
   })
 
   it('rejects an unknown unit and week start', () => {

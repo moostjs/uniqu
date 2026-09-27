@@ -774,6 +774,23 @@ describe('parseUrl – aggregate functions in $select', () => {
     ])
   })
 
+  it('countDistinct(field), with and without alias', () => {
+    const r = parseUrl('$select=region,countDistinct(customerId),countDistinct(customerId):n&$groupBy=region')
+    expect(r.controls.$select).toEqual([
+      'region',
+      { $fn: 'countDistinct', $field: 'customerId', $as: 'countDistinct_customerId' },
+      { $fn: 'countDistinct', $field: 'customerId', $as: 'n' },
+    ])
+    expect(r.insights.get('customerId')).toEqual(new Set(['countDistinct']))
+  })
+
+  it('passes fn(*) through for any function — validation is core\'s (validateAggregateExpr)', () => {
+    expect(parseUrl('$select=countDistinct(*),sum(*):s').controls.$select).toEqual([
+      { $fn: 'countDistinct', $field: '*', $as: 'countDistinct_star' },
+      { $fn: 'sum', $field: '*', $as: 's' },
+    ])
+  })
+
   it('custom (unknown) aggregate function', () => {
     const r = parseUrl('$select=stddev(score):sd')
     expect(r.controls.$select).toEqual([

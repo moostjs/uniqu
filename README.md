@@ -106,7 +106,7 @@ const { controls, insights } = parseUrl(
 // }
 ```
 
-Aggregate functions (`sum`, `count`, `avg`, `min`, `max`) appear as `AggregateExpr` objects in `$select`. The `$fn` field accepts any string for extensibility — consumers validate supported functions.
+Aggregate functions (`sum`, `count`, `countDistinct`, `avg`, `min`, `max`) appear as `AggregateExpr` objects in `$select`. The `$fn` field accepts any string for extensibility — consumers validate supported functions.
 
 Use `$having` to filter groups after aggregation (SQL `HAVING`):
 
