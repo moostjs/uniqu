@@ -6,7 +6,7 @@ import type {
   InsightOp,
   Uniquery,
 } from './types'
-import { walkFilter, type FilterVisitor } from './walk'
+import { isPlainObject, walkFilter, type FilterVisitor } from './walk'
 
 /**
  * Compute insights (field → operators map) from an already-built query.
@@ -28,6 +28,14 @@ export function computeInsights(
     set.add(op)
   }
 
+  /** Report a related entity's insights under the `prefix.` field path. */
+  function capturePrefixed(prefix: string, nested: UniqueryInsights) {
+    for (const [field, ops] of nested) {
+      const prefixed = `${prefix}.${field}`
+      for (const op of ops) capture(prefixed, op)
+    }
+  }
+
   const visitor: FilterVisitor<void> = {
     comparison(field, op) {
       capture(field, op)
@@ -35,6 +43,14 @@ export function computeInsights(
     and() {},
     or() {},
     not() {},
+    relation(field, op, operand) {
+      // The operand filters the related entity: its fields are reported with
+      // the nav-field prefix, the same way `$with` sub-query insights are.
+      capture(field, op)
+      // A malformed operand (array, string, null, a resolved adapter node, …)
+      // has no field paths to report; consumers reject it on their own.
+      if (isPlainObject(operand)) capturePrefixed(field, computeInsights(operand))
+    },
   }
   if (filter) walkFilter(filter, visitor)
 
@@ -66,6 +82,9 @@ export function computeInsights(
   if (controls?.$having) {
     const havingVisitor: FilterVisitor<void> = {
       comparison(field) { capture(aliasToField.get(field) ?? field, '$having') },
+      // Relational predicates are not valid in `$having`; report the key so
+      // consumers reject it as an unknown/invalid `$having` field.
+      relation(field) { capture(field, '$having') },
       and() {},
       or() {},
       not() {},
@@ -86,12 +105,7 @@ export function computeInsights(
       capture(entry.name, '$with')
       const nested = entry.insights ?? computeInsights(entry.filter, entry.controls)
       if (nested.size) entry.insights = nested
-      for (const [field, ops] of nested) {
-        const prefixed = `${entry.name}.${field}`
-        for (const op of ops) {
-          capture(prefixed, op)
-        }
-      }
+      capturePrefixed(entry.name, nested)
     }
   }
 

@@ -79,6 +79,17 @@ const query: Uniquery<User, UserNav> = {
 
 When no generic is provided, any string key is accepted (untyped mode).
 
+### Relational predicates
+
+A navigation field takes `$some` / `$none` to filter by related rows — typed through `Nav` like `$with`:
+
+```ts
+const q: Uniquery<User, UserNav> = {
+  filter: { posts: { $some: { published: true } } }, // users with a published post
+};
+// URL: posts=$some(published=true)
+```
+
 ## Aggregation
 
 Uniqu supports aggregate queries with `$groupBy` and aggregate functions in `$select`:
@@ -117,7 +128,7 @@ const { controls } = parseUrl(
 // controls.$having → { total: { $gt: 1000 } }
 ```
 
-Group a timestamp by calendar day, week, month, quarter or year in any IANA time zone with `bucket(...)` — the server returns each bucket as the local date it starts on (`'2026-03-01'`):
+Group a timestamp by local hour, calendar day, week, month, quarter or year in any IANA time zone with `bucket(...)` — the server returns each bucket as the local date it starts on (`'2026-03-01'`), or for an hour its local date and hour (`'2026-03-01T14:00'`):
 
 ```ts
 const { controls } = parseUrl(

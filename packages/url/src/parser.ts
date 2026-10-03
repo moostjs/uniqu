@@ -4,10 +4,9 @@ import type {
   ComparisonNode,
   ComparisonOp,
   Primitive,
-  InsightOp,
-  UniqueryInsights,
+  RelationOp,
 } from '@uniqu/core'
-import { isPrimitive, isLogicalKey } from '@uniqu/core'
+import { isPrimitive, isLogicalKey, isRelationOp } from '@uniqu/core'
 
 const opMap: Partial<Record<TokenType, ComparisonOp>> = {
   'op-eq': '$eq',
@@ -19,9 +18,17 @@ const opMap: Partial<Record<TokenType, ComparisonOp>> = {
   'op-regex': '$regex',
 }
 
+/**
+ * Hard cap on `$some(` / `$none(` nesting in a URL filter: a stack-safety
+ * bound for the recursive parser and filter walkers, far above any
+ * consumer's own nesting limit.
+ */
+const MAX_RELATION_DEPTH = 32
+
 export class Parser {
   private i = 0
-  private insights: UniqueryInsights = new Map()
+  /** Current relational predicate nesting depth (bounded by `MAX_RELATION_DEPTH`). */
+  private relDepth = 0
 
   constructor(private readonly t: Token[]) {}
 
@@ -33,6 +40,9 @@ export class Parser {
 
   private consume(type?: TokenType) {
     const tok = this.t[this.i++]
+    if (!tok) {
+      throw new SyntaxError(`Expected ${type ?? 'a token'}, got end of input`)
+    }
     if (type && tok.type !== type) {
       throw new SyntaxError(
         `Expected ${type}, got "${tok.value}" at pos ${tok.pos}`,
@@ -54,21 +64,6 @@ export class Parser {
       throw new SyntaxError(
         `Unexpected token at pos ${this.t[this.i]?.pos}. End of input expected.`,
       )
-  }
-
-  /* ── insights ────────────────────────────────────────── */
-
-  captureInsight(field: string, op: InsightOp) {
-    let set = this.insights.get(field)
-    if (!set) {
-      set = new Set()
-      this.insights.set(field, set)
-    }
-    set.add(op)
-  }
-
-  getInsights(): UniqueryInsights {
-    return this.insights
   }
 
   /* ── grammar ─────────────────────────────────────────── */
@@ -100,6 +95,13 @@ export class Parser {
   }
 
   private parseTerm(): FilterExpr {
+    if (!this.peek()) {
+      const last = this.t[this.t.length - 1]
+      throw new SyntaxError(
+        `Unexpected end of input${last ? ` after "${last.value}" at pos ${last.pos}` : ''}`,
+      )
+    }
+
     /* NOT group  !(expr) */
     if (this.peek()?.type === 'bang' && this.peek(1)?.type === 'lparen') {
       this.consume('bang')
@@ -146,8 +148,6 @@ export class Parser {
           [op1]: lhsLit,
           [op2]: rhsLit,
         }
-        this.captureInsight(field, op1)
-        this.captureInsight(field, op2)
         return out
       }
     }
@@ -162,9 +162,6 @@ export class Parser {
         fields.push(this.consume('word').value)
         while (this.match('comma'))
           fields.push(this.consume('word').value)
-        for (const field of fields) {
-          this.captureInsight(field, '$exists')
-        }
         return buildExists(fields, kwTok.value === '$exists')
       }
     }
@@ -186,13 +183,19 @@ export class Parser {
       const out: FilterExpr = {}
       const op: ComparisonOp = negate ? '$nin' : '$in'
       out[field] = { [op]: list }
-      this.captureInsight(field, op)
       return out
     }
 
     /* comparison   path op lit */
     const fieldTok = this.consume('word')
     const opTok = this.consume() as Token
+
+    /* relational predicate   path = $some( [expr] )  |  path = $none( [expr] ) */
+    const relTok = this.peek()
+    if (relTok?.type === 'keyword' && isRelationOp(relTok.value)) {
+      return this.parseRelation(fieldTok.value, opTok, relTok)
+    }
+
     const lit = this.parseLiteral()
     const op = opMap[opTok.type]
     const field = fieldTok.value
@@ -201,10 +204,37 @@ export class Parser {
         `Unsupported operator "${opTok.value}" at pos ${opTok.pos}`,
       )
 
-    this.captureInsight(field, op)
     return op === '$eq'
       ? { [field]: lit }
       : { [field]: { [op]: lit } }
+  }
+
+  /**
+   * `field=$some(<expr>)` / `field=$none(<expr>)` → `{ field: { $some: <expr | {}> } }`.
+   */
+  private parseRelation(field: string, opTok: Token, relTok: Token): FilterExpr {
+    const op = relTok.value as RelationOp
+    if (opTok.type !== 'op-eq') {
+      throw new SyntaxError(
+        `Relational predicate "${op}" must follow "=" (got "${opTok.value}" at pos ${opTok.pos}); negate with ${field}=$none(…) or !(…)`,
+      )
+    }
+    if (this.relDepth >= MAX_RELATION_DEPTH) {
+      throw new SyntaxError(
+        `Relational predicates nested deeper than ${MAX_RELATION_DEPTH} levels at pos ${relTok.pos}`,
+      )
+    }
+    this.consume('keyword')
+    this.consume('lparen')
+    this.relDepth++
+    let operand: FilterExpr = {}
+    try {
+      if (this.peek()?.type !== 'rparen') operand = this.parseDisjunction()
+    } finally {
+      this.relDepth--
+    }
+    this.consume('rparen')
+    return { [field]: { [op]: operand } }
   }
 
   parseLiteral(): Primitive {
@@ -257,9 +287,15 @@ function mergeConjunction(nodes: FilterExpr[]): FilterExpr | null {
           ? new Set(['$eq'])
           : new Set(Object.keys(val as object))
         const intersects: boolean = currentOps.some((op) => otherOps.has(op))
-        if (intersects) {
-          // Same operator twice on one field: close the current object and
-          // start the next one with this clause (never drop it).
+        // A relational predicate never shares an operator map with comparison
+        // operators (`ticket=$some(a=1)&ticket=5` stays two `$and` members):
+        // mixed maps are not predicates (`isRelationPredicate`) and consumers
+        // reject them, so keep each clause well-formed.
+        const mixesKinds = currentOps.some(isRelationOp) !== (otherOps.has('$some') || otherOps.has('$none'))
+        if (intersects || mixesKinds) {
+          // Same operator twice on one field (or a predicate next to a
+          // comparison): close the current object and start the next one
+          // with this clause (never drop it).
           merged.push(currentMerge)
           currentMerge = { [key]: val }
         } else {

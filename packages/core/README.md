@@ -152,6 +152,36 @@ When a `Nav` generic is provided, string entries and `name` fields are constrain
 
 Uniqu is a query parser, not an ORM. It records what was requested — the consumer (e.g. a database adapter) decides how to execute it (JOINs, subqueries, separate queries), validates relation names against its schema, and enforces depth/security limits.
 
+### Relational Predicates (`$some` / `$none`)
+
+A navigation field in a filter takes a relational predicate: an operator map that filters the **parent** rows by the existence of related rows. The operand is a filter on the related entity — its keys are the target's fields:
+
+```ts
+const query: Uniquery = {
+  filter: {
+    // issues whose ticket is open and belongs to team t1 or t2
+    ticket: { $some: { teamId: { $in: ['t1', 't2'] }, status: 'open' } },
+    // ... and that have no labels named "wontfix"
+    labels: { $none: { name: 'wontfix' } },
+  },
+}
+```
+
+| Operator | Matches a parent row when |
+|----------|---------------------------|
+| `$some: F` | at least one related row matches `F` |
+| `$none: F` | no related row matches `F` |
+| `$some: {}` | it has any related row |
+| `$none: {}` | it has no related row |
+
+- One meaning for to-one and to-many relations. Several operators on one key are ANDed (`{ ticket: { $some: A, $none: B } }`).
+- The operand may hold predicates on the target's own navigation fields (`{ ticket: { $some: { team: { $none: { name: 'x' } } } } }`).
+- There is no `$every`: "every related row matches `F`" is `$none: { $not: F }`.
+- Predicates sit anywhere a comparison can — under `$and` / `$or` / `$not`, and inside `$with` sub-query filters.
+- `$with` and predicates are independent: `$with` filters the **loaded children**, a predicate filters the **parents**.
+
+Uniqu defines the shape only. Which relations exist, how a predicate is executed (SQL `EXISTS`, a `$lookup`, …) and which callers may use it is the consumer's decision.
+
 ### Aggregation (`$groupBy` + `$select`)
 
 `$groupBy` declares grouping fields. Aggregate functions appear as `AggregateExpr` objects in the `$select` array alongside plain field names:
@@ -192,7 +222,7 @@ Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`
 
 #### Calendar buckets (`BucketExpr`)
 
-A bucket groups a timestamp field (epoch milliseconds) by calendar day, week, month, quarter or year in a chosen time zone. It is a computed entry in `$select` with an alias, and `$groupBy`, `$sort` and `$having` refer to that alias:
+A bucket groups a timestamp field (epoch milliseconds) by local hour, calendar day, week, month, quarter or year in a chosen time zone. It is a computed entry in `$select` with an alias, and `$groupBy`, `$sort` and `$having` refer to that alias:
 
 ```ts
 const query: Uniquery = {
@@ -213,13 +243,18 @@ const query: Uniquery = {
 
 | Field | Values | Default |
 |-------|--------|---------|
-| `$bucket` | `'day' \| 'week' \| 'month' \| 'quarter' \| 'year'` | — |
+| `$bucket` | `'hour' \| 'day' \| 'week' \| 'month' \| 'quarter' \| 'year'` | — |
 | `$field` | timestamp field (epoch ms) | — |
 | `$tz` | canonical IANA zone (`'Europe/Berlin'`, `'Asia/Kolkata'`) | `'UTC'` |
 | `$weekStart` | `'mon'` … `'sun'` — only with `$bucket: 'week'` | `'mon'` (ISO 8601) |
 | `$as` | alias; required when `$field` contains `.` | `${unit}_${field}` |
 
-**The value is a label, not a timestamp:** the local calendar date of the bucket's first day as `YYYY-MM-DD`, for every unit — `'2026-03-22'` for a week starting Sunday 22 March, `'2026-03-01'` for March, `'2026-01-01'` for Q1. Labels are DST-safe (only instant → local date is ever computed), sort chronologically as plain strings (so `$sort` and string comparisons in `$having` just work), and a week may start in the previous month or year (week(mon) of 2027-01-01 is `'2026-12-28'`). A null source, or an instant outside `[1970-01-02T00:00Z, 3000-01-01T00:00Z)`, gives a `null` label — those rows form one null group. `AggregateResult` types the label as `CalendarBucketLabel` (a string), `| null` when the source field is optional or nullable.
+**The value is a label, not a timestamp:** the local calendar date of the bucket's first day as `YYYY-MM-DD` — `'2026-03-22'` for a week starting Sunday 22 March, `'2026-03-01'` for March, `'2026-01-01'` for Q1 — and for `'hour'` the local date and hour as `YYYY-MM-DDTHH:00`. Labels are wall-clock times in the bucket's zone, computed only from instant → local time (so they are DST-safe); use `bucketStartInstant(label, tz)` for the instant a bucket starts — `new Date(label)` would read it in the runtime's zone. They sort chronologically as plain strings (so `$sort` and string comparisons in `$having` just work), and a week may start in the previous month or year (week(mon) of 2027-01-01 is `'2026-12-28'`). A null source, or an instant outside `[1970-01-02T00:00Z, 3000-01-01T00:00Z)`, gives a `null` label — those rows form one null group. `AggregateResult` types the label as `CalendarBucketLabel` (a string), `| null` when the source field is optional or nullable.
+
+**Hour buckets** are labelled with the local date and wall-clock hour (`'2026-03-29T14:00'`). The hour is the hour on the clock in `$tz`, so in zones with a non-whole-hour offset it starts at :30 or :45 past a UTC hour (10:00 in `Asia/Kolkata` is 04:30Z). Around DST transitions the label follows the clock, the same rule as `'day'` (whose fall-back day lasts 25 hours):
+
+- **Fall-back:** the repeated hour is one label. In `Europe/Berlin` on 2026-10-25, `'2026-10-25T02:00'` covers 00:00Z–02:00Z — both passes of 02:00–03:00 local.
+- **Spring-forward:** the skipped hour has no label. In `Europe/Berlin` on 2026-03-29, `'2026-03-29T01:00'` is followed by `'2026-03-29T03:00'`. A shift of 30 minutes (`Australia/Lord_Howe`) leaves a half-hour bucket instead.
 
 Validation that needs no schema lives here, so every consumer rejects the same inputs with the same wording. `resolveBuckets(controls)` returns `{ ok: true, buckets }` or `{ ok: false, issues: [{ path, message }] }` — it rejects unknown units, zones and week starts, a `$weekStart` on a non-week unit, a bucket outside a grouped query or missing from `$groupBy`, duplicate aliases, `$select` entries that are neither a field, an aggregate nor a bucket, and aggregates that fail `validateAggregateExpr`. Pass `{ isField: (name) => boolean }` to also reject an alias that collides with a real field of your schema (by default only fields selected in `$select` are checked), `{ aggregate: true }` when the query is grouped by other means, and `{ fns: AGGREGATE_FNS }` (or your own list) to reject unknown aggregate functions. `checkTimeZone(tz)` validates a zone and returns its canonical spelling (an alias such as `'US/Eastern'` is rejected with a hint naming `'America/New_York'`). Which fields may be bucketed (for example only timestamp-typed ones) is up to the consumer.
 
@@ -230,14 +265,21 @@ Validation that needs no schema lives here, so every consumer rejects the same i
 The date math is exported too, so clients produce exactly the labels servers return:
 
 ```ts
-import { bucketLabel, bucketer, nextBucketLabel, bucketStartInstant } from '@uniqu/core'
+import { bucketLabel, bucketer, bucketSeries, nextBucketLabel, bucketStartInstant } from '@uniqu/core'
 
 bucketLabel(Date.UTC(2026, 2, 29, 0, 30), 'day', 'Europe/Berlin') // '2026-03-29'
 const weekOf = bucketer('week', 'Europe/Berlin', 'sun')            // resolve once, label many rows
 rows.map((r) => weekOf(r.openedAt))
-nextBucketLabel('2026-01-31', 'month')                             // '2026-02-01' — fill gaps in a chart
 bucketStartInstant('2026-03-29', 'Europe/Berlin')                  // first instant of that local date (ms)
+bucketLabel(Date.UTC(2026, 2, 29, 1, 30), 'hour', 'Europe/Berlin') // '2026-03-29T03:00'
+
+// the full axis between two returned labels — fill the empty buckets of a chart
+bucketSeries('2026-03-29T00:00', '2026-03-29T04:00', 'hour', { tz: 'Europe/Berlin' })
+// ['2026-03-29T00:00', '2026-03-29T01:00', '2026-03-29T03:00', '2026-03-29T04:00'] — the DST gap is left out
+nextBucketLabel('2026-01-31', 'month')                             // '2026-02-01' — one step
 ```
+
+`bucketSeries(first, last, unit, { weekStart?, tz?, maxLength? })` lists every label from the bucket holding `first` through the one holding `last`; pass the query's unit, `$weekStart` and `$tz`. With `tz` it leaves out labels no instant has in that zone — the hour a spring-forward skips, or a skipped date such as `Pacific/Apia`'s 2011-12-30 — so the axis matches what the server can return. It throws a `RangeError` past `maxLength` labels (default 100 000). `nextBucketLabel(label, unit, { weekStart?, tz? })` is the single step (the third argument may also be just the week start, the older form); it is zone-free unless `tz` is given. `bucketStartInstant(label, tz)` accepts either label format and returns the first instant of that local day or hour; a repeated hour starts at its first pass, and a start that falls in a DST gap resolves to the transition instant.
 
 #### Post-Aggregation Filter (`$having`)
 
@@ -298,6 +340,23 @@ const filter: FilterExpr<User> = {
 
 When typed, only keys of `T` are allowed — no arbitrary string keys. Without a generic argument, `FilterExpr` accepts any string keys with any values (untyped mode).
 
+A second generic, `Nav`, types [relational predicates](#relational-predicates-some--none). Each `Nav` key accepts `{ $some?, $none? }` whose operand is typed by the target's `__ownProps` (fields) and `__navProps` (nested predicates). Array targets (to-many) use their element type:
+
+```ts
+type TicketNav = { team: { __ownProps: { id: string; name: string }; __navProps: {} } }
+type Ticket = { __ownProps: { key: string; status: string }; __navProps: TicketNav }
+type IssueNav = { ticket: Ticket }
+
+const filter: FilterExpr<{ id: number; title: string }, IssueNav> = {
+  title: 'Crash on save',
+  ticket: { $some: { status: 'open', team: { $none: { name: 'Ops' } } } },
+  // ticket: { $some: { nope: 1 } },  // type error: 'nope' is not a Ticket field
+  // title: { $some: {} },            // type error: title is not a navigation field
+}
+```
+
+`Uniquery<T, Nav>` passes `Nav` to its filter, and typed `$with` entries pass the target's navigation props to theirs. `Nav` defaults to `{}`; a wide `Record<string, unknown>` contributes nothing, so untyped filters are unchanged.
+
 ### Type-Safe Controls
 
 `UniqueryControls<T>` constrains `$select` and `$sort` field names when a type parameter is provided:
@@ -356,8 +415,13 @@ interface FilterVisitor<R> {
 
   /** Negate a child expression. */
   not(child: R): R
+
+  /** Relational predicate `{ field: { $some | $none: operand } }` (optional). */
+  relation?(field: string, op: RelationOp, operand: FilterExpr): R
 }
 ```
+
+`relation` receives the operand **unwalked**: it is a filter on another entity, so the visitor decides what to do with it — render a subquery, walk it with a visitor bound to the related table, prefix insights, and so on. A visitor without `relation` makes `walkFilter` throw `Relational predicate "$some" on "<field>" is not supported by this filter visitor` when a filter contains a predicate; filters without predicates never reach it.
 
 ### Walker Behavior
 
@@ -368,6 +432,7 @@ interface FilterVisitor<R> {
 - Children are visited before their parent (depth-first, post-order)
 - A logical key whose value is `undefined` is skipped
 - An empty node calls `and([])`
+- A `$some` / `$none` operator on a field calls `relation(field, op, operand)` once per operator; the walker does not descend into `operand`
 
 ## Lazy Insights
 
@@ -417,6 +482,18 @@ const insights = computeInsights({}, controls)
 // comments.insights     => Map { 'body' => Set { '$regex' } }
 ```
 
+Relational predicates are captured the same way: the navigation field with its operator, and the operand's fields with the navigation-field prefix:
+
+```ts
+computeInsights({ ticket: { $some: { status: 'open', team: { $none: { name: 'x' } } } } })
+// Map {
+//   'ticket'           => Set { '$some' },
+//   'ticket.status'    => Set { '$eq' },
+//   'ticket.team'      => Set { '$none' },
+//   'ticket.team.name' => Set { '$eq' },
+// }
+```
+
 Use cases: field whitelisting, operator auditing, index planning, relation validation.
 
 ### `getInsights`
@@ -441,9 +518,12 @@ const insights = getInsights(query)
 | `FieldOpsFor<V>` | Per-field typed operator map |
 | `FieldOps` | Untyped operator map (`FieldOpsFor<Primitive>`) |
 | `FieldValue` | `Primitive \| FieldOps` |
-| `FilterExpr<T>` | `ComparisonNode<T> \| LogicalNode<T>` |
-| `ComparisonNode<T>` | Leaf node — keys constrained to `keyof T` when typed |
-| `LogicalNode<T>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — at most one logical key per object at the type level (the others are `never`); comparison fields may sit alongside it, and the runtime ANDs several logical keys |
+| `FilterExpr<T, Nav>` | `ComparisonNode<T, Nav> \| LogicalNode<T, Nav>` |
+| `ComparisonNode<T, Nav>` | Leaf node — keys constrained to `keyof T` when typed; typed `Nav` keys accept a `RelationPredicate` |
+| `RelationOp` | `'$some' \| '$none'` |
+| `RelationPredicate<E>` | `{ $some?, $none? }` — operands typed by `E`'s `__ownProps` / `__navProps` |
+| `OwnOf<E>` / `NavOf<E>` | `E['__ownProps']` / `E['__navProps']`, or untyped / `{}` |
+| `LogicalNode<T, Nav>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — at most one logical key per object at the type level (the others are `never`); comparison fields may sit alongside it, and the runtime ANDs several logical keys |
 | `AggregateFn` | `'sum' \| 'count' \| 'countDistinct' \| 'avg' \| 'min' \| 'max'` |
 | `AggregateExpr<Fn, Field, Alias>` | `{ $fn, $field, $as? }` — aggregate function call in `$select`. Generic params preserve literal types for result inference |
 | `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
@@ -456,7 +536,7 @@ const insights = getInsights(query)
 | `AggregateQuery<T, D, M>` | Typed aggregate query — `{ filter?, controls, insights? }` with dimension/measure constraints |
 | `AggregateResult<T, Select>` | Infer result row type from `$select` — dimensions preserve original types, aggregates → `number` (min/max preserve field type) |
 | `ResolveAlias<A>` | Resolve the output alias of an `AggregateExpr` — uses `$as` if provided, otherwise `{fn}_{field}` |
-| `InsightOp` | `ComparisonOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| '$having' \| AggregateFn \| string` |
+| `InsightOp` | `ComparisonOp \| RelationOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| '$having' \| AggregateFn \| string` |
 | `UniqueryInsights` | `Map<string, Set<InsightOp>>` |
 
 ### Functions
@@ -467,6 +547,10 @@ const insights = getInsights(query)
 | `computeInsights` | `(filter: FilterExpr, controls?: UniqueryControls) => UniqueryInsights` | Lazily compute field/operator usage map |
 | `getInsights` | `(query: Uniquery) => UniqueryInsights` | Return pre-computed or lazily computed insights |
 | `isPrimitive` | `(x: unknown) => x is Primitive` | Type guard for primitive values |
+| `RELATION_OPS` | `readonly RelationOp[]` | `['$some', '$none']` (frozen) |
+| `isRelationOp` | `(op: string) => op is RelationOp` | True for `$some` / `$none` |
+| `isRelationPredicate` | `(value: unknown) => value is RelationPredicate` | True for a well-formed predicate: a non-empty plain object whose keys are all relation operators and whose operands are all plain objects (`{ $some: undefined }` and mixed maps are not) |
+| `hasRelationOp` | `(value: unknown) => boolean` | True for an operator map carrying any `$some` / `$none` key, malformed or mixed. Like `walkFilter`, it treats a primitive, `RegExp`, `Date` or class instance as a value, never an operator map. `walkFilter` dispatches every such key to `relation`, so a gate should reject values where `hasRelationOp` holds but `isRelationPredicate` does not |
 | `AGGREGATE_FNS` | `readonly AggregateFn[]` | The known aggregate function names |
 | `isAggregateFn` | `(name: unknown) => name is AggregateFn` | True for a known aggregate function name |
 | `STAR_AGGREGATE_FNS` | `readonly AggregateFn[]` | Known functions that accept `'*'` as `$field` (`count`) |

@@ -760,6 +760,34 @@ describe('buildUrl – round-trip with parseUrl', () => {
     expect((roundTrip(query).filter as Record<string, unknown>).tableKey).toBe('orders-cancelled')
   })
 
+  it('fuzz: bare-word-like strings (hyphens, dots, literal prefixes, digits) round-trip', () => {
+    const atoms = ['a', 'Z', '0', '1', '7', '-', '-', '.', '_', 'e', 'true', 'false', 'null', ' ', "'", '+', ':', 'T', '2026-03-29T14:00']
+    let seed = 7
+    const next = () => (seed = (seed * 48271) % 2147483647)
+    for (let n = 0; n < 5000; n++) {
+      let v = ''
+      for (let k = 1 + (next() % 6); k > 0; k--) v += atoms[next() % atoms.length]
+      for (const query of [
+        { filter: { v } },
+        { filter: { v: { $ne: v }, w: { $in: [v, 'x'] } } },
+        { filter: { rel: { $some: { v } } } },
+      ] as Uniquery[]) {
+        const qs = buildUrl(query)
+        expect(parseUrl(qs).filter, `${JSON.stringify(v)} -> ${qs}`).toEqual(query.filter)
+        expect(roundTripViaUrl(query).filter, `${JSON.stringify(v)} -> ${qs}`).toEqual(query.filter)
+      }
+    }
+  })
+
+  it('hour labels round-trip and match the hand-written bare form', () => {
+    for (const v of ['2026-03-29T14:00', '2026-03-29T14:00:30', '2026-03-29T14:00:00.000Z']) {
+      const query: Uniquery = { filter: { h: v, r: { $some: { h: { $gte: v } } } } }
+      expect(roundTrip(query).filter).toEqual(query.filter)
+      expect(roundTripViaUrl(query).filter).toEqual(query.filter)
+    }
+    expect(parseUrl('h=2026-03-29T14:00').filter).toEqual(roundTrip({ filter: { h: '2026-03-29T14:00' } }).filter)
+  })
+
   it('file-path-like values round-trip', () => {
     for (const v of ['/api/foo', 'a:b', 'a;b', 'q?r', 'x*y', 'a/b/c', 'arn:aws:s3:::bucket']) {
       const query: Uniquery = { filter: { v } }
@@ -1243,7 +1271,7 @@ describe('buildUrl – calendar buckets', () => {
   })
 
   it('round-trips units × zone × week start × alias', () => {
-    for (const $bucket of ['day', 'week', 'month', 'quarter', 'year'] as const) {
+    for (const $bucket of ['hour', 'day', 'week', 'month', 'quarter', 'year'] as const) {
       for (const $tz of [undefined, 'UTC', 'Europe/Berlin', 'America/New_York', 'Etc/GMT+5']) {
         for (const $weekStart of [undefined, 'sun', 'mon'] as const) {
           for (const $as of [undefined, 'b']) {
@@ -1320,5 +1348,80 @@ describe('buildUrl – calendar buckets', () => {
         ],
       },
     })
+  })
+})
+
+describe('buildUrl – relational predicates', () => {
+  it('serializes field=$some(<operand>) / $none', () => {
+    expect(buildUrl({ filter: { ticket: { $some: { status: 'open' } } } })).toBe('ticket=$some(status=open)')
+    expect(buildUrl({ filter: { ticket: { $none: {} } } })).toBe('ticket=$none()')
+    expect(buildUrl({ filter: { ticket: { $some: { teamId: { $in: ['t1', 't2'] }, status: 'open' } } } })).toBe(
+      'ticket=$some(teamId{t1,t2}&status=open)',
+    )
+  })
+
+  const cases: Array<[string, Uniquery]> = [
+    ['to-one with $in + eq', { filter: { ticket: { $some: { teamId: { $in: ['t1', 't2'] }, status: 'open' } } } }],
+    ['nested 2 levels', { filter: { ticket: { $some: { team: { $none: { name: 'x y' } }, status: 'open' } } } }],
+    ['empty body', { filter: { ticket: { $some: {} }, title: 'a' } }],
+    ['OR inside body', { filter: { ticket: { $some: { $or: [{ status: 'open' }, { status: 'new' }] } } } }],
+    ['predicate under OR / NOT', { filter: { $or: [{ a: 1 }, { $not: { ticket: { $none: { b: 2 } } } }] } }],
+    ['quoted value containing )', { filter: { ticket: { $some: { title: 'a)b(c&d%e' } } } }],
+    ['$some and $none on one key', { filter: { ticket: { $some: { a: 1 }, $none: { b: 2 } } } }],
+    [
+      'inside $with',
+      { filter: {}, controls: { $with: [{ name: 'a', filter: { b: { $some: { c: 1, d: 'x)y' } } }, controls: {} }] } },
+    ],
+  ]
+
+  for (const [name, query] of cases) {
+    it(`round-trips: ${name}`, () => {
+      for (const parsed of [roundTrip(query), roundTripViaUrl(query)]) {
+        expect(parsed.filter).toEqual(query.filter)
+        if (query.controls) expect(stripInsights(parsed.controls)).toEqual(query.controls)
+      }
+    })
+  }
+
+  it('refuses an operand that matches nothing instead of widening it to "any related row"', () => {
+    for (const operand of [{ $or: [] }, { $not: {} }, { $and: [{ $or: [] }] }]) {
+      const f = { ticket: { $some: operand } } as Uniquery['filter']
+      expect(() => buildUrl({ filter: f })).toThrow(/matches no row/)
+    }
+    // A never-member makes the whole AND match no row — it is not dropped to widen the operand.
+    const f = { ticket: { $some: { a: 1, $or: [] } } } as Uniquery['filter']
+    expect(() => buildUrl({ filter: f })).toThrow(/matches no row/)
+  })
+
+  it('never widens or narrows a filter by dropping an absorbing empty member', () => {
+    // AND with a never-member matches no row — at the root too (an empty query = every row)
+    for (const filter of [{ $or: [] }, { a: 1, $or: [] }, { $and: [{ a: 1 }, { $not: {} }] }]) {
+      expect(() => buildUrl({ filter } as Uniquery)).toThrow(/matches no row/)
+    }
+    // OR with an every-row member matches every row
+    expect(buildUrl({ filter: { $or: [{}, { a: 1 }] } } as Uniquery)).toBe('')
+    expect(buildUrl({ filter: { b: 2, $or: [{ $and: [] }, { a: 1 }] } } as Uniquery)).toBe('b=2')
+    // NOT of a never-AND matches every row; NOT of an every-OR matches none
+    expect(buildUrl({ filter: { b: 2, $not: { a: 1, $or: [] } } } as Uniquery)).toBe('b=2')
+    expect(() => buildUrl({ filter: { $not: { $or: [{}, { a: 1 }] } } } as Uniquery)).toThrow(
+      /matches no row/,
+    )
+    // OR drops never-members; AND drops every-row members
+    expect(buildUrl({ filter: { $or: [{ $or: [] }, { a: 1 }, { b: 2 }] } } as Uniquery)).toBe('a=1^b=2')
+    expect(buildUrl({ filter: { $and: [{}, { a: 1 }] } } as Uniquery)).toBe('a=1')
+  })
+
+  it('keeps tautological empty operands as the empty body', () => {
+    for (const operand of [{}, { $and: [] }, { $or: [{}] }, { $or: [{ $and: [] }, { $or: [] }] }]) {
+      expect(buildUrl({ filter: { ticket: { $none: operand } } as Uniquery['filter'] })).toBe('ticket=$none()')
+    }
+  })
+
+  it('refuses non-object operands', () => {
+    for (const operand of [null, undefined, [], [{ a: 1 }], 'x', 5, new Date(0)]) {
+      expect(() => buildUrl({ filter: { ticket: { $some: operand } } as unknown as Uniquery['filter'] })).toThrow(
+        /needs a filter object operand/,
+      )
+    }
   })
 })

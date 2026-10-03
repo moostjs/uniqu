@@ -7,7 +7,7 @@ import type {
   UniqueryControls,
   WithRelation,
 } from '@uniqu/core'
-import { isBucketExpr, resolveAlias, walkFilter } from '@uniqu/core'
+import { isBucketExpr, isPlainObject, resolveAlias, walkFilter } from '@uniqu/core'
 
 /**
  * Build a URL query string from a Uniquery object.
@@ -26,6 +26,8 @@ export function buildUrl(query: Uniquery): string {
 interface TUrlPart {
   s: string
   kind: 'leaf' | 'and' | 'or'
+  /** Serialized to nothing yet matches no row (`{ $or: [] }`, `{ $not: {} }`). */
+  never?: boolean
 }
 
 /**
@@ -35,8 +37,17 @@ interface TUrlPart {
  * is preserved so an enclosing node can still group it correctly.
  */
 function joinParts(children: TUrlPart[], kind: 'and' | 'or'): TUrlPart {
+  // An empty member is either "matches no row" (`never`) or "matches every row". One
+  // absorbing member decides the whole node: a never-member in an AND, an every-member
+  // in an OR — dropping it would widen (AND) or narrow (OR) the filter.
+  if (kind === 'and' ? children.some((c) => c.never) : children.some((c) => !c.s && !c.never)) {
+    return { s: '', kind: 'leaf', never: kind === 'and' }
+  }
   const parts = children.filter((child) => child.s)
-  if (parts.length === 0) return { s: '', kind: 'leaf' }
+  if (parts.length === 0) {
+    // AND of tautologies matches every row; OR of never-members (`{ $or: [] }`) matches none.
+    return { s: '', kind: 'leaf', never: kind === 'or' }
+  }
   if (parts.length === 1) return parts[0]
   const wrap = kind === 'and' ? 'or' : 'and'
   const separator = kind === 'and' ? '&' : '^'
@@ -64,7 +75,26 @@ const urlVisitor: FilterVisitor<TUrlPart> = {
   },
   and: (children) => joinParts(children, 'and'),
   or: (children) => joinParts(children, 'or'),
-  not: (child) => ({ s: child.s ? `!(${child.s})` : '', kind: 'leaf' }),
+  not: (child) =>
+    child.s ? { s: `!(${child.s})`, kind: 'leaf' } : { s: '', kind: 'leaf', never: !child.never },
+  // `field=$some(<operand>)` — the operand is a filter on the related entity,
+  // serialized recursively; values inside are percent-encoded like any other.
+  relation(field, op, operand) {
+    if (!isPlainObject(operand)) {
+      throw new TypeError(`Relational predicate "${op}" on "${field}" needs a filter object operand`)
+    }
+    // A plain object always walks to a part (never `undefined`).
+    const part = walkFilter(operand, urlVisitor)!
+    // An empty body means "any related row" (`$some()` / `$none()`). An operand
+    // that serializes to nothing but matches no row (`{ $or: [] }`,
+    // `{ $not: {} }`) has no URL spelling — refuse rather than widen it.
+    if (part.never) {
+      throw new TypeError(
+        `Relational predicate "${op}" on "${field}" has an operand that matches no row; it cannot be expressed in a URL`,
+      )
+    }
+    return { s: `${field}=${op}(${part.s})`, kind: 'leaf' }
+  },
 }
 
 /**
@@ -74,7 +104,12 @@ const urlVisitor: FilterVisitor<TUrlPart> = {
  * `{ id: 101, $or: [...] }` → `id=101&(…^…)`.
  */
 function serializeFilter(expr: FilterExpr): string {
-  return walkFilter(expr, urlVisitor)?.s ?? ''
+  const part = walkFilter(expr, urlVisitor)
+  // An empty query string means "every row" — refuse rather than widen a filter that matches none.
+  if (part?.never) {
+    throw new TypeError('The filter matches no row; it cannot be expressed in a URL')
+  }
+  return part?.s ?? ''
 }
 
 function serializeComparison(field: string, op: string, value: unknown): string {
@@ -116,12 +151,11 @@ function serializeComparison(field: string, op: string, value: unknown): string 
   }
 }
 
-// A bare value in `field=<value>` position is round-trip-safe only when the
-// lexer in tokens.ts would consume the entire string as a single `word` token
-// (`[A-Za-z0-9_.]+`). Anything else must be single-quoted so it tokenizes as
-// a `string` literal. Pinning this allowlist to the tokenizer's `word` shape
-// keeps the encoder in sync if new operator/delimiter chars are added later —
-// the previous denylist drifted silently every time tokens.ts grew.
+// A value is emitted bare only when the lexer (tokens.ts) reads the whole
+// string as one `word` token (`[A-Za-z0-9_.]+`) — an allowlist pinned to that
+// token shape, so new operator/delimiter chars can never leak out unquoted.
+// Everything else is single-quoted. Hyphenated words (`in-progress`) parse bare
+// too, but stay quoted so the URL emitted for a value is stable.
 const WORD_RE = /^[A-Za-z0-9_.]+$/u
 // Mirrors the tokenizer's `number` rule (full-string match). Strings matching
 // this would otherwise be lexed as numbers and lose their string identity on

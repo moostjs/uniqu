@@ -7,6 +7,10 @@ export type {
   FilterExpr,
   ComparisonNode,
   LogicalNode,
+  RelationOp,
+  RelationPredicate,
+  OwnOf,
+  NavOf,
   AggregateFn,
   AggregateExpr,
   AggregateSelectExpr,
@@ -30,7 +34,17 @@ export type {
   ValidGroupBy,
 } from './types'
 
-export { walkFilter, isPrimitive, isLogicalKey, type FilterVisitor } from './walk'
+export {
+  walkFilter,
+  isPrimitive,
+  isLogicalKey,
+  RELATION_OPS,
+  isRelationOp,
+  isRelationPredicate,
+  hasRelationOp,
+  isPlainObject,
+  type FilterVisitor,
+} from './walk'
 export { computeInsights, getInsights } from './insights'
 export {
   AGGREGATE_FNS,
@@ -53,6 +67,7 @@ export {
   bucketLabel,
   bucketer,
   nextBucketLabel,
+  bucketSeries,
   bucketStartInstant,
   checkTimeZone,
   BUCKET_MIN_INSTANT,
@@ -61,5 +76,7 @@ export {
   WEEK_STARTS,
   TIME_ZONE_NAME_RE,
   type IsoWeekday,
+  type NextBucketOptions,
+  type BucketSeriesOptions,
   type TimeZoneCheck,
 } from './calendar'

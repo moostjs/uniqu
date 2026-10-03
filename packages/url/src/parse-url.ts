@@ -61,27 +61,12 @@ function parseQuery(raw: string, nested: boolean): UrlQuery {
 
   const controls = handleControls(controlParts)
 
-  let filter: FilterExpr = {}
-  let parser: Parser
-
-  if (exprParts.length) {
-    const rawExpr = exprParts.join('&')
-    const parsed = parseFilterExpr(rawExpr)
-    parser = parsed.parser
-    filter = parsed.expr
-  } else {
-    parser = new Parser([])
-  }
-
-  // Control insights (with computed-column aliases resolved to their source fields) are core's.
-  for (const [field, ops] of computeInsights(undefined, controls)) {
-    for (const op of ops) parser.captureInsight(field, op)
-  }
+  const filter: FilterExpr = exprParts.length ? parseFilterExpr(exprParts.join('&')) : {}
 
   return {
     filter,
     controls,
-    insights: parser.getInsights(),
+    insights: computeInsights(filter, controls),
   }
 }
 
@@ -199,7 +184,7 @@ function parseFilterExpr(raw: string) {
   const parser = new Parser(tokens)
   const expr = parser.parseExpression()
   parser.expectEof()
-  return { expr, parser }
+  return expr
 }
 
 /** Parse a single `$with` segment like `posts` or `posts($sort=-createdAt&status=active)`. */
@@ -320,7 +305,7 @@ function handleControls(parts: string[]): UniqueryControls {
 
       case '$having': {
         if (!value) break
-        const { expr } = parseFilterExpr(value)
+        const expr = parseFilterExpr(value)
         if (controls.$having) {
           controls.$having = { $and: [controls.$having, expr] }
         } else {

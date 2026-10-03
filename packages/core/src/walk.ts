@@ -3,7 +3,50 @@ import type {
   ComparisonOp,
   FieldOps,
   Primitive,
+  RelationOp,
+  RelationPredicate,
 } from './types'
+
+/** Relational predicate operators, in canonical order (frozen). */
+export const RELATION_OPS: readonly RelationOp[] = Object.freeze(['$some', '$none'] as const)
+
+/** True when `op` is a relational predicate operator (`$some` / `$none`). */
+export function isRelationOp(op: string): op is RelationOp {
+  return op === '$some' || op === '$none'
+}
+
+/** True for a plain object (`{}` literal or null-prototype) — not an array, RegExp, Date or class instance. */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object') return false
+  const proto = Object.getPrototypeOf(value)
+  return proto === Object.prototype || proto === null
+}
+
+/**
+ * True when `value` is a well-formed relational predicate operator map: a
+ * plain object with at least one key, every key a relation op and every
+ * operand a plain object (`{ $some: {...} }`, `{ $some: {...}, $none: {...} }`).
+ * `{ $some: undefined }` and mixed maps (`{ $some: {...}, $eq: 1 }`) are not.
+ */
+export function isRelationPredicate(value: unknown): value is RelationPredicate {
+  if (!isPlainObject(value)) return false
+  const keys = Object.keys(value)
+  return keys.length > 0 && keys.every((k) => isRelationOp(k) && isPlainObject(value[k]))
+}
+
+/**
+ * True when `value` is an object carrying ANY relation-op key — including
+ * malformed or mixed maps (`{ $some: undefined }`, `{ $some: {...}, $eq: 1 }`).
+ * `walkFilter` dispatches every `$some` / `$none` key to `visitor.relation`
+ * whatever its siblings, so a gate deciding whether a filter value needs
+ * relational handling should test this, and reject values for which it holds
+ * but {@link isRelationPredicate} does not.
+ */
+export function hasRelationOp(value: unknown): boolean {
+  // Same leaf test as `walkFilter`: a primitive or a non-plain value (RegExp,
+  // Date, class instance) is a comparison value, never an operator map.
+  return !isPrimitive(value) && Object.keys(value as object).some(isRelationOp)
+}
 
 /**
  * Visitor callbacks for controlling how filter nodes are processed.
@@ -20,6 +63,14 @@ export interface FilterVisitor<R> {
   or(children: R[]): R
   /** Negate a child expression. */
   not(child: R): R
+  /**
+   * Called for a relational predicate `{ field: { $some | $none: operand } }`.
+   * The walker does NOT recurse into `operand` — it is a filter on another
+   * entity (the relation's target); the visitor decides what to do with it
+   * (render a subquery, prefix insights, …). When absent, a filter containing
+   * a predicate makes `walkFilter` throw.
+   */
+  relation?(field: string, op: RelationOp, operand: FilterExpr): R
 }
 
 /**
@@ -32,6 +83,9 @@ export interface FilterVisitor<R> {
  *   (Mongo semantics): `{ id: 101, $or: [...] }` is equivalent to
  *   `{ $and: [{ id: 101 }, { $or: [...] }] }`. A field with several operators
  *   contributes one `comparison` per operator.
+ * - A relational operator (`$some` / `$none`) on a field dispatches to
+ *   `visitor.relation(field, op, operand)` without walking `operand`; a
+ *   visitor without `relation` makes the walk throw.
  * - A node that yields a single result returns it unwrapped (no surrounding
  *   `and`); an empty node yields `visitor.and([])`.
  */
@@ -49,6 +103,15 @@ export function walkFilter<R>(expr: FilterExpr | undefined, visitor: FilterVisit
       results.push(visitor.comparison(key, '$eq', value))
     } else {
       for (const [op, opValue] of Object.entries(value as FieldOps)) {
+        if (isRelationOp(op)) {
+          if (!visitor.relation) {
+            throw new Error(
+              `Relational predicate "${op}" on "${key}" is not supported by this filter visitor`,
+            )
+          }
+          results.push(visitor.relation(key, op, opValue as unknown as FilterExpr))
+          continue
+        }
         results.push(
           visitor.comparison(key, op as ComparisonOp, opValue as Primitive | Primitive[]),
         )

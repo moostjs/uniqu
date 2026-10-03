@@ -41,6 +41,10 @@ export interface TokenDef {
  *   - keywords before generic words
  *   - multi-char operators (>=, <=, !=, ~=) before single-char
  *   - literals before identifiers
+ *
+ * A number / boolean / null literal must span the whole bare run of
+ * `[A-Za-z0-9_.-]` chars (`(?![\w.-])`), so `nullable`, `1.5.3` and
+ * `2026-01-01` lex as one word instead of a literal plus a stray tail.
  */
 export const tokens: TokenDef[] = [
   /* ---------- literals ---------- */
@@ -51,13 +55,13 @@ export const tokens: TokenDef[] = [
   { r: /^'(?:\\.|[^'\\])*'/u, type: 'string' },
 
   // number  -12.34   0   42   (but NOT 007, 00, 01, -00)
-  { r: /^-?(?:0(?!\d)|[1-9]\d*)(?:\.\d+)?(?!\w)/u, type: 'number' },
+  { r: /^-?(?:0(?!\d)|[1-9]\d*)(?:\.\d+)?(?![\w.-])/u, type: 'number' },
 
   // boolean  true | false
-  { r: /^(?:true|false)/u, type: 'boolean' },
+  { r: /^(?:true|false)(?![\w.-])/u, type: 'boolean' },
 
   // null literal
-  { r: /^null/u, type: 'null' },
+  { r: /^null(?![\w.-])/u, type: 'null' },
 
   /* ---------- operators (longest first) ---------- */
   { r: /^!=/u, type: 'op-ne' },
@@ -93,6 +97,15 @@ export const tokens: TokenDef[] = [
   // still lex as free text.
   { r: /^(?:[^&^){}\s=><!]+(?:\s|\+)+[^&^){}=><!]*)+/u, type: 'string' },
 
+  // bare local date-time `YYYY-MM-DDTHH:MM[:SS]` (an `'hour'` bucket label):
+  // a string. `:` has no meaning in the filter grammar, so this is unambiguous;
+  // any other shape with `:` (`Z`, fractions, offsets) must be quoted.
+  { r: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?![\w.:-])/u, type: 'string' },
+
+  // bare word with interior hyphens: `in-progress`, `2026-01-01`, `a1b2-c3d4`.
+  // Always a string literal, never a field. A leading `-` stays a negative number.
+  { r: /^[A-Za-z0-9_.]+(?:-+[A-Za-z0-9_.]+)+/u, type: 'string' },
+
   // field / bare word  (allow dots inside so we don't need a separate DOT token)
   { r: /^[A-Za-z0-9_.]+/u, type: 'word' },
 
@@ -116,10 +129,9 @@ export function lex(input: string): Token[] {
 
   while (idx < input.length) {
     let matched = false
+    const slice = input.slice(idx)
 
     for (const { r, type } of tokens) {
-      r.lastIndex = 0
-      const slice = input.slice(idx)
       const m = r.exec(slice)
       if (m) {
         matched = true

@@ -375,3 +375,46 @@ describe('getInsights', () => {
     expect(insights.get('name')).toEqual(new Set(['$select']))
   })
 })
+
+describe('computeInsights – relational predicates', () => {
+  it('captures the nav field with its op and prefixes inner fields', () => {
+    const insights = computeInsights({
+      ticket: { $some: { teamId: { $in: ['t1'] }, status: 'open' } },
+    })
+    expect(insights.get('ticket')).toEqual(new Set(['$some']))
+    expect(insights.get('ticket.teamId')).toEqual(new Set(['$in']))
+    expect(insights.get('ticket.status')).toEqual(new Set(['$eq']))
+  })
+
+  it('prefixes nested predicates through every hop', () => {
+    const insights = computeInsights({
+      $or: [{ ticket: { $some: { team: { $none: { name: 'x' } } } } }, { title: 'a' }],
+    })
+    expect(insights.get('ticket')).toEqual(new Set(['$some']))
+    expect(insights.get('ticket.team')).toEqual(new Set(['$none']))
+    expect(insights.get('ticket.team.name')).toEqual(new Set(['$eq']))
+    expect(insights.get('title')).toEqual(new Set(['$eq']))
+  })
+
+  it('records an empty operand as the bare op', () => {
+    const insights = computeInsights({ ticket: { $none: {} } })
+    expect([...insights.keys()]).toEqual(['ticket'])
+    expect(insights.get('ticket')).toEqual(new Set(['$none']))
+  })
+
+  it('does not walk into malformed / non-plain operands', () => {
+    class Resolved { kind = 'to'; source = { table: 't' }; filter = { a: 1 } }
+    for (const operand of [['x'], 'abc', null, new Resolved()]) {
+      const insights = computeInsights({ ticket: { $some: operand } } as unknown as FilterExpr)
+      expect([...insights.keys()]).toEqual(['ticket'])
+    }
+  })
+
+  it('reports a predicate inside $having as a $having key (rejected downstream)', () => {
+    const insights = computeInsights(undefined, {
+      $groupBy: ['status'],
+      $having: { ticket: { $some: { a: 1 } } },
+    })
+    expect(insights.get('ticket')).toEqual(new Set(['$having']))
+  })
+})

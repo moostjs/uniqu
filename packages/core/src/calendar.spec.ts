@@ -7,6 +7,7 @@ import {
   WEEK_STARTS,
   bucketLabel,
   bucketLabelUncached,
+  bucketSeries,
   bucketStartInstant,
   bucketer,
   checkTimeZone,
@@ -81,6 +82,78 @@ describe('bucketLabel — DST fixtures (unit: day)', () => {
     expect(bucketLabel(at('2026-03-28T23:00:00Z'), 'day', 'Europe/Berlin')).toBe('2026-03-29')
     expect(bucketLabel(at('2026-03-28T23:00:00Z'), 'day', 'UTC')).toBe('2026-03-28')
     expect(bucketLabel(at('2026-03-28T23:00:00Z'), 'day')).toBe('2026-03-28')
+  })
+})
+
+// Hour buckets: [tz, instant, local wall-clock hour label]. The label is the
+// local hour, so a fall-back's repeated hour labels two UTC hours alike and a
+// spring-forward's skipped hour labels none.
+const HOUR_CASES: Array<[tz: string, instant: string, label: string]> = [
+  ['UTC', '2026-03-29T00:00:00Z', '2026-03-29T00:00'],
+  ['UTC', '2026-03-29T00:59:59.999Z', '2026-03-29T00:00'],
+  ['UTC', '2026-03-29T23:59:59Z', '2026-03-29T23:00'],
+  // Europe/Berlin spring-forward 2026-03-29: 02:00 CET → 03:00 CEST at 01:00Z (T02 never exists)
+  ['Europe/Berlin', '2026-03-29T00:00:00Z', '2026-03-29T01:00'],
+  ['Europe/Berlin', '2026-03-29T00:59:59Z', '2026-03-29T01:00'],
+  ['Europe/Berlin', '2026-03-29T01:00:00Z', '2026-03-29T03:00'],
+  ['Europe/Berlin', '2026-03-29T01:59:59Z', '2026-03-29T03:00'],
+  ['Europe/Berlin', '2026-03-29T02:00:00Z', '2026-03-29T04:00'],
+  // Europe/Berlin fall-back 2026-10-25: 03:00 CEST → 02:00 CET at 01:00Z (T02 covers 00:00Z–02:00Z)
+  ['Europe/Berlin', '2026-10-24T23:59:59Z', '2026-10-25T01:00'],
+  ['Europe/Berlin', '2026-10-25T00:00:00Z', '2026-10-25T02:00'], // 02:00 CEST
+  ['Europe/Berlin', '2026-10-25T00:59:59Z', '2026-10-25T02:00'],
+  ['Europe/Berlin', '2026-10-25T01:00:00Z', '2026-10-25T02:00'], // 02:00 CET, the repeat
+  ['Europe/Berlin', '2026-10-25T01:59:59Z', '2026-10-25T02:00'],
+  ['Europe/Berlin', '2026-10-25T02:00:00Z', '2026-10-25T03:00'],
+  // America/New_York spring-forward 2026-03-08 (02:00 EST → 03:00 EDT at 07:00Z), fall-back 2026-11-01 (06:00Z)
+  ['America/New_York', '2026-03-08T06:59:59Z', '2026-03-08T01:00'],
+  ['America/New_York', '2026-03-08T07:00:00Z', '2026-03-08T03:00'],
+  ['America/New_York', '2026-11-01T05:00:00Z', '2026-11-01T01:00'], // 01:00 EDT
+  ['America/New_York', '2026-11-01T06:00:00Z', '2026-11-01T01:00'], // 01:00 EST, the repeat
+  ['America/New_York', '2026-11-01T06:59:59Z', '2026-11-01T01:00'],
+  ['America/New_York', '2026-11-01T07:00:00Z', '2026-11-01T02:00'],
+  // Non-whole-hour offsets: the hour turns at :30 / :15 / :45 UTC
+  ['Asia/Kolkata', '2026-06-14T04:29:59Z', '2026-06-14T09:00'], // +05:30
+  ['Asia/Kolkata', '2026-06-14T04:30:00Z', '2026-06-14T10:00'],
+  ['Asia/Kolkata', '2026-06-14T18:30:00Z', '2026-06-15T00:00'],
+  ['Asia/Kathmandu', '2026-06-14T04:14:59Z', '2026-06-14T09:00'], // +05:45
+  ['Asia/Kathmandu', '2026-06-14T04:15:00Z', '2026-06-14T10:00'],
+  ['Asia/Kathmandu', '2026-06-14T18:15:00Z', '2026-06-15T00:00'],
+  ['Pacific/Chatham', '2026-06-14T11:15:00Z', '2026-06-15T00:00'], // +12:45
+  // America/St_Johns −03:30 / −02:30: spring-forward 2026-03-08 02:00 NST → 03:00 NDT at 05:30Z,
+  // fall-back 2026-11-01 02:00 NDT → 01:00 NST at 04:30Z
+  ['America/St_Johns', '2026-01-15T03:29:59Z', '2026-01-14T23:00'],
+  ['America/St_Johns', '2026-01-15T03:30:00Z', '2026-01-15T00:00'],
+  ['America/St_Johns', '2026-07-15T02:29:59Z', '2026-07-14T23:00'],
+  ['America/St_Johns', '2026-07-15T02:30:00Z', '2026-07-15T00:00'],
+  ['America/St_Johns', '2026-03-08T05:29:59Z', '2026-03-08T01:00'],
+  ['America/St_Johns', '2026-03-08T05:30:00Z', '2026-03-08T03:00'],
+  ['America/St_Johns', '2026-11-01T03:30:00Z', '2026-11-01T01:00'], // 01:00 NDT
+  ['America/St_Johns', '2026-11-01T04:29:59Z', '2026-11-01T01:00'],
+  ['America/St_Johns', '2026-11-01T04:30:00Z', '2026-11-01T01:00'], // 01:00 NST, the repeat
+  ['America/St_Johns', '2026-11-01T05:30:00Z', '2026-11-01T02:00'],
+  // Australia/Lord_Howe 30-minute DST shift 2026-10-04: 02:00 +10:30 → 02:30 +11 (15:30Z): T02 is half an hour
+  ['Australia/Lord_Howe', '2026-10-03T15:29:59Z', '2026-10-04T01:00'],
+  ['Australia/Lord_Howe', '2026-10-03T15:30:00Z', '2026-10-04T02:00'],
+  ['Australia/Lord_Howe', '2026-10-03T15:59:59Z', '2026-10-04T02:00'],
+  ['Australia/Lord_Howe', '2026-10-03T16:00:00Z', '2026-10-04T03:00'],
+]
+
+describe('bucketLabel — hour', () => {
+  it.each(HOUR_CASES)('%s %s → %s', (tz, instant, label) => {
+    expect(bucketLabel(at(instant), 'hour', tz)).toBe(label)
+    expect(bucketLabelUncached(at(instant), 'hour', tz)).toBe(label)
+    expect(bucketer('hour', tz)(at(instant))).toBe(label)
+  })
+
+  it('ignores the week start and labels the range edges', () => {
+    expect(bucketLabel(at('2026-03-29T05:30:00Z'), 'hour', 'UTC', 'sun')).toBe('2026-03-29T05:00')
+    expect(bucketLabel(BUCKET_MIN_INSTANT, 'hour')).toBe('1970-01-02T00:00')
+    expect(bucketLabel(BUCKET_MIN_INSTANT, 'hour', 'Pacific/Pago_Pago')).toBe('1970-01-01T13:00')
+    expect(bucketLabel(BUCKET_MAX_INSTANT - 1, 'hour')).toBe('2999-12-31T23:00')
+    expect(bucketLabel(BUCKET_MAX_INSTANT - 1, 'hour', 'Pacific/Kiritimati')).toBe('3000-01-01T13:00')
+    expect(bucketLabel(BUCKET_MIN_INSTANT - 1, 'hour')).toBeNull()
+    expect(bucketLabel(1_774_746_000_000n, 'hour', 'Europe/Berlin')).toBe('2026-03-29T03:00')
   })
 })
 
@@ -218,7 +291,7 @@ describe('bucketLabel — input and range guard', () => {
   })
 
   it('throws RangeError for an unknown unit, week start or zone', () => {
-    expect(() => bucketLabel(at('2026-01-01T00:00:00Z'), 'hour' as BucketUnit)).toThrow(RangeError)
+    expect(() => bucketLabel(at('2026-01-01T00:00:00Z'), 'minute' as BucketUnit)).toThrow(RangeError)
     expect(() => bucketLabel(at('2026-01-01T00:00:00Z'), 'week', 'UTC', 'sunday' as WeekStart)).toThrow(RangeError)
     expect(() => bucketLabel(at('2026-01-01T00:00:00Z'), 'week', 'UTC', 8 as never)).toThrow(RangeError)
     expect(() => bucketLabel(at('2026-01-01T00:00:00Z'), 'day', 'Mars/Olympus')).toThrow(RangeError)
@@ -240,12 +313,20 @@ const oracleFormatters = new Map<string, Intl.DateTimeFormat>()
 function oracle(t: number, unit: BucketUnit, tz: string, ws: WeekStart): string {
   let f = oracleFormatters.get(tz)
   if (!f) {
-    f = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: 'numeric', day: 'numeric' })
+    f = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      hourCycle: 'h23',
+    })
     oracleFormatters.set(tz, f)
   }
   const p: Record<string, number> = {}
   for (const part of f.formatToParts(t)) p[part.type] = Number(part.value)
-  const d = new Date(Date.UTC(p.year, p.month - 1, p.day))
+  const d = new Date(Date.UTC(p.year, p.month - 1, p.day, p.hour))
+  if (unit === 'hour') return d.toISOString().slice(0, 16)
   if (unit === 'week') {
     const wsJs = (WEEK_STARTS.indexOf(ws) + 1) % 7 // JS getUTCDay: 0 = Sunday
     while (d.getUTCDay() !== wsJs) d.setUTCDate(d.getUTCDate() - 1)
@@ -308,6 +389,7 @@ describe('bucketLabel — property test against an Intl oracle', () => {
       for (let m = 0; m < 36 * 60; m += 1) {
         const t = t0 + m * 60_000
         expect(bucketLabel(t, 'day', tz)).toBe(oracle(t, 'day', tz, 'mon'))
+        expect(bucketLabel(t, 'hour', tz)).toBe(oracle(t, 'hour', tz, 'mon'))
       }
     }
     // Transitions only ~6.96 days apart (the tightest pairs in tzdata 1970–2100)
@@ -368,6 +450,35 @@ describe('nextBucketLabel', () => {
     expect(nextBucketLabel('2028-02-29', 'year')).toBe('2029-01-01')
   })
 
+  it('steps hours across day, month, year and leap boundaries', () => {
+    expect(nextBucketLabel('2026-03-29T05:00', 'hour')).toBe('2026-03-29T06:00')
+    expect(nextBucketLabel('2026-03-29T23:00', 'hour')).toBe('2026-03-30T00:00')
+    expect(nextBucketLabel('2026-12-31T23:00', 'hour')).toBe('2027-01-01T00:00')
+    expect(nextBucketLabel('2028-02-28T23:00', 'hour')).toBe('2028-02-29T00:00')
+    expect(nextBucketLabel('2026-03-29', 'hour')).toBe('2026-03-29T01:00') // a date label is its 00 hour
+    expect(nextBucketLabel('2026-03-29T05:00', 'day')).toBe('2026-03-30') // an hour label is its date
+    expect(nextBucketLabel('2026-03-29T05:00', 'hour', 'sun')).toBe('2026-03-29T06:00') // week start ignored
+  })
+
+  it('without tz the hour step is zone-free; with tz it skips the hour a spring-forward removes', () => {
+    expect(nextBucketLabel('2026-03-29T01:00', 'hour')).toBe('2026-03-29T02:00')
+    expect(nextBucketLabel('2026-03-29T01:00', 'hour', { tz: 'Europe/Berlin' })).toBe('2026-03-29T03:00')
+    expect(nextBucketLabel('2026-03-08T01:00', 'hour', { tz: 'America/New_York' })).toBe('2026-03-08T03:00')
+    expect(nextBucketLabel('2026-03-08T01:00', 'hour', { tz: 'America/St_Johns' })).toBe('2026-03-08T03:00')
+    // a repeated (fall-back) hour is one label: stepping over it is plain
+    expect(nextBucketLabel('2026-10-25T01:00', 'hour', { tz: 'Europe/Berlin' })).toBe('2026-10-25T02:00')
+    expect(nextBucketLabel('2026-10-25T02:00', 'hour', { tz: 'Europe/Berlin' })).toBe('2026-10-25T03:00')
+    // a half-hour gap leaves the hour in place (Lord Howe 02:00 → 02:30)
+    expect(nextBucketLabel('2026-10-04T01:00', 'hour', { tz: 'Australia/Lord_Howe' })).toBe('2026-10-04T02:00')
+    // a skipped date (Samoa 2011-12-30), for hours and days
+    expect(nextBucketLabel('2011-12-29T23:00', 'hour', { tz: 'Pacific/Apia' })).toBe('2011-12-31T00:00')
+    expect(nextBucketLabel('2011-12-29', 'day', { tz: 'Pacific/Apia' })).toBe('2011-12-31')
+    expect(nextBucketLabel('2011-12-29', 'day')).toBe('2011-12-30')
+    // options object carries the week start too; tz is validated
+    expect(nextBucketLabel('2026-12-31', 'week', { weekStart: 'sun', tz: 'Europe/Berlin' })).toBe('2027-01-03')
+    expect(() => nextBucketLabel('2026-03-29T01:00', 'hour', { tz: 'Mars/Olympus' })).toThrow(RangeError)
+  })
+
   it('fills gaps between labels without zone math', () => {
     const labels = ['2026-03-23']
     while (labels.length < 5) labels.push(nextBucketLabel(labels[labels.length - 1], 'week'))
@@ -379,19 +490,69 @@ describe('nextBucketLabel', () => {
       let label = bucketLabel(at('2026-01-01T00:00:00Z'), unit, 'UTC', 'wed')!
       for (let i = 0; i < 30; i++) {
         const next = nextBucketLabel(label, unit, 'wed')
-        const lastDay = new Date(Date.parse(`${next}T00:00:00Z`) - 1)
-        expect(bucketLabel(lastDay.getTime(), unit, 'UTC', 'wed')).toBe(label)
-        expect(bucketLabel(Date.parse(`${next}T00:00:00Z`), unit, 'UTC', 'wed')).toBe(next)
+        const start = bucketStartInstant(next)
+        expect(bucketLabel(start - 1, unit, 'UTC', 'wed')).toBe(label)
+        expect(bucketLabel(start, unit, 'UTC', 'wed')).toBe(next)
         label = next
       }
     }
   })
 
   it('throws RangeError for malformed labels', () => {
-    for (const bad of ['2026-02-30', '2026-13-01', '2026-00-10', '2026-2-3', '26-01-01', 'x', '', '2026-01-01T00:00']) {
+    for (const bad of ['2026-02-30', '2026-13-01', '2026-00-10', '2026-2-3', '26-01-01', 'x', '', '2026-01-01T00:00:00']) {
       expect(() => nextBucketLabel(bad, 'day'), bad).toThrow(RangeError)
     }
-    expect(() => nextBucketLabel('2026-01-01', 'hour' as BucketUnit)).toThrow(RangeError)
+    expect(() => nextBucketLabel('2026-01-01', 'minute' as BucketUnit)).toThrow(RangeError)
+    for (const bad of ['2026-01-01T24:00', '2026-01-01T7:00', '2026-01-01T07', '2026-01-01T07:30', '2026-02-30T01:00']) {
+      expect(() => nextBucketLabel(bad, 'hour'), bad).toThrow(RangeError)
+      expect(() => bucketStartInstant(bad, 'Europe/Berlin'), bad).toThrow(RangeError)
+    }
+  })
+})
+
+// ── bucketSeries ─────────────────────────────────────────────────────────────
+
+describe('bucketSeries', () => {
+  it('lists every bucket from the one holding first to the one holding last, inclusive', () => {
+    expect(bucketSeries('2026-03-29T22:00', '2026-03-30T01:00', 'hour')).toEqual([
+      '2026-03-29T22:00', '2026-03-29T23:00', '2026-03-30T00:00', '2026-03-30T01:00',
+    ])
+    expect(bucketSeries('2026-12-31', '2027-01-15', 'week', { weekStart: 'sun' })).toEqual(['2026-12-27', '2027-01-03', '2027-01-10'])
+    expect(bucketSeries('2026-02-14', '2026-05-01', 'month')).toEqual(['2026-02-01', '2026-03-01', '2026-04-01', '2026-05-01'])
+    expect(bucketSeries('2026-03-29', '2026-03-29', 'day')).toEqual(['2026-03-29'])
+    expect(bucketSeries('2026-03-30', '2026-03-29', 'day')).toEqual([])
+  })
+
+  it('with tz, leaves out the labels that never occur in the zone', () => {
+    expect(bucketSeries('2026-03-29T00:00', '2026-03-29T04:00', 'hour', { tz: 'Europe/Berlin' })).toEqual([
+      '2026-03-29T00:00', '2026-03-29T01:00', '2026-03-29T03:00', '2026-03-29T04:00',
+    ])
+    expect(bucketSeries('2026-03-29T00:00', '2026-03-29T04:00', 'hour')).toHaveLength(5)
+    expect(bucketSeries('2011-12-29', '2011-12-31', 'day', { tz: 'Pacific/Apia' })).toEqual(['2011-12-29', '2011-12-31'])
+    expect(bucketSeries('2026-09-05', '2026-09-07', 'day', { tz: 'America/Santiago' })).toEqual(['2026-09-05', '2026-09-06', '2026-09-07'])
+  })
+
+  it('guards the length', () => {
+    expect(bucketSeries('2026-01-01T00:00', '2026-01-01T09:00', 'hour', { maxLength: 10 })).toHaveLength(10)
+    expect(() => bucketSeries('2026-01-01T00:00', '2026-01-01T10:00', 'hour', { maxLength: 10 })).toThrow(RangeError)
+    expect(() => bucketSeries('2000-01-01T00:00', '2030-01-01T00:00', 'hour')).toThrow(RangeError) // > 100 000
+    expect(() => bucketSeries('2026-01-01', 'x', 'day')).toThrow(RangeError)
+  })
+
+  it('a year of hours with tz is exactly the labelled set, and every label round-trips with bucketStartInstant', () => {
+    for (const tz of ['Europe/Berlin', 'America/New_York', 'America/St_Johns', 'Asia/Kathmandu', 'Australia/Lord_Howe']) {
+      const seen = new Set<string>()
+      for (let t = at('2026-01-01T00:00:00Z'); t < at('2027-01-01T00:00:00Z'); t += 15 * 60_000) seen.add(bucketLabel(t, 'hour', tz)!)
+      const first = bucketLabel(at('2026-01-01T00:00:00Z'), 'hour', tz)!
+      const last = bucketLabel(at('2027-01-01T00:00:00Z') - 1, 'hour', tz)!
+      const series = bucketSeries(first, last, 'hour', { tz })
+      expect(series, tz).toEqual([...seen].toSorted())
+      for (const label of series) {
+        const start = bucketStartInstant(label, tz)
+        expect(bucketLabel(start, 'hour', tz), `${tz} ${label}`).toBe(label)
+        expect(bucketLabel(start - 1, 'hour', tz), `${tz} ${label}`).not.toBe(label)
+      }
+    }
   })
 })
 
@@ -442,6 +603,25 @@ describe('bucketStartInstant', () => {
         label = nextBucketLabel(label, 'day')
       }
     }
+  })
+
+  it('hour labels: the first instant of the local hour', () => {
+    expect(bucketStartInstant('2026-03-29T05:00')).toBe(at('2026-03-29T05:00:00Z'))
+    expect(bucketStartInstant('2026-06-14T10:00', 'Asia/Kolkata')).toBe(at('2026-06-14T04:30:00Z'))
+    expect(bucketStartInstant('2026-06-14T10:00', 'Asia/Kathmandu')).toBe(at('2026-06-14T04:15:00Z'))
+    expect(bucketStartInstant('2026-01-15T00:00', 'America/St_Johns')).toBe(at('2026-01-15T03:30:00Z'))
+    expect(bucketStartInstant('2026-07-15T00:00', 'America/St_Johns')).toBe(at('2026-07-15T02:30:00Z'))
+  })
+
+  it('a repeated hour starts at its first occurrence; a skipped hour at the transition', () => {
+    expect(bucketStartInstant('2026-10-25T02:00', 'Europe/Berlin')).toBe(at('2026-10-25T00:00:00Z'))
+    expect(bucketStartInstant('2026-10-25T03:00', 'Europe/Berlin')).toBe(at('2026-10-25T02:00:00Z'))
+    expect(bucketStartInstant('2026-11-01T01:00', 'America/New_York')).toBe(at('2026-11-01T05:00:00Z'))
+    expect(bucketStartInstant('2026-11-01T01:00', 'America/St_Johns')).toBe(at('2026-11-01T03:30:00Z'))
+    expect(bucketStartInstant('2026-03-29T02:00', 'Europe/Berlin')).toBe(at('2026-03-29T01:00:00Z'))
+    expect(bucketStartInstant('2026-03-29T03:00', 'Europe/Berlin')).toBe(at('2026-03-29T01:00:00Z'))
+    expect(bucketStartInstant('2026-03-08T02:00', 'America/St_Johns')).toBe(at('2026-03-08T05:30:00Z'))
+    expect(bucketStartInstant('2026-10-04T02:00', 'Australia/Lord_Howe')).toBe(at('2026-10-03T15:30:00Z'))
   })
 
   it('throws RangeError for a malformed label', () => {
@@ -613,7 +793,7 @@ describe('bucketer', () => {
   })
 
   it('throws RangeError up front for an unknown unit, zone or week start', () => {
-    expect(() => bucketer('hour' as BucketUnit)).toThrow(RangeError)
+    expect(() => bucketer('minute' as BucketUnit)).toThrow(RangeError)
     expect(() => bucketer('day', 'Mars/Olympus')).toThrow(RangeError)
     expect(() => bucketer('week', 'UTC', 'sunday' as WeekStart)).toThrow(RangeError)
   })

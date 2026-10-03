@@ -4,6 +4,11 @@ import type {
   AggregateQuery,
   AggregateResult,
   BucketExpr,
+  FilterExpr,
+  NavOf,
+  OwnOf,
+  RelationPredicate,
+  Uniquery,
   CalendarBucketLabel,
   InsightOp,
   ResolveAlias,
@@ -56,8 +61,9 @@ describe('AggregateResult', () => {
   })
 
   it('uses the default bucket alias', () => {
-    type Sel = [{ $bucket: 'week'; $field: 'openedAt' }, 'status']
+    type Sel = [{ $bucket: 'week'; $field: 'openedAt' }, { $bucket: 'hour'; $field: 'openedAt' }, 'status']
     expectTypeOf<AggregateResult<Ticket, Sel>['week_openedAt']>().toEqualTypeOf<string>()
+    expectTypeOf<AggregateResult<Ticket, Sel>['hour_openedAt']>().toEqualTypeOf<string>()
     expectTypeOf<AggregateResult<Ticket, Sel>['status']>().toEqualTypeOf<string>()
   })
 
@@ -198,5 +204,126 @@ describe('control types', () => {
 
   it("InsightOp includes '$bucket'", () => {
     expectTypeOf<'$bucket'>().toExtend<InsightOp>()
+  })
+})
+
+describe('relational predicates', () => {
+  interface TeamOwn { id: string; name: string }
+  interface TeamT { __ownProps: TeamOwn; __navProps: {} }
+  interface TicketOwn { key: string; teamId: string; status: string }
+  type TicketNav = { team: TeamT; issues: IssueT[] }
+  interface TicketT { __ownProps: TicketOwn; __navProps: TicketNav }
+  interface IssueOwn { id: number; title: string; ticketKey: string | null }
+  type IssueNav = { ticket: TicketT }
+  interface IssueT { __ownProps: IssueOwn; __navProps: IssueNav }
+
+  it('typed nav key accepts $some / $none over the target own props', () => {
+    const f: FilterExpr<IssueOwn, IssueNav> = {
+      title: 'x',
+      ticket: { $some: { status: 'open', teamId: { $in: ['t1'] } }, $none: {} },
+    }
+    expectTypeOf(f).toExtend<FilterExpr<IssueOwn, IssueNav>>()
+  })
+
+  it('nests through the target nav props, including to-many targets', () => {
+    const f: FilterExpr<IssueOwn, IssueNav> = {
+      ticket: { $some: { team: { $none: { name: 'x' } }, issues: { $some: { title: 'y' } } } },
+    }
+    expectTypeOf(f).toExtend<FilterExpr<IssueOwn, IssueNav>>()
+    const q: Uniquery<IssueOwn, IssueNav> = {
+      filter: { $or: [{ ticket: { $some: { status: 'open' } } }, { $not: { ticket: { $none: {} } } }] },
+    }
+    expectTypeOf(q).toExtend<Uniquery<IssueOwn, IssueNav>>()
+  })
+
+  it('optional nav keys are typed through their target too', () => {
+    type OptNav = { ticket?: TicketT; labels?: TicketT[] | null }
+    const f: FilterExpr<IssueOwn, OptNav> = { ticket: { $some: { status: 'open' } }, labels: { $none: {} } }
+    expectTypeOf(f).toExtend<FilterExpr<IssueOwn, OptNav>>()
+    const bad: FilterExpr<IssueOwn, OptNav> = {
+      // @ts-expect-error — 'nope' is not a Ticket field
+      ticket: { $some: { nope: 1 } },
+    }
+    expectTypeOf(bad).toExtend<object>()
+  })
+
+  it('rejects an unknown target field', () => {
+    const f: FilterExpr<IssueOwn, IssueNav> = {
+      // @ts-expect-error — 'nope' is not a Ticket field
+      ticket: { $some: { nope: 1 } },
+    }
+    expectTypeOf(f).toExtend<object>()
+  })
+
+  it('rejects $some on an own field', () => {
+    const f: FilterExpr<IssueOwn, IssueNav> = {
+      // @ts-expect-error — title is not a navigation field
+      title: { $some: {} },
+    }
+    expectTypeOf(f).toExtend<object>()
+  })
+
+  it('$with sub-filters are typed through the target nav props', () => {
+    const q: Uniquery<IssueOwn, IssueNav> = {
+      controls: { $with: [{ name: 'ticket', filter: { team: { $some: { name: 'x' } } } }] },
+    }
+    expectTypeOf(q).toExtend<Uniquery<IssueOwn, IssueNav>>()
+  })
+
+  it('$with sub-filters on an OPTIONAL / nullable nav are fully typed through the target', () => {
+    type OptNav = { ticket?: TicketT | null; issues?: IssueT[] }
+    const ok: Uniquery<IssueOwn, OptNav> = {
+      controls: {
+        $with: [
+          // nested predicate inside a $with filter compiles exactly like at the root
+          { name: 'ticket', filter: { status: 'open', team: { $some: { name: 'x' } } } },
+          { name: 'issues', filter: { title: 'y', ticket: { $none: {} } } },
+        ],
+      },
+    }
+    expectTypeOf(ok).toExtend<Uniquery<IssueOwn, OptNav>>()
+    const badKey: Uniquery<IssueOwn, OptNav> = {
+      // @ts-expect-error — 'nope' is not a Ticket field
+      controls: { $with: [{ name: 'ticket', filter: { nope: 1 } }] },
+    }
+    const badValue: Uniquery<IssueOwn, OptNav> = {
+      // @ts-expect-error — status is a string
+      controls: { $with: [{ name: 'ticket', filter: { status: 42 } }] },
+    }
+    expectTypeOf(badKey).toExtend<object>()
+    expectTypeOf(badValue).toExtend<object>()
+  })
+
+  it('readonly to-many nav arrays type their operands through the element', () => {
+    type RoNav = { issues: readonly IssueT[] }
+    const ok: FilterExpr<TicketOwn, RoNav> = { issues: { $some: { title: 'x' } } }
+    expectTypeOf(ok).toExtend<FilterExpr<TicketOwn, RoNav>>()
+    const bad: FilterExpr<TicketOwn, RoNav> = {
+      // @ts-expect-error — 'nope' is not an Issue field
+      issues: { $some: { nope: 1 } },
+    }
+    expectTypeOf(bad).toExtend<object>()
+  })
+
+  it('OwnOf / NavOf do not distribute over a nullable entity', () => {
+    expectTypeOf<OwnOf<TicketT | undefined>>().toEqualTypeOf<Record<string, unknown>>()
+    expectTypeOf<OwnOf<TicketT>>().toEqualTypeOf<TicketOwn>()
+    expectTypeOf<NavOf<TicketT | undefined>>().toEqualTypeOf<{}>()
+    expectTypeOf<NavOf<TicketT>>().toEqualTypeOf<TicketNav>()
+  })
+
+  it('untyped filters are unchanged (any key, predicates allowed by shape)', () => {
+    const a: FilterExpr = { anything: 1, 'a.b': { $gt: 2 } }
+    const b: FilterExpr = { ticket: { $some: { x: 1 } } }
+    const c: FilterExpr<IssueOwn> = { title: 'x' }
+    expectTypeOf(a).toExtend<FilterExpr>()
+    expectTypeOf(b).toExtend<FilterExpr>()
+    expectTypeOf(c).toExtend<FilterExpr<IssueOwn>>()
+    expectTypeOf<RelationPredicate>().toHaveProperty('$some')
+  })
+
+  it("InsightOp includes '$some' / '$none'", () => {
+    expectTypeOf<'$some'>().toExtend<InsightOp>()
+    expectTypeOf<'$none'>().toExtend<InsightOp>()
   })
 })

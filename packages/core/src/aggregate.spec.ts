@@ -193,9 +193,9 @@ describe('resolveBuckets — one bucket', () => {
 
   it('rejects an unknown unit', () => {
     expect(fail({ $bucket: 'fortnight' as never })).toBe(
-      'Unknown bucket unit "fortnight" — use day, week, month, quarter or year',
+      'Unknown bucket unit "fortnight" — use hour, day, week, month, quarter or year',
     )
-    expect(fail({ $bucket: 'hour' as never })).toMatch(/^Unknown bucket unit "hour"/)
+    expect(fail({ $bucket: 'minute' as never })).toMatch(/^Unknown bucket unit "minute"/)
   })
 
   it('rejects an empty $field', () => {
@@ -273,7 +273,7 @@ describe('resolveBuckets', () => {
     expect(res).toEqual({
       ok: false,
       issues: [
-        { path: '$select', message: 'Unknown bucket unit "fortnight" — use day, week, month, quarter or year' },
+        { path: '$select', message: 'Unknown bucket unit "fortnight" — use hour, day, week, month, quarter or year' },
         { path: '$select', message: 'Time zone "CET" is an alias — use "Europe/Brussels"' },
       ],
     })
@@ -306,7 +306,7 @@ describe('resolveBuckets', () => {
     // an invalid bucket outside aggregate mode reports both problems
     const res = resolveBuckets({ $select: [{ $bucket: 'eon', $field: 'openedAt' }] })
     expect(!res.ok && res.issues.map(i => i.message)).toEqual([
-      'Unknown bucket unit "eon" — use day, week, month, quarter or year',
+      'Unknown bucket unit "eon" — use hour, day, week, month, quarter or year',
       'Calendar buckets are only valid in grouped queries',
     ])
   })

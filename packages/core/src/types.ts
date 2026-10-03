@@ -44,23 +44,54 @@ export type FieldOps = FieldOpsFor<Primitive>
 /** A field can hold a bare primitive (implicit $eq) or an explicit operator map. */
 export type FieldValue = Primitive | FieldOps
 
+/** Relational predicate operators: `$some` (a related row matches), `$none` (no related row matches). */
+export type RelationOp = '$some' | '$none'
+
+/** Own (non-navigation) props of an entity type (`__ownProps`), or untyped. */
+export type OwnOf<E> = [E] extends [{ __ownProps: infer F }] ? F : Record<string, unknown>
+
+/** Navigation props of an entity type (`__navProps`), or none. */
+export type NavOf<E> = [E] extends [{ __navProps: infer N extends Record<string, unknown> }] ? N : {}
+
+/**
+ * Relational predicate on a navigation field: filters the PARENT rows by the
+ * existence of related rows. `E` is the related entity type (array element
+ * for to-many relations). Several operators on one key are ANDed.
+ *
+ * - `{ ticket: { $some: { status: 'open' } } }` — at least one related row matches
+ * - `{ ticket: { $none: { status: 'open' } } }` — no related row matches
+ * - `$some: {}` / `$none: {}` — has any related row / has none
+ *
+ * There is no `$every`: write `$none: { $not: F }`.
+ */
+export type RelationPredicate<E = Record<string, unknown>> = {
+  $some?: FilterExpr<OwnOf<E>, NavOf<E>>
+  $none?: FilterExpr<OwnOf<E>, NavOf<E>>
+}
+
 /**
  * A filter expression is either a comparison leaf or a logical branch.
  * `T` is the entity shape — provides type-safe field names and value types.
  * Defaults to `Record<string, unknown>` (untyped).
+ * `Nav` is the entity's navigation props (`__navProps`): each nav key accepts a
+ * {@link RelationPredicate} on its target. Defaults to `{}` (no typed nav keys).
  */
-export type FilterExpr<T = Record<string, unknown>> =
-  | ComparisonNode<T>
-  | LogicalNode<T>
+export type FilterExpr<T = Record<string, unknown>, Nav extends Record<string, unknown> = {}> =
+  | ComparisonNode<T, Nav>
+  | LogicalNode<T, Nav>
 
 /**
  * Leaf node: one or more field comparisons.
  * When `T` is typed, only known keys are allowed.
  * When untyped (default), any string key is accepted.
+ * Typed `Nav` keys accept a {@link RelationPredicate}; a wide `Nav`
+ * (`Record<string, unknown>`) contributes nothing.
  */
-export type ComparisonNode<T = Record<string, unknown>> = {
+export type ComparisonNode<T = Record<string, unknown>, Nav extends Record<string, unknown> = {}> = {
   [K in keyof T & string]?: T[K] | FieldOpsFor<T[K]>
-}
+} & (string extends keyof Nav
+  ? {}
+  : { [K in keyof Nav & string]?: RelationPredicate<NavTarget<NonNullable<Nav[K]>>> })
 
 /**
  * Branch node: logical combination of child expressions.
@@ -69,10 +100,10 @@ export type ComparisonNode<T = Record<string, unknown>> = {
  * alongside it (`{ id: 1, $or: [...] }`). At runtime every member of a node
  * is ANDed, so several logical keys in one object are accepted and combined.
  */
-export type LogicalNode<T = Record<string, unknown>> =
-  | { $and: FilterExpr<T>[]; $or?: never; $not?: never }
-  | { $or: FilterExpr<T>[]; $and?: never; $not?: never }
-  | { $not: FilterExpr<T>; $and?: never; $or?: never }
+export type LogicalNode<T = Record<string, unknown>, Nav extends Record<string, unknown> = {}> =
+  | { $and: FilterExpr<T, Nav>[]; $or?: never; $not?: never }
+  | { $or: FilterExpr<T, Nav>[]; $and?: never; $not?: never }
+  | { $not: FilterExpr<T, Nav>; $and?: never; $or?: never }
 
 /**
  * Known aggregate function names. Consumers may support additional functions via the (string & {}) escape hatch.
@@ -97,15 +128,17 @@ export interface AggregateExpr<
   $as?: Alias
 }
 
-/** Calendar units a bucket truncates to. */
-export type BucketUnit = 'day' | 'week' | 'month' | 'quarter' | 'year'
+/** Calendar units a bucket truncates to. `'hour'` is the local wall-clock hour. */
+export type BucketUnit = 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year'
 
 /** First day of a `week` bucket (ISO 8601 default: 'mon'). */
 export type WeekStart = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
 
 /**
  * `YYYY-MM-DD`: the local calendar date of the bucket's first day, the same
- * format for every unit. Zero-padded, so a plain string sort is chronological.
+ * format for every unit but `'hour'`, whose label is the local date and
+ * wall-clock hour `YYYY-MM-DDTHH:00`. Wall-clock in the bucket's zone (not an
+ * instant). Zero-padded, so a plain string sort is chronological.
  */
 export type CalendarBucketLabel = string
 
@@ -182,14 +215,15 @@ export interface Uniquery<
 > {
   /** Relation name. Present only for nested `$with` sub-queries. */
   name?: string
-  filter?: FilterExpr<T>
+  /** Typed nav keys (`Nav`) accept relational predicates (`$some` / `$none`). */
+  filter?: FilterExpr<T, Nav>
   controls?: UniqueryControls<T, Nav>
   /** Pre-computed insights. */
   insights?: UniqueryInsights
 }
 
-/** Unwrap array types to get the element type for nav props. */
-export type NavTarget<T> = T extends Array<infer U> ? U : T
+/** Unwrap array types (mutable or readonly) to get the element type for nav props. */
+export type NavTarget<T> = T extends ReadonlyArray<infer U> ? U : T
 
 /**
  * A typed $with relation entry.
@@ -203,9 +237,9 @@ export type TypedWithRelation<Nav extends Record<string, unknown>> =
     : {
         [K in keyof Nav & string]: {
           name: K
-          filter?: FilterExpr<NavTarget<Nav[K]> extends { __ownProps: infer F } ? F : Record<string, unknown>>
+          filter?: FilterExpr<OwnOf<NavTarget<NonNullable<Nav[K]>>>, NavOf<NavTarget<NonNullable<Nav[K]>>>>
           controls?: UniqueryControls<
-            NavTarget<Nav[K]> extends { __ownProps: infer F } ? F : Record<string, unknown>,
+            OwnOf<NavTarget<Nav[K]>>,
             NavTarget<Nav[K]> extends { __navProps: infer N extends Record<string, unknown> } ? N : Record<string, unknown>
           >
           insights?: UniqueryInsights
@@ -224,7 +258,7 @@ export type WithRelation = {
  * Insight operator includes comparison ops, control ops ($-prefixed),
  * and aggregate function names (bare, e.g. 'sum', 'avg').
  */
-export type InsightOp = ComparisonOp | '$select' | '$order' | '$with' | '$groupBy' | '$having' | '$bucket' | AggregateFn | (string & {})
+export type InsightOp = ComparisonOp | RelationOp | '$select' | '$order' | '$with' | '$groupBy' | '$having' | '$bucket' | AggregateFn | (string & {})
 
 /** Map of field names to the set of operators used on that field. */
 export type UniqueryInsights = Map<string, Set<InsightOp>>

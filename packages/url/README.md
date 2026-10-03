@@ -101,6 +101,33 @@ $!exists=deletedAt        → { deletedAt: { $exists: false } }
 → { $and: [{ $not: { role: { $in: ['Guest', 'Anonymous'] } } }, { age: { $gte: 18 } }] }
 ```
 
+### Relational Predicates (`$some` / `$none`)
+
+`<navField>=$some(<expr>)` / `<navField>=$none(<expr>)` filters by the existence of related rows. The body is a full filter expression on the related entity (any operators, `&`, `^`, groups, `!( )`, nested predicates); an empty body means "has any" / "has none":
+
+```
+ticket=$some(teamId{t1,t2}&status=open)
+→ { ticket: { $some: { teamId: { $in: ['t1', 't2'] }, status: 'open' } } }
+
+ticket=$none()
+→ { ticket: { $none: {} } }
+
+ticket=$some(team=$none(name=Ops))
+→ { ticket: { $some: { team: { $none: { name: 'Ops' } } } } }
+
+ticket=$some(a=1)&ticket=$none(b=2)
+→ { ticket: { $some: { a: 1 }, $none: { b: 2 } } }
+```
+
+- Only `=` introduces a predicate. Negate with `$none(…)` or `!(…)`; `ticket!=$some(…)` is a `SyntaxError`.
+- An `&` inside the parentheses does not split the query string, so predicates combine freely with other filters and controls: `ticket=$some(status=open)&title~=/crash/i&$limit=20`.
+- Predicates are valid inside `$with` bodies too: `$with=tickets(issues=$some(title=x))`.
+- Insights record the navigation field with `$some` / `$none` and the body's fields with the field prefix (`ticket.teamId`, `ticket.status`).
+- Nesting is capped at 32 levels (`SyntaxError` beyond); an unterminated body (`ticket=$some(`) is a `SyntaxError`.
+- `buildUrl` throws a `TypeError` for an operand that is not a filter object (`null`, an array, a string) and for one that matches no row (`{ $or: [] }`, `{ $not: {} }`): such an operand would serialize to the empty body, which means "any related row".
+- The same holds for the whole filter: a filter that matches no row (`{ $or: [] }`, or any AND with such a member, e.g. `{ status: 'open', $or: [] }`) throws, because an empty query string means "every row". An empty member is never dropped when that would change the result: a never-matching member makes its AND match nothing, an every-row member (`{}`) makes its OR match everything.
+- Hand-written URLs: the top-level `&` split counts parentheses but ignores quotes, so a literal `(`, `)` or `&` inside a quoted value must be percent-encoded (`title='a%29b'`) — `buildUrl` always does this.
+
 ### Logical Operators
 
 `&` is AND (higher precedence), `^` is OR (lower precedence). Parentheses override precedence:
@@ -136,8 +163,12 @@ age>=18&age<=30  → { age: { $gte: 18, $lte: 30 } }
 | `true` / `false` | `boolean` | `flag=true` |
 | `null` | `null` | `deleted=null` |
 | `'quoted'` | `string` | `name='John Doe'` |
-| Bare word | `string` | `status=ACTIVE` |
+| Bare word | `string` | `status=ACTIVE`, `type=nullable` |
+| Bare word with interior `-` | `string` | `status=in-progress`, `date>=2026-01-01`, `id=a1b2-c3d4` |
+| Bare local date-time | `string` | `hour=2026-03-29T14:00`, `at>=2026-03-29T14:00:30` |
 | `/pattern/flags` | `string` | `name~=/^Jo/i` |
+
+A bare value is a number, boolean or `null` only when the whole word is one (`nullable`, `1.5.3`, `5-3` and `2026-01-01` are strings). A leading `-` is a negative number (`a>-5`); a value starting or ending with `-` (`-x`, `x-`) and a hyphenated field name are a `SyntaxError` — quote the value (`'-x'`). There is no date type: a bare date is the string `'2026-01-01'`, and a bare `YYYY-MM-DDTHH:MM[:SS]` (an `'hour'` bucket label) the string `'2026-03-29T14:00'`. Any other value with `:` (`Z`, fractions, offsets: `'2026-03-29T14:00:00.000Z'`) must be quoted.
 
 ### Percent Encoding
 
@@ -190,7 +221,7 @@ When aggregates are present, `$select` always uses the array form (even if `-` p
 
 ### Calendar Buckets in `$select`
 
-`bucket(field,unit[,tz][,weekStart])[:alias]` groups a timestamp field by calendar day, week, month, quarter or year — see [calendar buckets](../core/README.md#calendar-buckets-bucketexpr) for units, zones and the `YYYY-MM-DD` label the server returns. Group, sort and filter by its alias:
+`bucket(field,unit[,tz][,weekStart])[:alias]` groups a timestamp field by local hour, calendar day, week, month, quarter or year — see [calendar buckets](../core/README.md#calendar-buckets-bucketexpr) for units, zones and the `YYYY-MM-DD` (hour: `YYYY-MM-DDTHH:00`) label the server returns. Group, sort and filter by its alias:
 
 ```
 $select=bucket(openedAt,week,'Europe/Berlin',sun):week,status,count(*):n
@@ -202,6 +233,7 @@ bucket(openedAt,day)                              → { $bucket: 'day', $field: 
 bucket(openedAt,day,'Europe/Berlin'):day          → { $bucket: 'day', $field: 'openedAt', $tz: 'Europe/Berlin', $as: 'day' }
 bucket(openedAt,week,'America/New_York',sun):wk   → { $bucket: 'week', …, $tz: 'America/New_York', $weekStart: 'sun', $as: 'wk' }
 bucket(openedAt,week,,sun)                        → default zone (UTC), Sunday weeks
+bucket(openedAt,hour,'Asia/Kolkata'):h           → { $bucket: 'hour', …, $tz: 'Asia/Kolkata', $as: 'h' } — labels like '2026-03-01T14:00'
 ```
 
 - The zone is quoted when it contains `/` (`UTC` may be bare); an empty slot means the default zone.
@@ -405,6 +437,8 @@ Uniqu parses and types the `$with` declaration. The consumer (e.g. a database ad
 
 Insights are computed **eagerly** during URL parsing — a `Map<string, Set<InsightOp>>` recording which fields are used and with which operators. This includes filter operators, control usage (`$select`, `$order`, `$groupBy`), and aggregate functions (`sum`, `avg`, etc. — bare names without `$` prefix).
 
+Fields inside a relational predicate body are recorded with the navigation-field prefix: `ticket=$some(status=open)` → `ticket` (`$some`), `ticket.status` (`$eq`).
+
 For queries constructed as JSON objects (not parsed from URL), use `computeInsights()` from `@uniqu/core` for **lazy** computation.
 
 ## Full Example
@@ -516,6 +550,7 @@ All features are supported:
 - A `$with` body gets one extra level of `%` encoding, matching the extra decode on parse
 - Calendar buckets are written as `bucket(field,unit[,tz][,weekStart]):alias`, always with the alias
 - Leading-zero numbers (`007`) stay as bare strings
+- Hyphenated strings and date-times are quoted (`'in-progress'`, `'2026-03-29T14:00'`), although `parseUrl` also accepts them bare
 - `Date` values are serialized as quoted ISO strings
 - `RegExp` values are serialized as `/pattern/flags`
 

@@ -62,3 +62,41 @@ describe('Lexer', () => {
     ])
   })
 })
+
+describe('Lexer – relational predicates', () => {
+  it('lexes $some / $none as keywords followed by parens', () => {
+    expect(lex('ticket=$some(status=open)').map((t) => t.type)).toEqual([
+      'word', 'op-eq', 'keyword', 'lparen', 'word', 'op-eq', 'word', 'rparen',
+    ])
+    expect(lex('ticket=$none()').map((t) => t.value)).toEqual(['ticket', '=', '$none', '(', ')'])
+  })
+})
+
+describe('Lexer – bare words with hyphens and literal prefixes', () => {
+  it('lexes a bare word with interior hyphens as one string token', () => {
+    expect(lex('status=in-progress')).toEqual([
+      { pos: 0, type: 'word', value: 'status' },
+      { pos: 6, type: 'op-eq', value: '=' },
+      { pos: 7, type: 'string', value: 'in-progress' },
+    ])
+    expect(lex('d>=2026-01-01').map((t) => `${t.type}:${t.value}`)).toEqual([
+      'word:d', 'op-gte:>=', 'string:2026-01-01',
+    ])
+  })
+
+  it('lexes a bare local date-time as one string token', () => {
+    expect(lex('h>=2026-03-29T14:00:30').map((t) => `${t.type}:${t.value}`)).toEqual([
+      'word:h', 'op-gte:>=', 'string:2026-03-29T14:00:30',
+    ])
+  })
+
+  it('keeps a leading - as a negative number', () => {
+    expect(lex('a>-5').map((t) => `${t.type}:${t.value}`)).toEqual(['word:a', 'op-gt:>', 'number:-5'])
+  })
+
+  it('lexes a literal-prefixed word (nullable, trueish, 1.5.3) as one word', () => {
+    for (const v of ['nullable', 'trueish', 'false_flag', 'null.x', '1.5.3', '5.']) {
+      expect(lex(v), v).toEqual([{ pos: 0, type: 'word', value: v }])
+    }
+  })
+})

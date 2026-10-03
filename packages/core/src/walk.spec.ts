@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { walkFilter, type FilterVisitor } from './walk'
+import { walkFilter, RELATION_OPS, isRelationOp, isRelationPredicate, hasRelationOp, type FilterVisitor } from './walk'
 import type { FilterExpr, LogicalNode, ComparisonOp, Primitive } from './types'
 
 /** Collects all visitor calls as structured records. */
@@ -384,5 +384,126 @@ describe('walkFilter', () => {
 
     // These exist only for compile-time checking
     expect(true).toBe(true)
+  })
+})
+
+describe('walkFilter – relational predicates', () => {
+  function relVisitor() {
+    const calls: Array<{ field: string; op: string; operand: FilterExpr }> = []
+    const visitor: FilterVisitor<string> = {
+      comparison: (field, op, value) => `${field} ${op} ${String(value)}`,
+      and: (children) => children.join(' AND '),
+      or: (children) => `(${children.join(' OR ')})`,
+      not: (child) => `NOT (${child})`,
+      relation(field, op, operand) {
+        calls.push({ field, op, operand })
+        return `${field} ${op} [${Object.keys(operand).join(',')}]`
+      },
+    }
+    return { calls, visitor }
+  }
+
+  it('dispatches $some / $none to visitor.relation without walking the operand', () => {
+    const { calls, visitor } = relVisitor()
+    const operand = { status: 'open', team: { $some: { name: 'x' } } }
+    const result = walkFilter({ ticket: { $some: operand } }, visitor)
+    expect(result).toBe('ticket $some [status,team]')
+    expect(calls).toEqual([{ field: 'ticket', op: '$some', operand }])
+    expect(calls[0].operand).toBe(operand)
+  })
+
+  it('combines several relation ops on one key and siblings with AND', () => {
+    const { calls, visitor } = relVisitor()
+    const result = walkFilter(
+      { title: 'a', ticket: { $some: { status: 'open' }, $none: {} } },
+      visitor,
+    )
+    expect(result).toBe('title $eq a AND ticket $some [status] AND ticket $none []')
+    expect(calls.map((c) => c.op)).toEqual(['$some', '$none'])
+  })
+
+  it('reaches predicates under $or / $not', () => {
+    const { visitor } = relVisitor()
+    expect(walkFilter({ $or: [{ id: 1 }, { $not: { ticket: { $none: {} } } }] }, visitor)).toBe(
+      '(id $eq 1 OR NOT (ticket $none []))',
+    )
+  })
+
+  it('dispatches each op of a mixed operator map to its own callback', () => {
+    const { visitor } = relVisitor()
+    expect(walkFilter({ ticket: { $some: {}, $eq: 1 } } as FilterExpr, visitor)).toBe(
+      'ticket $some [] AND ticket $eq 1',
+    )
+  })
+
+  it('throws when the visitor has no relation callback', () => {
+    const { visitor } = collectingVisitor()
+    expect(() => walkFilter({ ticket: { $some: { status: 'open' } } }, visitor)).toThrow(
+      'Relational predicate "$some" on "ticket" is not supported by this filter visitor',
+    )
+  })
+
+  it('leaves predicate-free filters untouched for visitors without relation', () => {
+    const { visitor } = collectingVisitor()
+    expect(walkFilter({ some: 1, none: { $ne: 2 } }, visitor)).toBe('some $eq 1 AND none $ne 2')
+  })
+})
+
+describe('relation helpers', () => {
+  it('RELATION_OPS / isRelationOp', () => {
+    expect(RELATION_OPS).toEqual(['$some', '$none'])
+    expect(Object.isFrozen(RELATION_OPS)).toBe(true)
+    expect(isRelationOp('$some')).toBe(true)
+    expect(isRelationOp('$none')).toBe(true)
+    expect(isRelationOp('$every')).toBe(false)
+    expect(isRelationOp('$eq')).toBe(false)
+  })
+
+  it('isRelationPredicate', () => {
+    expect(isRelationPredicate({ $some: {} })).toBe(true)
+    expect(isRelationPredicate({ $some: {}, $none: { a: 1 } })).toBe(true)
+    expect(isRelationPredicate({})).toBe(false)
+    expect(isRelationPredicate({ $some: {}, $eq: 1 })).toBe(false)
+    expect(isRelationPredicate({ $eq: 1 })).toBe(false)
+    expect(isRelationPredicate('x')).toBe(false)
+    expect(isRelationPredicate(null)).toBe(false)
+    expect(isRelationPredicate([{ $some: {} }])).toBe(false)
+    expect(isRelationPredicate(new Date())).toBe(false)
+    // malformed operands are not well-formed predicates
+    expect(isRelationPredicate({ $some: undefined })).toBe(false)
+    expect(isRelationPredicate({ $some: null })).toBe(false)
+    expect(isRelationPredicate({ $some: [] })).toBe(false)
+    expect(isRelationPredicate({ $some: 'x' })).toBe(false)
+    expect(isRelationPredicate({ $some: {}, $none: 1 })).toBe(false)
+  })
+
+  it('hasRelationOp spots any relation-op key, including malformed / mixed maps', () => {
+    expect(hasRelationOp({ $some: {} })).toBe(true)
+    expect(hasRelationOp({ $some: undefined })).toBe(true)
+    expect(hasRelationOp({ $some: {}, $eq: 5 })).toBe(true)
+    expect(hasRelationOp({ $eq: 5 })).toBe(false)
+    expect(hasRelationOp({})).toBe(false)
+    expect(hasRelationOp([{ $some: {} }])).toBe(false)
+    expect(hasRelationOp('x')).toBe(false)
+    expect(hasRelationOp(null)).toBe(false)
+  })
+
+  it('hasRelationOp treats non-plain values as leaves, like walkFilter', () => {
+    class Id {
+      $some = {}
+    }
+    const id = new Id()
+    expect(hasRelationOp(id)).toBe(false)
+    expect(hasRelationOp(Object.assign(/x/, { $some: {} }))).toBe(false)
+    expect(hasRelationOp(Object.assign(Object.create(null), { $some: {} }))).toBe(true)
+    // walkFilter compares the instance as a value, never dispatches `relation`
+    const seen: string[] = []
+    walkFilter({ a: id } as never, {
+      comparison: (f, op) => void seen.push(`${f}${op}`),
+      and: () => undefined,
+      or: () => undefined,
+      not: () => undefined,
+    })
+    expect(seen).toEqual(['a$eq'])
   })
 })

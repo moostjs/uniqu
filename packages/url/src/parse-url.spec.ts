@@ -214,6 +214,74 @@ describe('parseUrl – literal typing edge-cases', () => {
     expect((r.filter as Record<string, unknown>).code).toBe('007')
   })
 
+  it('bare word with interior hyphens is a string', () => {
+    expect(parseUrl('status=in-progress').filter).toEqual({ status: 'in-progress' })
+    expect(parseUrl('status!=in-progress&id=a1b2-c3d4-e5').filter).toEqual({
+      status: { $ne: 'in-progress' },
+      id: 'a1b2-c3d4-e5',
+    })
+    expect(parseUrl('status{in-progress,on-hold}^x=a--b').filter).toEqual({
+      $or: [{ status: { $in: ['in-progress', 'on-hold'] } }, { x: 'a--b' }],
+    })
+    expect(parseUrl('ticket=$some(status=in-progress)').filter).toEqual({
+      ticket: { $some: { status: 'in-progress' } },
+    })
+  })
+
+  it('bare dates and digit-led hyphenated words are strings, numbers stay numbers', () => {
+    expect(parseUrl('d>=2026-01-01&d<2026-02-01').filter).toEqual({
+      d: { $gte: '2026-01-01', $lt: '2026-02-01' },
+    })
+    expect(parseUrl('2026-01-01<=d<2026-02-01').filter).toEqual({
+      d: { $gte: '2026-01-01', $lt: '2026-02-01' },
+    })
+    expect(parseUrl('a=5-3&b=1e-5').filter).toEqual({ a: '5-3', b: '1e-5' })
+    expect(parseUrl('a=-5&b>=-3.5&c=0').filter).toEqual({ a: -5, b: { $gte: -3.5 }, c: 0 })
+    expect(parseUrl('-5<a<-1').filter).toEqual({ a: { $gt: -5, $lt: -1 } })
+  })
+
+  it('bare local date-times (hour labels) are strings', () => {
+    expect(parseUrl('h=2026-03-29T14:00').filter).toEqual({ h: '2026-03-29T14:00' })
+    expect(parseUrl('h>=2026-03-29T14:00:30&h<2026-03-29T16:00').filter).toEqual({
+      h: { $gte: '2026-03-29T14:00:30', $lt: '2026-03-29T16:00' },
+    })
+    expect(parseUrl('2026-03-29T14:00<=h<2026-03-29T16:00').filter).toEqual({
+      h: { $gte: '2026-03-29T14:00', $lt: '2026-03-29T16:00' },
+    })
+    expect(parseUrl('h{2026-03-29T14:00,2026-03-29T15:00}&t=$some(h=2026-03-29T14:00)').filter).toEqual({
+      h: { $in: ['2026-03-29T14:00', '2026-03-29T15:00'] },
+      t: { $some: { h: '2026-03-29T14:00' } },
+    })
+    expect(parseUrl('$having=h>2026-03-29T14:00').controls.$having).toEqual({ h: { $gt: '2026-03-29T14:00' } })
+    // Any other shape with `:` must be quoted.
+    for (const q of ['h=2026-03-29T14:00:00.000Z', 'h=2026-03-29T14:00Z', 'h=2026-03-29T4:00', 'h=a:b']) {
+      expect(() => parseUrl(q), q).toThrow(SyntaxError)
+    }
+    expect(parseUrl("h='2026-03-29T14:00:00.000Z'").filter).toEqual({ h: '2026-03-29T14:00:00.000Z' })
+  })
+
+  it('hyphenated words next to spaces stay multi-word strings', () => {
+    expect(parseUrl('a=in-progress now').filter).toEqual({ a: 'in-progress now' })
+    expect(parseUrl('a=say in-progress').filter).toEqual({ a: 'say in-progress' })
+  })
+
+  it('words that start with a literal keyword or number are strings', () => {
+    expect(parseUrl('a=nullable&b=trueish&c=falsehood&d=1.5.3').filter).toEqual({
+      a: 'nullable',
+      b: 'trueish',
+      c: 'falsehood',
+      d: '1.5.3',
+    })
+    expect(parseUrl('a=null&b=true&c=1.5').filter).toEqual({ a: null, b: true, c: 1.5 })
+  })
+
+  it('leading / trailing hyphens and hyphenated field names are still rejected', () => {
+    expect(() => parseUrl('a=-x')).toThrow(SyntaxError)
+    expect(() => parseUrl('a=x-')).toThrow(SyntaxError)
+    expect(() => parseUrl('my-field=1')).toThrow(SyntaxError)
+    expect(() => parseUrl('$exists=my-field')).toThrow(SyntaxError)
+  })
+
   it('regex flags preserved', () => {
     const r = parseUrl('name~=/^a.+z/im')
     expect((r.filter as Record<string, unknown>).name).toEqual({
@@ -359,6 +427,15 @@ describe('parseUrl – kitchen-sink query', () => {
 
     expect(r.insights).toMatchInlineSnapshot(`
       Map {
+        "status" => Set {
+          "$ne",
+        },
+        "name" => Set {
+          "$regex",
+        },
+        "role" => Set {
+          "$in",
+        },
         "client.phone" => Set {
           "$exists",
         },
@@ -368,15 +445,6 @@ describe('parseUrl – kitchen-sink query', () => {
         "age" => Set {
           "$gte",
           "$lte",
-        },
-        "status" => Set {
-          "$ne",
-        },
-        "name" => Set {
-          "$regex",
-        },
-        "role" => Set {
-          "$in",
         },
         "category" => Set {
           "$nin",
@@ -1067,6 +1135,22 @@ describe('parseUrl – calendar buckets in $select', () => {
     })
   })
 
+  it('parses an hour bucket and a $having on its YYYY-MM-DDTHH:00 label', () => {
+    const r = parseUrl(
+      "$select=bucket(openedAt,hour,'Asia/Kolkata'):h,count(*):n&$groupBy=h&$having=h>='2026-03-29T05:00'&$sort=h",
+    )
+    expect(r.controls).toEqual({
+      $select: [
+        { $bucket: 'hour', $field: 'openedAt', $tz: 'Asia/Kolkata', $as: 'h' },
+        { $fn: 'count', $field: '*', $as: 'n' },
+      ],
+      $groupBy: ['h'],
+      $having: { h: { $gte: '2026-03-29T05:00' } },
+      $sort: { h: 1 },
+    })
+    expect(select('$select=bucket(openedAt,hour)')).toEqual([{ $bucket: 'hour', $field: 'openedAt', $as: 'hour_openedAt' }])
+  })
+
   it('parses a bucket inside a $with relation', () => {
     const r = parseUrl('$with=orders($select=bucket(createdAt,month):m,sum(total):s&$groupBy=m)')
     const orders = r.controls.$with![0] as { name: string; controls: Record<string, unknown> }
@@ -1128,5 +1212,86 @@ describe('parseUrl – calendar bucket insights', () => {
       const r = parseUrl(qs)
       expect(r.insights, qs).toEqual(computeInsights(r.filter, r.controls))
     }
+  })
+})
+
+describe('parseUrl – relational predicates', () => {
+  it('parses field=$some(<expr>) into a predicate on the nav field', () => {
+    const r = parseUrl('ticket=$some(teamId{t1,t2}&status=open)')
+    expect(r.filter).toEqual({ ticket: { $some: { teamId: { $in: ['t1', 't2'] }, status: 'open' } } })
+  })
+
+  it('parses $none and an empty body', () => {
+    expect(parseUrl('ticket=$none()').filter).toEqual({ ticket: { $none: {} } })
+    expect(parseUrl('ticket=$some()').filter).toEqual({ ticket: { $some: {} } })
+  })
+
+  it('records insights with the nav prefix, nested', () => {
+    const r = parseUrl('ticket=$some(status=open&team=$none(name=x))&title=a')
+    expect(r.insights.get('ticket')).toEqual(new Set(['$some']))
+    expect(r.insights.get('ticket.status')).toEqual(new Set(['$eq']))
+    expect(r.insights.get('ticket.team')).toEqual(new Set(['$none']))
+    expect(r.insights.get('ticket.team.name')).toEqual(new Set(['$eq']))
+    expect(r.insights.get('title')).toEqual(new Set(['$eq']))
+    expect(r.insights.has('status')).toBe(false)
+    // eager insights match the lazy ones
+    expect(r.insights).toEqual(computeInsights(r.filter, r.controls))
+  })
+
+  it('keeps OR inside the body and combines with outer OR / NOT', () => {
+    expect(parseUrl('ticket=$some(status=open^status=new)').filter).toEqual({
+      ticket: { $some: { $or: [{ status: 'open' }, { status: 'new' }] } },
+    })
+    expect(parseUrl('a=1^!(ticket=$some(status=open))').filter).toEqual({
+      $or: [{ a: 1 }, { $not: { ticket: { $some: { status: 'open' } } } }],
+    })
+  })
+
+  it('ANDs $some and $none on one key into one operator map; repeats stay separate', () => {
+    expect(parseUrl('ticket=$some(a=1)&ticket=$none(b=2)').filter).toEqual({
+      ticket: { $some: { a: 1 }, $none: { b: 2 } },
+    })
+    expect(parseUrl('ticket=$some(a=1)&ticket=$some(b=2)').filter).toEqual({
+      $and: [{ ticket: { $some: { a: 1 } } }, { ticket: { $some: { b: 2 } } }],
+    })
+    // a predicate never merges with a comparison on the same key
+    expect(parseUrl('ticket=$some(a=1)&ticket=5').filter).toEqual({
+      $and: [{ ticket: { $some: { a: 1 } } }, { ticket: 5 }],
+    })
+    expect(parseUrl('ticket!=5&ticket=$none()').filter).toEqual({
+      $and: [{ ticket: { $ne: 5 } }, { ticket: { $none: {} } }],
+    })
+  })
+
+  it('accepts predicates inside a $with body', () => {
+    const r = parseUrl('$with=a(b=$some(c=1))')
+    const rel = r.controls.$with![0] as { name: string; filter: unknown }
+    expect(rel.name).toBe('a')
+    expect(rel.filter).toEqual({ b: { $some: { c: 1 } } })
+  })
+
+  it('a quoted value with a paren inside the body', () => {
+    expect(parseUrl("ticket=$some(title='a%29b')").filter).toEqual({ ticket: { $some: { title: 'a)b' } } })
+  })
+
+  it('rejects malformed predicates', () => {
+    expect(() => parseUrl('ticket=$some')).toThrow(SyntaxError)
+    expect(() => parseUrl('ticket=$some(status=open')).toThrow()
+    expect(() => parseUrl('ticket!=$some(status=open)')).toThrow(/must follow "="/)
+    expect(() => parseUrl('ticket>$none()')).toThrow(/must follow "="/)
+    expect(() => parseUrl('ticket=$every(status=open)')).toThrow()
+  })
+
+  it('an unterminated body is a SyntaxError, never a TypeError', () => {
+    for (const q of ['ticket=$some(', 'ticket=$none(', 'ticket=$some(team=$some(', 'a=1&ticket=$some(', '(', '!(']) {
+      expect(() => parseUrl(q), q).toThrow(SyntaxError)
+    }
+  })
+
+  it('caps relational predicate nesting (MAX_RELATION_DEPTH)', () => {
+    const nest = (n: number) => 'a=$some('.repeat(n) + ')'.repeat(n)
+    expect(() => parseUrl(nest(32))).not.toThrow()
+    expect(() => parseUrl(nest(33))).toThrow(/nested deeper than 32/)
+    expect(() => parseUrl(nest(2000))).toThrow(SyntaxError)
   })
 })
