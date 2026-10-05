@@ -60,6 +60,18 @@ describe('AggregateResult', () => {
     expectTypeOf<AggregateResult<Ticket, Sel>['week']>().toEqualTypeOf<string>()
   })
 
+  it('adds no empty member without expression entries, so a typed row equals the written one', () => {
+    type Sel = ['status', { $fn: 'count'; $field: '*'; $as: 'n' }, { $bucket: 'week'; $field: 'openedAt'; $as: 'week' }]
+    expectTypeOf<AggregateResult<Ticket, Sel>>().toEqualTypeOf<
+      { status: string } & { n: number } & { week: string }
+    >()
+  })
+
+  it('types expression entries as number | null', () => {
+    type Sel = [{ $fn: 'count'; $field: '*'; $as: 'n' }, { $expr: 'n'; $as: 'x' }]
+    expectTypeOf<AggregateResult<Ticket, Sel>['x']>().toEqualTypeOf<number | null>()
+  })
+
   it('uses the default bucket alias', () => {
     type Sel = [{ $bucket: 'week'; $field: 'openedAt' }, { $bucket: 'hour'; $field: 'openedAt' }, 'status']
     expectTypeOf<AggregateResult<Ticket, Sel>['week_openedAt']>().toEqualTypeOf<string>()

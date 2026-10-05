@@ -381,6 +381,15 @@ export type ValidGroupBy<T, Q, D extends string = keyof T & string> =
     : unknown
 
 /**
+ * The `number | null` members of the expression entries in a `$select` (row-level aggregates over an
+ * expression, group-level expressions). `unknown` when there are none, so the intersection carries no
+ * empty `{}` member and typed rows compare equal to the written-out row type.
+ */
+type ExprAliasMembers<Select extends readonly unknown[]> =
+  [Extract<Select[number], { $expr: unknown }>] extends [never] ? unknown
+  : { [E in Extract<Select[number], { $expr: unknown }> as ResolveAlias<E>]: number | null }
+
+/**
  * Infer the result row type from an aggregate query's $select.
  * Dimension fields preserve their original type from T.
  * Aggregate expressions: min/max/first/last preserve original type, others → number.
@@ -395,7 +404,7 @@ export type AggregateResult<
   & { [A in Extract<Select[number], AggregateExpr> as ResolveAlias<A>]:
       A extends { $fn: 'min' | 'max' | 'first' | 'last'; $field: infer F extends keyof T & string } ? T[F] : number
     }
-  & { [E in Extract<Select[number], { $expr: unknown }> as ResolveAlias<E>]: number | null }
+  & ExprAliasMembers<Select>
   & { [B in Extract<Select[number], BucketExpr> as ResolveAlias<B>]:
       B extends { $field: infer F extends keyof T & string }
         ? null extends T[F] ? CalendarBucketLabel | null
