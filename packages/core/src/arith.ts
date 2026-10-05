@@ -228,11 +228,13 @@ export function formatArith(expr: ArithExpr, opts: FormatArithOptions = {}): str
 /** The distinct names an expression references, in first-use order. */
 export function arithNames(expr: ArithExpr): string[] {
   const out = new Set<string>()
-  const walk = (e: ArithExpr) => {
+  // Iterative: an expression may be hostile (10k levels deep) before it is validated.
+  const stack: ArithExpr[] = [expr]
+  while (stack.length) {
+    const e = stack.pop()!
     if (typeof e === 'string') out.add(e)
-    else if (isNode(e)) for (const a of e.$args) walk(a)
+    else if (isNode(e)) for (let i = e.$args.length - 1; i >= 0; i--) stack.push(e.$args[i] as ArithExpr)
   }
-  walk(expr)
   return [...out]
 }
 

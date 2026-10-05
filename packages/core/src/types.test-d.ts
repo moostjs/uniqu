@@ -13,6 +13,7 @@ import type {
   InsightOp,
   ResolveAlias,
   SelectExpr,
+  NumericKeys,
   UniqueryControls,
   ValidGroupBy,
 } from './types'
@@ -394,3 +395,35 @@ describe('arithmetic expressions, first / last and $rowOrder', () => {
     expectTypeOf<'first'>().toExtend<InsightOp>()
   })
 })
+
+describe('NumericKeys', () => {
+  interface Row {
+    id: number
+    title: string
+    price: number
+    discount?: number | null
+    flag: boolean
+  }
+
+  it('lists the numeric keys of a concrete record', () => {
+    expectTypeOf<NumericKeys<Row>>().toEqualTypeOf<'id' | 'price' | 'discount'>()
+  })
+
+  it('falls back to string for an untyped record, any, or no numeric key', () => {
+    expectTypeOf<NumericKeys<Record<string, unknown>>>().toEqualTypeOf<string>()
+    expectTypeOf<NumericKeys<any>>().toEqualTypeOf<string>()
+    expectTypeOf<NumericKeys<{ a: string }>>().toEqualTypeOf<string>()
+  })
+
+  it('types the operands of a row-level aggregate in SelectExpr<T>', () => {
+    const ok: SelectExpr<Row> = [{ $fn: 'sum', $expr: { $op: '*', $args: ['price', 2] }, $as: 'x' }]
+    expectTypeOf(ok).toExtend<SelectExpr<Row>>()
+    // @ts-expect-error — `title` is not a numeric field
+    const bad: SelectExpr<Row> = [{ $fn: 'sum', $expr: { $op: '*', $args: ['title', 2] }, $as: 'x' }]
+    void bad
+    // an untyped record keeps accepting any name
+    const loose: SelectExpr = [{ $fn: 'sum', $expr: 'anything', $as: 'x' }]
+    expectTypeOf(loose).toExtend<SelectExpr>()
+  })
+})
+

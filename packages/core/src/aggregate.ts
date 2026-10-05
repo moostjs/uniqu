@@ -207,6 +207,8 @@ export type BucketResolution =
     }
   | { ok: false; issues: QueryIssue[] }
 
+/** Prefix of the engine's internal column / alias names (derived tables, result envelopes). */
+export const RESERVED_ALIAS_PREFIX = '__as_'
 const ALIAS_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
 /** `a, b or c` */
 const orList = (items: readonly string[]) =>
@@ -350,11 +352,25 @@ export function resolveBuckets(
         fields.add(entry)
         continue
       }
+      if (typeof entry === 'object' && entry !== null && '$field' in entry && '$expr' in entry) {
+        issues.push({
+          path: '$select',
+          message: `$select entry at index ${i} has both $field and $expr — use one`,
+        })
+        continue
+      }
       if (!isComputedExpr(entry)) {
         issues.push({ path: '$select', message: `Unsupported $select entry at index ${i}` })
         continue
       }
       const entryAlias = resolveAlias(entry)
+      if (typeof entryAlias === 'string' && entryAlias.startsWith(RESERVED_ALIAS_PREFIX)) {
+        issues.push({
+          path: '$select',
+          message: `Alias "${entryAlias}" is reserved — aliases must not start with "${RESERVED_ALIAS_PREFIX}"`,
+        })
+        continue
+      }
       aliasCount.set(entryAlias, (aliasCount.get(entryAlias) ?? 0) + 1)
       if (isBucketExpr(entry)) {
         sawBucket = true

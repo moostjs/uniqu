@@ -21,6 +21,7 @@ export type {
   ComputedExpr,
   ArithExpr,
   AggregateOfExpr,
+  NumericKeys,
   SelectArithExpr,
   SelectExpr,
   WithRelation,

@@ -164,6 +164,14 @@ describe('parseArith ↔ formatArith', () => {
   }
 })
 
+describe('arithNames on hostile input', () => {
+  it('reads a 10k-deep chain without a stack overflow, in left-to-right order', () => {
+    let e: ArithExpr = 'a'
+    for (let i = 0; i < 10_000; i++) e = { $op: '+', $args: [e, 'b'] }
+    expect(arithNames(e)).toEqual(['a', 'b'])
+  })
+})
+
 describe('arithNames / arithNullable', () => {
   it('lists distinct names in first-use order', () => {
     expect(arithNames(parseArith('a*b+a/coalesce(c,1)-2'))).toEqual(['a', 'b', 'c'])

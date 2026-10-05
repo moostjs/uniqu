@@ -164,9 +164,26 @@ export interface AggregateOfExpr<
  * (`expr(est/open):avgEst`). `$as` is required.
  */
 export interface SelectArithExpr<Alias extends string = string> {
+  /** Never set: an entry with `$fn` is a row-level aggregate ({@link AggregateOfExpr}), typed on its own. */
+  $fn?: never
   $expr: ArithExpr
   $as: Alias
 }
+
+/**
+ * The numeric field names of `T` — the operands a per-row expression may read.
+ * Falls back to `string` when `T` is untyped (`Record<string, unknown>`, `any`) or has no
+ * numeric field, so an expression over an untyped table never collapses to `never`.
+ */
+export type NumericKeys<T> =
+  string extends keyof T
+    ? string
+    : [NumericNames<T>] extends [never]
+      ? string
+      : NumericNames<T>
+type NumericNames<T> = {
+  [K in keyof T & string]-?: [NonNullable<T[K]>] extends [number] ? K : never
+}[keyof T & string]
 
 /** Calendar units a bucket truncates to. `'hour'` is the local wall-clock hour. */
 export type BucketUnit = 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year'
@@ -227,7 +244,7 @@ export type ComputedExpr = AggregateExpr | BucketExpr | AggregateOfExpr | Select
  * - Object form: inclusion/exclusion map (0 or 1 per field). No computed columns in this form.
  */
 export type SelectExpr<T = Record<string, unknown>> =
-  | ((keyof T & string) | AggregateExpr | BucketExpr<keyof T & string> | AggregateOfExpr | SelectArithExpr)[]
+  | ((keyof T & string) | AggregateExpr | BucketExpr<keyof T & string> | AggregateOfExpr<'sum' | 'avg' | 'min' | 'max', NumericKeys<T>> | SelectArithExpr)[]
   | Partial<Record<keyof T & string, 0 | 1>>
 
 /** Query controls (pagination, projection, sorting, grouping). Generic `T` constrains field names. */

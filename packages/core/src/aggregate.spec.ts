@@ -644,3 +644,30 @@ describe('resolveBuckets – first / last and $rowOrder', () => {
     expect(!res.ok && res.issues[0].message).toMatch(/Unknown aggregate function "first"/)
   })
 })
+
+describe('resolveBuckets — malformed entries', () => {
+  it('rejects an entry carrying both $field and $expr', () => {
+    const res = resolveBuckets(
+      { $select: ['g', { $fn: 'sum', $field: 'a', $expr: 'b', $as: 'x' } as never], $groupBy: ['g'] },
+      { aggregate: true },
+    )
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.issues[0]!.message).toMatch(/both \$field and \$expr/)
+  })
+
+  it('rejects an alias in the reserved internal prefix, for every entry kind', () => {
+    for (const entry of [
+      { $fn: 'sum', $field: 'a', $as: '__as_n_total' },
+      { $fn: 'sum', $expr: 'a', $as: '__as_x' },
+      { $expr: 'n', $as: '__as_y' },
+      { $bucket: 'day', $field: 'at', $as: '__as_d' },
+    ]) {
+      const res = resolveBuckets(
+        { $select: ['g', { $fn: 'count', $field: '*', $as: 'n' }, entry as never], $groupBy: ['g', '__as_d'] },
+        { aggregate: true },
+      )
+      expect(res.ok).toBe(false)
+      if (!res.ok) expect(res.issues.some((i) => /reserved/.test(i.message))).toBe(true)
+    }
+  })
+})
