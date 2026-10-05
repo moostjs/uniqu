@@ -1,4 +1,5 @@
-import { computedAliases, isAggregateExpr, isBucketExpr } from './aggregate'
+import { computedAliases, isAggregateExpr, isAggregateOfExpr, isBucketExpr, isSelectArithExpr } from './aggregate'
+import { arithNames } from './arith'
 import type {
   FilterExpr,
   UniqueryControls,
@@ -57,6 +58,8 @@ export function computeInsights(
   // Computed-column alias → source field, so alias references in
   // $groupBy / $having / $sort are reported against the real field.
   const aliasToField = computedAliases(controls?.$select)
+  // An expression alias has no single source field, so it is not reported at all.
+  const exprAliases = new Set<string>()
   if (controls?.$select) {
     if (Array.isArray(controls.$select)) {
       for (const entry of controls.$select) {
@@ -66,6 +69,11 @@ export function computeInsights(
           capture(entry.$field, '$bucket')
         } else if (isAggregateExpr(entry)) {
           capture(entry.$field, entry.$fn)
+        } else if (isAggregateOfExpr(entry) || isSelectArithExpr(entry)) {
+          exprAliases.add(entry.$as)
+          // Each operand is read by a row-level aggregate. A group-level expression reads
+          // aliases / $groupBy fields only, reported where they are defined.
+          if (isAggregateOfExpr(entry)) for (const name of arithNames(entry.$expr)) capture(name, entry.$fn)
         }
       }
     } else {
@@ -74,14 +82,18 @@ export function computeInsights(
       }
     }
   }
+  /** Report `name` against the real field behind it (a computed alias resolves to its source field). */
+  const captureSource = (name: string, op: InsightOp) => {
+    if (!exprAliases.has(name)) capture(aliasToField.get(name) ?? name, op)
+  }
   if (controls?.$groupBy) {
     for (const field of controls.$groupBy) {
-      if (typeof field === 'string') capture(aliasToField.get(field) ?? field, '$groupBy')
+      if (typeof field === 'string') captureSource(field, '$groupBy')
     }
   }
   if (controls?.$having) {
     const havingVisitor: FilterVisitor<void> = {
-      comparison(field) { capture(aliasToField.get(field) ?? field, '$having') },
+      comparison(field) { captureSource(field, '$having') },
       // Relational predicates are not valid in `$having`; report the key so
       // consumers reject it as an unknown/invalid `$having` field.
       relation(field) { capture(field, '$having') },
@@ -93,8 +105,14 @@ export function computeInsights(
   }
   if (controls?.$sort) {
     for (const field of Object.keys(controls.$sort)) {
-      capture(aliasToField.get(field) ?? field, '$order')
+      captureSource(field, '$order')
     }
+  }
+  // Rows are ordered by these fields inside each group (first() / last()). Reported as
+  // '$order' so the sortability gates consumers already apply to `$sort` cover them by default.
+  const rowOrder = controls?.$rowOrder
+  if (rowOrder) {
+    for (const field of Object.keys(rowOrder)) capture(field, '$order')
   }
   if (controls?.$with) {
     for (const entry of controls.$with) {

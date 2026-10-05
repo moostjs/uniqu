@@ -1295,3 +1295,166 @@ describe('parseUrl – relational predicates', () => {
     expect(() => parseUrl(nest(2000))).toThrow(SyntaxError)
   })
 })
+
+describe('parseUrl – empty IN / NOT IN lists', () => {
+  it('parses code{} as an empty $in and code!{} as an empty $nin', () => {
+    expect(parseUrl('code{}').filter).toEqual({ code: { $in: [] } })
+    expect(parseUrl('code!{}').filter).toEqual({ code: { $nin: [] } })
+  })
+
+  it('ignores whitespace inside the braces', () => {
+    expect(parseUrl('code{ }').filter).toEqual({ code: { $in: [] } })
+    expect(parseUrl('code!{  }').filter).toEqual({ code: { $nin: [] } })
+  })
+
+  it('works inside groups, negation and combinations', () => {
+    expect(parseUrl('!(code{})').filter).toEqual({ $not: { code: { $in: [] } } })
+    expect(parseUrl('(code{})^x=1').filter).toEqual({ $or: [{ code: { $in: [] } }, { x: 1 }] })
+    expect(parseUrl('code{}^x=1').filter).toEqual({ $or: [{ code: { $in: [] } }, { x: 1 }] })
+    expect(parseUrl('code{}&x=1').filter).toEqual({ code: { $in: [] }, x: 1 })
+  })
+
+  it('keeps same-field clauses separate (never widens)', () => {
+    expect(parseUrl('code{}&code{a}').filter).toEqual({
+      $and: [{ code: { $in: [] } }, { code: { $in: ['a'] } }],
+    })
+  })
+
+  it('parses a relational predicate over an empty list', () => {
+    expect(parseUrl('rel=$some(code{})').filter).toEqual({ rel: { $some: { code: { $in: [] } } } })
+  })
+
+  it('records the field in the insights', () => {
+    expect(parseUrl('code{}').insights.get('code')).toEqual(new Set(['$in']))
+    expect(parseUrl('code!{}').insights.get('code')).toEqual(new Set(['$nin']))
+  })
+
+  it('still rejects malformed lists', () => {
+    for (const bad of ['code{,}', 'code{a,}', 'code{,a}', 'code{', 'code!{', 'code{a', 'code{}}']) {
+      expect(() => parseUrl(bad), bad).toThrow()
+    }
+  })
+
+  it('non-empty lists are unchanged', () => {
+    expect(parseUrl('code{a,b}').filter).toEqual({ code: { $in: ['a', 'b'] } })
+  })
+})
+
+describe('parseUrl – arithmetic $select items', () => {
+  const sel = (qs: string) => parseUrl(qs).controls.$select
+
+  it('parses expr(<arith>):alias as a group-level expression', () => {
+    expect(sel('$select=expr(est/open):avgEst')).toEqual([
+      { $expr: { $op: '/', $args: ['est', 'open'] }, $as: 'avgEst' },
+    ])
+  })
+
+  it('parses fn(<arith>):alias as an expression aggregate', () => {
+    expect(sel('$select=sum(price*qty):rev')).toEqual([
+      { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'rev' },
+    ])
+    for (const fn of ['avg', 'min', 'max']) {
+      expect(sel(`$select=${fn}(a-b):x`)).toEqual([{ $fn: fn, $expr: { $op: '-', $args: ['a', 'b'] }, $as: 'x' }])
+    }
+  })
+
+  it('keeps simple field aggregates unchanged, including first / last', () => {
+    expect(sel('$select=sum(price):total,first(raisedAt),last(raisedAt):newest')).toEqual([
+      { $fn: 'sum', $field: 'price', $as: 'total' },
+      { $fn: 'first', $field: 'raisedAt', $as: 'first_raisedAt' },
+      { $fn: 'last', $field: 'raisedAt', $as: 'newest' },
+    ])
+  })
+
+  it('reads %2B (decoded by the segment) and a raw + as plus', () => {
+    const want = [{ $expr: { $op: '+', $args: [{ $op: '*', $args: ['open', 10] }, 'sevMax'] }, $as: 'rank' }]
+    expect(sel('$select=expr(open*10%2BsevMax):rank')).toEqual(want)
+    expect(sel('$select=expr(open*10+sevMax):rank')).toEqual(want)
+    expect(sel('$select=expr(open%20%2B%201):x')).toEqual([{ $expr: { $op: '+', $args: ['open', 1] }, $as: 'x' }])
+  })
+
+  it('rejects a + decoded to a space (missing operator)', () => {
+    expect(() => parseUrl('$select=expr(open 1):x')).toThrow(/Missing operator/)
+  })
+
+  it('keeps nested parentheses and coalesce commas whole', () => {
+    expect(sel('$select=a,expr(coalesce(b,0)*(c-d)):x,count(*):n')).toEqual([
+      'a',
+      {
+        $expr: {
+          $op: '*',
+          $args: [{ $op: 'coalesce', $args: ['b', 0] }, { $op: '-', $args: ['c', 'd'] }],
+        },
+        $as: 'x',
+      },
+      { $fn: 'count', $field: '*', $as: 'n' },
+    ])
+  })
+
+  it('parses negative literals and unary minus', () => {
+    expect(sel('$select=expr(-a*-2):x')).toEqual([
+      { $expr: { $op: '*', $args: [{ $op: '-', $args: ['a'] }, -2] }, $as: 'x' },
+    ])
+  })
+
+  it('requires an alias', () => {
+    expect(() => parseUrl('$select=expr(a/b)')).toThrow(/Malformed \$select item "expr\(a\/b\)": expected :alias/)
+    expect(() => parseUrl('$select=sum(a*b)')).toThrow(/expected :alias/)
+  })
+
+  it('throws on malformed items instead of dropping them', () => {
+    for (const bad of [
+      'sum(a',
+      'expr(a/',
+      'expr(a/b',
+      'sum()',
+      'sum(a,b)',
+      'sum(a*b):',
+      'expr(1 2):x',
+      'expr(a$b):x',
+      'expr(foo(a)):x',
+      'sum(a)x',
+      'sum(a):b c',
+    ]) {
+      expect(() => parseUrl(`$select=${bad}`), bad).toThrow(SyntaxError)
+    }
+    expect(() => parseUrl('$select=sum()')).toThrow(/Malformed \$select item "sum\(\)"/)
+  })
+
+  it('rejects an unknown function over an expression at the URL level', () => {
+    expect(() => parseUrl('$select=foo(a*b):x')).toThrow(/Malformed \$select item "foo\(a\*b\):x": unknown function "foo"/)
+    expect(() => parseUrl('$select=count(a*b):x')).toThrow(/unknown function "count"/)
+  })
+
+  it('preserves entry order next to fields, aggregates and buckets', () => {
+    expect(sel('$select=g,bucket(at,day):d,sum(a*b):s,expr(s/2):h,max(c)')).toEqual([
+      'g',
+      { $bucket: 'day', $field: 'at', $as: 'd' },
+      { $fn: 'sum', $expr: { $op: '*', $args: ['a', 'b'] }, $as: 's' },
+      { $expr: { $op: '/', $args: ['s', 2] }, $as: 'h' },
+      { $fn: 'max', $field: 'c', $as: 'max_c' },
+    ])
+  })
+
+  it('captures insights for operands and row-order keys', () => {
+    const q = parseUrl('$groupBy=g&$select=g,sum(price*qty):rev,expr(rev/2):half,first(title):t&$rowOrder=at&$sort=-half')
+    expect(q.insights.get('price')).toEqual(new Set(['sum']))
+    expect(q.insights.get('qty')).toEqual(new Set(['sum']))
+    expect(q.insights.get('title')).toEqual(new Set(['first']))
+    expect(q.insights.get('at')).toEqual(new Set(['$order']))
+    expect(q.insights.has('rev')).toBe(false)
+    expect(q.insights.has('half')).toBe(false)
+  })
+})
+
+describe('parseUrl – $rowOrder', () => {
+  it('parses like $sort', () => {
+    expect(parseUrl('$rowOrder=raisedAt,-id').controls.$rowOrder).toEqual({ raisedAt: 1, id: -1 })
+  })
+
+  it('does not leak into $sort', () => {
+    const c = parseUrl('$rowOrder=a&$sort=-b').controls
+    expect(c.$rowOrder).toEqual({ a: 1 })
+    expect(c.$sort).toEqual({ b: -1 })
+  })
+})

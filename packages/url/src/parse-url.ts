@@ -1,10 +1,18 @@
-import { TIME_ZONE_NAME_RE, computeInsights, resolveAlias } from '@uniqu/core'
+import {
+  EXPR_AGGREGATE_FNS,
+  TIME_ZONE_NAME_RE,
+  computeInsights,
+  parseArith,
+  resolveAlias,
+} from '@uniqu/core'
 import type {
   AggregateExpr,
+  AggregateOfExpr,
   BucketExpr,
   BucketUnit,
   WeekStart,
   FilterExpr,
+  SelectArithExpr,
   WithRelation,
   UniqueryControls,
   UniqueryInsights,
@@ -122,6 +130,38 @@ function closingQuote(str: string, open: number): number {
   return str.length
 }
 
+const ALIAS_SRC = '[\\w.]+'
+/** `:alias` — the whole text after a `$select` call. */
+const ALIAS_RE = new RegExp(`^:(${ALIAS_SRC})$`, 'u')
+/** `fn(field)[:alias]` / `fn(*)[:alias]` — a plain aggregate item. */
+const AGG_RE = new RegExp(`^(\\w+)\\((\\*|[\\w.]+)\\)(?::(${ALIAS_SRC}))?$`)
+
+/** The `alias` of `:alias`, or `undefined` when `rest` is not exactly that. */
+function parseAlias(rest: string): string | undefined {
+  return ALIAS_RE.exec(rest)?.[1]
+}
+
+/** `findCloseParen` results besides an index. */
+const UNBALANCED = -1
+const NESTED_PAREN = -2
+
+/**
+ * Index of the `)` closing the `(` at `open`, skipping single-quoted strings.
+ * With `nested` an inner `(…)` is balanced (`coalesce(a,0)`); without it an inner
+ * `(` gives {@link NESTED_PAREN}. {@link UNBALANCED} when never closed.
+ */
+function findCloseParen(str: string, open: number, nested: boolean): number {
+  let depth = 0
+  for (let i = open; i < str.length; i++) {
+    if (str[i] === "'") i = closingQuote(str, i)
+    else if (str[i] === '(') {
+      if (!nested && depth > 0) return NESTED_PAREN
+      depth++
+    } else if (str[i] === ')' && --depth === 0) return i
+  }
+  return UNBALANCED
+}
+
 function fail(item: string, why: string): never {
   throw new SyntaxError(`Malformed bucket "${item}": ${why}`)
 }
@@ -142,16 +182,9 @@ function fail(item: string, why: string): never {
  */
 function parseBucket(item: string): BucketExpr {
   const open = item.indexOf('(')
-  let close = -1
-  for (let i = open + 1; i < item.length; i++) {
-    if (item[i] === "'") i = closingQuote(item, i)
-    else if (item[i] === '(') fail(item, 'unexpected "("')
-    else if (item[i] === ')') {
-      close = i
-      break
-    }
-  }
-  if (close === -1) fail(item, 'missing ")"')
+  const close = findCloseParen(item, open, false)
+  if (close === NESTED_PAREN) fail(item, 'unexpected "("')
+  if (close === UNBALANCED) fail(item, 'missing ")"')
   const args = splitTopLevel(item.slice(open + 1, close), ',', true)
   if (args.length < 2) fail(item, 'expected bucket(field,unit[,tz][,weekStart])')
   if (args.length > 4) fail(item, 'too many arguments')
@@ -170,12 +203,59 @@ function parseBucket(item: string): BucketExpr {
   }
   const rest = item.slice(close + 1)
   if (rest) {
-    const alias = /^:([\w.]+)$/u.exec(rest)
-    if (!alias) fail(item, 'invalid alias')
-    expr.$as = alias[1]
+    expr.$as = parseAlias(rest)
+    if (expr.$as === undefined) fail(item, 'invalid alias')
   }
   expr.$as ??= resolveAlias(expr)
   return expr
+}
+
+/** A `$select` call item split at its matching parens: `name(arg)rest`. */
+interface SelectCall {
+  name: string
+  arg: string
+  rest: string
+}
+
+/** Split `name(arg)rest` at the `)` matching the first `(`; `undefined` when unbalanced. */
+function splitCall(item: string): SelectCall | undefined {
+  const open = item.indexOf('(')
+  const close = findCloseParen(item, open, true)
+  if (close === UNBALANCED) return undefined
+  return { name: item.slice(0, open), arg: item.slice(open + 1, close), rest: item.slice(close + 1) }
+}
+
+/**
+ * Parse an arithmetic `$select` item:
+ *
+ *   expr(<arith>):alias          → `{ $expr, $as }`
+ *   sum|avg|min|max(<arith>):alias → `{ $fn, $expr, $as }`
+ *
+ * The argument runs to the matching `)` (nested `coalesce(a,0)` stays whole); the
+ * alias is required; any other function name is malformed. The argument is parsed by
+ * core's `parseArith`; its rules (operators, limits, operand types) are validated
+ * downstream. A raw `+` and a decoded `%2B` both read as plus. `expr` is a reserved
+ * name, like `bucket`.
+ */
+function parseExprItem(item: string, call: SelectCall | undefined): SelectArithExpr | AggregateOfExpr {
+  if (!call) throw new SyntaxError(`Malformed $select item "${item}": missing ")"`)
+  const fn = EXPR_AGGREGATE_FNS.find((f) => f === call.name)
+  if (call.name !== 'expr' && !fn) {
+    throw new SyntaxError(
+      `Malformed $select item "${item}": unknown function "${call.name}" — use ${EXPR_AGGREGATE_FNS.join('/')} or expr(<arith>)`,
+    )
+  }
+  const alias = parseAlias(call.rest)
+  if (alias === undefined) {
+    throw new SyntaxError(`Malformed $select item "${item}": expected :alias after the expression`)
+  }
+  let expr
+  try {
+    expr = parseArith(call.arg)
+  } catch (e) {
+    throw new SyntaxError(`Malformed $select item "${item}": ${(e as Error).message}`)
+  }
+  return fn ? { $fn: fn, $expr: expr, $as: alias } : { $expr: expr, $as: alias }
 }
 
 /** Lex + parse a raw filter expression string. */
@@ -249,7 +329,7 @@ function handleControls(parts: string[]): UniqueryControls {
         }
 
         if (hasComputed || !hasExclusion) {
-          const arr: (string | AggregateExpr | BucketExpr)[] = Array.isArray(controls.$select)
+          const arr: (string | AggregateExpr | BucketExpr | AggregateOfExpr | SelectArithExpr)[] = Array.isArray(controls.$select)
             ? controls.$select
             : []
           // Entries keep their order, so buildUrl → parseUrl round-trips
@@ -263,8 +343,12 @@ function handleControls(parts: string[]): UniqueryControls {
               arr.push(f)
               continue
             }
-            const aggMatch = /^(\w+)\((\*|[\w.]+)\)(?::([\w.]+))?$/.exec(f)
-            if (!aggMatch) continue
+            // `expr(<arith>):alias` and `fn(<arith>):alias`; a plain `fn(field)` is an aggregate.
+            const aggMatch = f.startsWith('expr(') ? null : AGG_RE.exec(f)
+            if (!aggMatch) {
+              arr.push(parseExprItem(f, splitCall(f)))
+              continue
+            }
             const fn = aggMatch[1]
             const field = aggMatch[2]
             arr.push({ $fn: fn, $field: field, $as: aggMatch[3] ?? resolveAlias({ $fn: fn, $field: field }) })
@@ -282,13 +366,15 @@ function handleControls(parts: string[]): UniqueryControls {
         break
       }
 
+      case '$rowOrder':
       case '$sort':
       case '$order': {
-        controls.$sort ??= {}
+        const orderKey = key === '$rowOrder' ? '$rowOrder' : '$sort'
+        const order: Partial<Record<string, 1 | -1>> = (controls[orderKey] ??= {})
         for (const f of value.split(',')) {
           if (!f) continue
-          if (f.startsWith('-')) controls.$sort![f.slice(1)] = -1
-          else controls.$sort![f] = 1
+          if (f.startsWith('-')) order[f.slice(1)] = -1
+          else order[f] = 1
         }
         break
       }

@@ -103,6 +103,7 @@ means `a = 1` AND the `$and` branch AND the `$or` branch.
 | `$limit` | `number` | Limit to N results |
 | `$count` | `boolean` | Request total count |
 | `$select` | `SelectExpr<T>` | Field projection — array of strings/aggregates for inclusion, object for exclusion/mixed |
+| `$rowOrder` | `Record<string, 1 \| -1>` | Row order inside each group for `first()` / `last()` — see [representative row](#representative-row-first--last-and-roworder) |
 | `$groupBy` | `string[]` | Fields — or [calendar bucket](#calendar-buckets-bucketexpr) aliases — to group by for aggregate queries |
 | `$having` | `FilterExpr` | Post-aggregation filter on aliases and dimension fields |
 | `$with` | `(WithRelation \| string)[]` | Relations to populate alongside the primary query |
@@ -208,17 +209,68 @@ const query: Uniquery = {
 
 ```ts
 interface AggregateExpr {
-  $fn: AggregateFn | (string & {})  // 'sum' | 'count' | 'countDistinct' | 'avg' | 'min' | 'max' | custom
+  $fn: AggregateFn | (string & {})  // 'sum' | 'count' | 'countDistinct' | 'avg' | 'min' | 'max' | 'first' | 'last' | custom
   $field: string                     // field name, or '*' for count(*)
   $as?: string                       // optional alias for the result
 }
 ```
 
-Known functions are `sum`, `count`, `countDistinct`, `avg`, `min`, `max` (`AggregateFn`), but `$fn` accepts any string for extensibility — consumers validate and execute supported functions. `AGGREGATE_FNS` lists the known names at runtime and `isAggregateFn(name)` checks one.
+Known functions are `sum`, `count`, `countDistinct`, `avg`, `min`, `max`, `first`, `last` (`AggregateFn`), but `$fn` accepts any string for extensibility — consumers validate and execute supported functions. `AGGREGATE_FNS` lists the known names at runtime and `isAggregateFn(name)` checks one.
 
 `countDistinct` counts the distinct non-null values of `$field`; the result is a number. In `AggregateControls` it may target a dimension or a measure field (other aggregates take measures only). Only `count` accepts `'*'` (`STAR_AGGREGATE_FNS`): `countDistinct(*)` is not valid.
 
 Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`, `countDistinct(customerId)` → `countDistinct_customerId`). `resolveAlias(expr)` applies that rule for aggregates and buckets alike — use it instead of re-deriving aliases.
+
+#### Arithmetic expressions (`ArithExpr`)
+
+A closed arithmetic grammar for aggregates over expressions and for expressions over other aggregates. `ArithExpr` is a number literal, a name, or an operator node:
+
+```ts
+type ArithExpr =
+  | number
+  | string                                                       // a name
+  | { $op: '+' | '-' | '*' | '/'; $args: [ArithExpr, ArithExpr] }
+  | { $op: '-'; $args: [ArithExpr] }                             // negation
+  | { $op: 'coalesce'; $args: [ArithExpr, ArithExpr, ...ArithExpr[]] }
+```
+
+Two `$select` entry kinds use it; both require `$as`:
+
+```ts
+{ $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'revenue' }   // AggregateOfExpr: row-level, $fn is sum | avg | min | max
+{ $expr: { $op: '/', $args: ['est', 'open'] }, $as: 'avgEst' }                  // SelectArithExpr: group-level
+```
+
+A row-level expression's names are fields of the row. A group-level expression's names are the aliases of other numeric entries (aggregates, `first` / `last`, other expressions, in any order, without cycles) or plain `$groupBy` fields; it is evaluated after grouping, and an inline aggregate call (`sum(a)/count(*)`) is not part of the grammar. Both entry kinds are valid in grouped queries only, and an expression alias cannot be a `$groupBy` entry. Results are typed `number | null` in `AggregateResult`. `isAggregateOfExpr` and `isSelectArithExpr` tell the kinds apart (`isAggregateExpr` stays strict: it needs a string `$field`). `NumericKeys<T>` lists the number-valued keys of `T`.
+
+One grammar serves JSON users and the URL:
+
+```ts
+import { parseArith, formatArith, arithNames, arithNullable, validateArith } from '@uniqu/core'
+
+parseArith('open*10+sevMax')             // { $op: '+', $args: [{ $op: '*', $args: ['open', 10] }, 'sevMax'] }
+formatArith(expr)                        // 'open*10+sevMax'
+formatArith(expr, { encodePlus: true })  // 'open*10%2BsevMax' (for a URL)
+```
+
+- `parseArith(text)`: `+ - * /` (left-associative, `*` `/` bind tighter), unary `-`, parentheses, number literals (`2`, `0.5`, `1e3`), names (`[A-Za-z_][\w.]*`) and `coalesce(a, b, …)`. A `-` directly before a number in operand position is a negative literal; `-(5)` is a negation node. Whitespace is skipped. It throws `SyntaxError` with the offset (missing operator, unbalanced paren, unknown function, a literal that underflows to 0).
+- `formatArith(expr, { encodePlus? })`: canonical text with minimal parentheses (`a-(b-c)` keeps them), the inverse of `parseArith`: `parseArith(formatArith(x))` deep-equals `x`. It throws `TypeError` for a malformed expression.
+- `arithNames(expr)`: the distinct names, in first-use order. `arithNullable(expr, isNullable)`: whether the result may be NULL (a `/`, a nullable name, or a `coalesce` whose arguments are all nullable).
+- `validateArith(expr)`: schema-free rules as `QueryIssue[]`: operators and arities (`-` takes 1 or 2 arguments, `coalesce` at least 2, the rest 2), identifier names, finite literals within `Number.MAX_SAFE_INTEGER`, at least one name (a constant is rejected), and at most `ARITH_MAX_NODES` (64) nodes and `ARITH_MAX_DEPTH` (16) levels. The limits are a guard: the URL is user input.
+
+Semantics are the consumer's (a typical engine uses IEEE doubles, NULL propagates, and division by zero gives NULL).
+
+#### Representative row: `first` / `last` and `$rowOrder`
+
+`first` / `last` read one field of a representative row of each group. The row is chosen by the query's `$rowOrder` control (same shape as `$sort`) and is the same row for every `first()`; every `last()` reads the opposite end. `$rowOrder` is required when `first` / `last` is used and rejected otherwise; `first(*)` is not valid. Results are typed as the field (like `min` / `max`).
+
+```ts
+{
+  $groupBy: ['ticketId'],
+  $select: ['ticketId', { $fn: 'first', $field: 'title', $as: 'oldestTitle' }, { $fn: 'last', $field: 'raisedAt', $as: 'newestAt' }],
+  $rowOrder: { raisedAt: 1 },
+}
+```
 
 #### Calendar buckets (`BucketExpr`)
 
@@ -256,11 +308,13 @@ const query: Uniquery = {
 - **Fall-back:** the repeated hour is one label. In `Europe/Berlin` on 2026-10-25, `'2026-10-25T02:00'` covers 00:00Z–02:00Z — both passes of 02:00–03:00 local.
 - **Spring-forward:** the skipped hour has no label. In `Europe/Berlin` on 2026-03-29, `'2026-03-29T01:00'` is followed by `'2026-03-29T03:00'`. A shift of 30 minutes (`Australia/Lord_Howe`) leaves a half-hour bucket instead.
 
-Validation that needs no schema lives here, so every consumer rejects the same inputs with the same wording. `resolveBuckets(controls)` returns `{ ok: true, buckets }` or `{ ok: false, issues: [{ path, message }] }` — it rejects unknown units, zones and week starts, a `$weekStart` on a non-week unit, a bucket outside a grouped query or missing from `$groupBy`, duplicate aliases, `$select` entries that are neither a field, an aggregate nor a bucket, and aggregates that fail `validateAggregateExpr`. Pass `{ isField: (name) => boolean }` to also reject an alias that collides with a real field of your schema (by default only fields selected in `$select` are checked), `{ aggregate: true }` when the query is grouped by other means, and `{ fns: AGGREGATE_FNS }` (or your own list) to reject unknown aggregate functions. `checkTimeZone(tz)` validates a zone and returns its canonical spelling (an alias such as `'US/Eastern'` is rejected with a hint naming `'America/New_York'`). Which fields may be bucketed (for example only timestamp-typed ones) is up to the consumer.
+Validation that needs no schema lives here, so every consumer rejects the same inputs with the same wording. `resolveBuckets(controls)` returns `{ ok: true, buckets, exprs, rowOrder? }` or `{ ok: false, issues: [{ path, message }] }` — it rejects unknown units, zones and week starts, a `$weekStart` on a non-week unit, a bucket outside a grouped query or missing from `$groupBy`, duplicate aliases, `$select` entries that are neither a field, an aggregate nor a bucket, and aggregates that fail `validateAggregateExpr`. Pass `{ isField: (name) => boolean }` to also reject an alias that collides with a real field of your schema (by default only fields selected in `$select` are checked), `{ aggregate: true }` when the query is grouped by other means, and `{ fns: AGGREGATE_FNS }` (or your own list) to reject unknown aggregate functions. `checkTimeZone(tz)` validates a zone and returns its canonical spelling (an alias such as `'US/Eastern'` is rejected with a hint naming `'America/New_York'`). Which fields may be bucketed (for example only timestamp-typed ones) is up to the consumer.
 
 `validateAggregateExpr(expr, { fns? })` checks one aggregate: its `$fn` is in `fns` (only when given — by default any name passes, so custom functions work), and a known function other than `count` is not applied to `'*'`. It returns `{ ok: true }` or `{ ok: false, message }`.
 
-`groupByFields(controls)` maps `$groupBy` to source fields — a bucket alias becomes its `$field` — for access-control whitelists. `isAggregateExpr` / `isBucketExpr` tell `$select` entries apart.
+`resolveBuckets` also validates the arithmetic entries and `first` / `last` (rules above): `exprs` lists the arithmetic entries as `{ alias, expr, names, level: 'row' | 'group', fn? }`, row-level first, then group-level in dependency order (a cycle is reported as `Expression cycle: a → b → a`); `rowOrder` is `[{ field, desc }]` when `first` / `last` is used. Pass `$rowOrder` in the controls. It reports an expression alias that collides with a field or another alias, an operand that is not an alias or `$groupBy` field, a bucket alias used as an operand, grouping by an expression alias, and a missing or superfluous `$rowOrder`. Whether an operand is numeric is the caller's rule. Issue paths are `$select`, `$groupBy` or `$rowOrder`.
+
+`groupByFields(controls)` maps `$groupBy` to source fields — a bucket alias becomes its `$field` — for access-control whitelists. `isAggregateExpr` / `isBucketExpr` / `isAggregateOfExpr` / `isSelectArithExpr` tell `$select` entries apart.
 
 The date math is exported too, so clients produce exactly the labels servers return:
 
@@ -302,7 +356,7 @@ const query: Uniquery = {
 
 `$having` accepts a full `FilterExpr` — logical operators (`$and`, `$or`, `$not`) and all comparison operators are supported. It is untyped (`FilterExpr` without a generic) because its fields are aggregate aliases that don't exist on the entity type `T`.
 
-Insights record **source fields**, never aliases: an alias used in `$having`, `$sort` or `$groupBy` is resolved to the field behind it. Aggregate usage is recorded with bare function names (not `$`-prefixed), and a bucket with `'$bucket'`:
+Insights record **source fields**, never aliases: an alias used in `$having`, `$sort` or `$groupBy` is resolved to the field behind it. An expression aggregate records each operand field under its function (`sum(price*qty)` → `price` and `qty` get `'sum'`), `first` / `last` record the field under `'first'` / `'last'`, each `$rowOrder` key is recorded as `'$order'`, and an expression alias is not a field, so it is not recorded. Aggregate usage is recorded with bare function names (not `$`-prefixed), and a bucket with `'$bucket'`:
 
 ```ts
 // insights for the query above:
@@ -524,7 +578,11 @@ const insights = getInsights(query)
 | `RelationPredicate<E>` | `{ $some?, $none? }` — operands typed by `E`'s `__ownProps` / `__navProps` |
 | `OwnOf<E>` / `NavOf<E>` | `E['__ownProps']` / `E['__navProps']`, or untyped / `{}` |
 | `LogicalNode<T, Nav>` | `{ $and: ... } \| { $or: ... } \| { $not: ... }` — at most one logical key per object at the type level (the others are `never`); comparison fields may sit alongside it, and the runtime ANDs several logical keys |
-| `AggregateFn` | `'sum' \| 'count' \| 'countDistinct' \| 'avg' \| 'min' \| 'max'` |
+| `AggregateFn` | `'sum' \| 'count' \| 'countDistinct' \| 'avg' \| 'min' \| 'max' \| 'first' \| 'last'` |
+| `ArithExpr<N>` | Number literal, name, or `{ $op, $args }` node (`+ - * /`, unary `-`, `coalesce`) |
+| `AggregateOfExpr` | `{ $fn: 'sum' \| 'avg' \| 'min' \| 'max', $expr, $as }`: aggregate over a per-row expression |
+| `SelectArithExpr` | `{ $expr, $as }`: group-level arithmetic over aliases / `$groupBy` fields |
+| `NumericKeys<T>` | Keys of `T` whose value is a number (optionally null / undefined) |
 | `AggregateExpr<Fn, Field, Alias>` | `{ $fn, $field, $as? }` — aggregate function call in `$select`. Generic params preserve literal types for result inference |
 | `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
 | `UniqueryControls<T>` | Pagination, sorting, projection, grouping, `$having` — `$select`/`$sort`/`$groupBy` constrained to `keyof T` when typed |
@@ -534,7 +592,7 @@ const insights = getInsights(query)
 | `AggregateSelectExpr<D, M>` | Aggregate allowed in a typed `$select` — `count` over a measure or `'*'`, `countDistinct` over a dimension or measure, the rest over a measure |
 | `AggregateControls<T, D, M>` | Typed aggregate controls — `$groupBy` required, `$with` forbidden, `$select` constrained to dimensions, `AggregateSelectExpr<D, M>` and buckets |
 | `AggregateQuery<T, D, M>` | Typed aggregate query — `{ filter?, controls, insights? }` with dimension/measure constraints |
-| `AggregateResult<T, Select>` | Infer result row type from `$select` — dimensions preserve original types, aggregates → `number` (min/max preserve field type) |
+| `AggregateResult<T, Select>` | Infer result row type from `$select` — dimensions preserve original types, aggregates → `number` (min/max/first/last preserve field type), expressions → `number \| null` |
 | `ResolveAlias<A>` | Resolve the output alias of an `AggregateExpr` — uses `$as` if provided, otherwise `{fn}_{field}` |
 | `InsightOp` | `ComparisonOp \| RelationOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| '$having' \| AggregateFn \| string` |
 | `UniqueryInsights` | `Map<string, Set<InsightOp>>` |
@@ -553,6 +611,10 @@ const insights = getInsights(query)
 | `hasRelationOp` | `(value: unknown) => boolean` | True for an operator map carrying any `$some` / `$none` key, malformed or mixed. Like `walkFilter`, it treats a primitive, `RegExp`, `Date` or class instance as a value, never an operator map. `walkFilter` dispatches every such key to `relation`, so a gate should reject values where `hasRelationOp` holds but `isRelationPredicate` does not |
 | `AGGREGATE_FNS` | `readonly AggregateFn[]` | The known aggregate function names |
 | `isAggregateFn` | `(name: unknown) => name is AggregateFn` | True for a known aggregate function name |
+| `ROW_ORDER_FNS` / `EXPR_AGGREGATE_FNS` | `readonly AggregateFn[]` | `['first', 'last']` (need `$rowOrder`) / `['sum', 'avg', 'min', 'max']` (accept `$expr`) |
+| `parseArith` / `formatArith` | `(text) => ArithExpr` / `(expr, { encodePlus? }) => string` | The single arithmetic grammar, text ⇄ JSON |
+| `arithNames` / `arithNullable` / `validateArith` | see [Arithmetic expressions](#arithmetic-expressions-arithexpr) | Names, nullability and schema-free validation (limits `ARITH_MAX_NODES` 64, `ARITH_MAX_DEPTH` 16) |
+| `isAggregateOfExpr` / `isSelectArithExpr` | `(v: unknown) => v is …` | Type guards for the expression `$select` entries |
 | `STAR_AGGREGATE_FNS` | `readonly AggregateFn[]` | Known functions that accept `'*'` as `$field` (`count`) |
 | `validateAggregateExpr` | `(expr: AggregateExpr, opts?: { fns?: readonly string[] }) => AggregateExprCheck` | Schema-free aggregate check — `$fn` allow-list (when `fns` given) and the `'*'` rule; returns `{ ok: true }` or `{ ok: false, message }` |
 

@@ -327,3 +327,58 @@ describe('relational predicates', () => {
     expectTypeOf<'$none'>().toExtend<InsightOp>()
   })
 })
+
+describe('arithmetic expressions, first / last and $rowOrder', () => {
+  const select = [
+    'status',
+    { $fn: 'sum', $expr: { $op: '*', $args: ['points', 2] }, $as: 'weighted' },
+    { $expr: { $op: '/', $args: ['weighted', 'n'] }, $as: 'ratio' },
+    { $fn: 'count', $field: '*', $as: 'n' },
+    { $fn: 'first', $field: 'closedAt', $as: 'firstClosed' },
+    { $fn: 'last', $field: 'status', $as: 'lastStatus' },
+  ] as const
+  type Sel = typeof select
+
+  it('infers number | null for expressions and T[F] for first / last', () => {
+    expectTypeOf<AggregateResult<Ticket, Sel>['weighted']>().toEqualTypeOf<number | null>()
+    expectTypeOf<AggregateResult<Ticket, Sel>['ratio']>().toEqualTypeOf<number | null>()
+    expectTypeOf<AggregateResult<Ticket, Sel>['n']>().toEqualTypeOf<number>()
+    expectTypeOf<AggregateResult<Ticket, Sel>['firstClosed']>().toEqualTypeOf<number | undefined>()
+    expectTypeOf<AggregateResult<Ticket, Sel>['lastStatus']>().toEqualTypeOf<string>()
+    expectTypeOf<AggregateResult<Ticket, Sel>['status']>().toEqualTypeOf<string>()
+  })
+
+  it('resolves the alias of the new entries', () => {
+    expectTypeOf<ResolveAlias<{ $expr: 1; $as: 'r' }>>().toEqualTypeOf<'r'>()
+    expectTypeOf<ResolveAlias<{ $fn: 'sum'; $expr: 1; $as: 'r' }>>().toEqualTypeOf<'r'>()
+    expectTypeOf<ResolveAlias<{ $fn: 'first'; $field: 'points' }>>().toEqualTypeOf<'first_points'>()
+  })
+
+  it('accepts the new entries and $rowOrder in the controls', () => {
+    const q: AggregateQuery<Ticket> = {
+      controls: {
+        $groupBy: ['status'],
+        $select: [
+          'status',
+          { $fn: 'first', $field: 'points', $as: 'f' },
+          { $fn: 'sum', $expr: 'points', $as: 's' },
+          { $expr: { $op: '+', $args: ['s', 1] }, $as: 'e' },
+        ],
+        $rowOrder: { openedAt: 1, points: -1 },
+      },
+    }
+    expectTypeOf(q).toExtend<AggregateQuery<Ticket>>()
+    const bad: AggregateControls<Ticket> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — direction must be 1 | -1
+      $rowOrder: { openedAt: 2 },
+    }
+    expectTypeOf(bad).toExtend<object>()
+    const ctl: UniqueryControls<Ticket> = { $rowOrder: { points: 1 } }
+    expectTypeOf(ctl).toExtend<UniqueryControls<Ticket>>()
+  })
+
+  it("InsightOp includes 'first' and 'last'", () => {
+    expectTypeOf<'first'>().toExtend<InsightOp>()
+  })
+})

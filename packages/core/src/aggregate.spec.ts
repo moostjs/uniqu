@@ -5,7 +5,11 @@ import {
   groupByFields,
   isAggregateExpr,
   isAggregateFn,
+  isAggregateOfExpr,
   isBucketExpr,
+  isSelectArithExpr,
+  EXPR_AGGREGATE_FNS,
+  ROW_ORDER_FNS,
   resolveAlias,
   resolveBuckets,
   validateAggregateExpr,
@@ -58,7 +62,7 @@ describe('resolveAlias', () => {
 
 describe('AGGREGATE_FNS / isAggregateFn', () => {
   it('lists the known aggregate functions', () => {
-    expect(AGGREGATE_FNS).toEqual(['sum', 'count', 'countDistinct', 'avg', 'min', 'max'])
+    expect(AGGREGATE_FNS).toEqual(['sum', 'count', 'countDistinct', 'avg', 'min', 'max', 'first', 'last'])
   })
 
   it('accepts exactly the known names', () => {
@@ -101,7 +105,7 @@ describe('validateAggregateExpr', () => {
   it('rejects a function missing from fns', () => {
     expect(validateAggregateExpr({ $fn: 'stddev', $field: 'score' }, { fns: AGGREGATE_FNS })).toEqual({
       ok: false,
-      message: 'Unknown aggregate function "stddev" — use sum, count, countDistinct, avg, min or max',
+      message: 'Unknown aggregate function "stddev" — use sum, count, countDistinct, avg, min, max, first or last',
     })
     expect(validateAggregateExpr({ $fn: 'sum', $field: 'amount' }, { fns: ['count'] })).toEqual({
       ok: false,
@@ -253,6 +257,7 @@ describe('resolveBuckets', () => {
       buckets: [
         { alias: 'week', field: 'openedAt', unit: 'week', tz: 'Europe/Berlin', weekStart: 'sun', weekStartIso: 7 },
       ],
+      exprs: [],
     })
   })
 
@@ -260,9 +265,10 @@ describe('resolveBuckets', () => {
     expect(resolveBuckets({ $select: ['a', { $fn: 'sum', $field: 'b' }], $groupBy: ['a'] })).toEqual({
       ok: true,
       buckets: [],
+      exprs: [],
     })
-    expect(resolveBuckets({ $select: { a: 1 } })).toEqual({ ok: true, buckets: [] })
-    expect(resolveBuckets(undefined)).toEqual({ ok: true, buckets: [] })
+    expect(resolveBuckets({ $select: { a: 1 } })).toEqual({ ok: true, buckets: [], exprs: [] })
+    expect(resolveBuckets(undefined)).toEqual({ ok: true, buckets: [], exprs: [] })
   })
 
   it('collects entry-level issues', () => {
@@ -366,7 +372,7 @@ describe('resolveBuckets', () => {
       { path: '$select', message: 'Aggregate "countDistinct" needs a field — only count accepts *' },
       {
         path: '$select',
-        message: 'Unknown aggregate function "stddev" — use sum, count, countDistinct, avg, min or max',
+        message: 'Unknown aggregate function "stddev" — use sum, count, countDistinct, avg, min, max, first or last',
       },
     ])
     expect(resolveBuckets({ $select: [{ $fn: 'count', $field: '*' }], $groupBy: [] }).ok).toBe(true)
@@ -413,5 +419,228 @@ describe('resolveBuckets', () => {
         { path: '$groupBy', message: 'Unsupported $groupBy entry at index 1 — expected a field name or bucket alias' },
       ],
     })
+  })
+})
+
+describe('expression guards', () => {
+  it('isAggregateOfExpr: $fn + $expr, no $field / $bucket', () => {
+    expect(isAggregateOfExpr({ $fn: 'sum', $expr: 'a', $as: 'x' })).toBe(true)
+    expect(isAggregateOfExpr({ $fn: 'sum', $field: 'a', $expr: 'a' })).toBe(false)
+    expect(isAggregateOfExpr({ $expr: 'a', $as: 'x' })).toBe(false)
+    expect(isAggregateOfExpr(null)).toBe(false)
+  })
+
+  it('isSelectArithExpr: $expr only', () => {
+    expect(isSelectArithExpr({ $expr: 'a', $as: 'x' })).toBe(true)
+    expect(isSelectArithExpr({ $fn: 'sum', $expr: 'a' })).toBe(false)
+    expect(isSelectArithExpr({ $bucket: 'day', $field: 'a', $expr: 1 })).toBe(false)
+    expect(isSelectArithExpr('a')).toBe(false)
+  })
+
+  it('isAggregateExpr stays strict, resolveAlias reads $as', () => {
+    expect(isAggregateExpr({ $fn: 'sum', $expr: 'a', $as: 'x' })).toBe(false)
+    expect(resolveAlias({ $expr: 'a', $as: 'x' })).toBe('x')
+    expect(resolveAlias({ $fn: 'first', $field: 'at' })).toBe('first_at')
+  })
+
+  it('lists first / last and the expression functions', () => {
+    expect(ROW_ORDER_FNS).toEqual(['first', 'last'])
+    expect(EXPR_AGGREGATE_FNS).toEqual(['sum', 'avg', 'min', 'max'])
+    expect(isAggregateFn('first')).toBe(true)
+  })
+})
+
+describe('resolveBuckets – arithmetic entries', () => {
+  const issuesOf = (controls: Parameters<typeof resolveBuckets>[0], opts?: Parameters<typeof resolveBuckets>[1]) => {
+    const res = resolveBuckets(controls, opts)
+    return res.ok ? [] : res.issues.map((i) => `${i.path}: ${i.message}`)
+  }
+
+  it('returns row-level entries first, then group-level in dependency order', () => {
+    const res = resolveBuckets({
+      $groupBy: ['ticketId'],
+      $select: [
+        'ticketId',
+        { $expr: { $op: '+', $args: [{ $op: '*', $args: ['open', 10] }, 'sevMax'] }, $as: 'rank' },
+        { $expr: { $op: '/', $args: ['est', 'open'] }, $as: 'avgEst' },
+        { $fn: 'count', $field: '*', $as: 'open' },
+        { $fn: 'sum', $field: 'estimate', $as: 'est' },
+        { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'revenue' },
+        { $fn: 'max', $field: 'severity', $as: 'sevMax' },
+        { $expr: { $op: '*', $args: ['rank', 2] }, $as: 'double' },
+      ],
+    })
+    expect(res.ok && res.exprs.map((e) => [e.alias, e.level, e.fn])).toEqual([
+      ['revenue', 'row', 'sum'],
+      ['rank', 'group', undefined],
+      ['avgEst', 'group', undefined],
+      ['double', 'group', undefined],
+    ])
+    expect(res.ok && res.exprs.find((e) => e.alias === 'rank')?.names).toEqual(['open', 'sevMax'])
+    expect(res.ok && res.rowOrder).toBeUndefined()
+  })
+
+  it('orders dependencies even when declared in reverse', () => {
+    const res = resolveBuckets({
+      $groupBy: ['g'],
+      $select: [
+        { $expr: { $op: '+', $args: ['b', 1] }, $as: 'c' },
+        { $expr: { $op: '*', $args: ['a', 2] }, $as: 'b' },
+        { $fn: 'sum', $field: 'x', $as: 'a' },
+      ],
+    })
+    expect(res.ok && res.exprs.map((e) => e.alias)).toEqual(['b', 'c'])
+  })
+
+  it('allows a plain $groupBy field as a group-level operand', () => {
+    expect(issuesOf({ $groupBy: ['n'], $select: ['n', { $expr: { $op: '*', $args: ['n', 2] }, $as: 'n2' }] })).toEqual([])
+  })
+
+  it('rejects expressions outside grouped queries', () => {
+    expect(issuesOf({ $select: [{ $fn: 'sum', $expr: 'a', $as: 'x' }] })).toEqual([
+      '$select: Expressions and first()/last() are only valid in grouped queries',
+    ])
+    expect(issuesOf({ $select: [{ $fn: 'first', $field: 'a' }], $rowOrder: { a: 1 } })).toEqual([
+      '$select: Expressions and first()/last() are only valid in grouped queries',
+    ])
+    expect(issuesOf({ $select: [{ $fn: 'sum', $expr: 'a', $as: 'x' }] }, { aggregate: true })).toEqual([])
+  })
+
+  it('validates the aggregate function of an expression entry', () => {
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $fn: 'count', $expr: 'a', $as: 'x' }] })).toEqual([
+      '$select: Aggregate "count" takes a field, not an expression — use sum, avg, min or max',
+    ])
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $fn: 'first', $expr: 'a', $as: 'x' }] })[0]).toMatch(/takes a field/)
+  })
+
+  it('requires an identifier alias', () => {
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $fn: 'sum', $expr: 'a' }] })).toEqual([
+      '$select: An expression needs an explicit $as',
+    ])
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $expr: 'a', $as: 'x.y' }] })[0]).toMatch(/Invalid alias "x.y"/)
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $expr: 'a', $as: '' }] })[0]).toMatch(/Invalid alias/)
+  })
+
+  it('reports arithmetic problems (constant, shape, limits)', () => {
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $fn: 'sum', $expr: 3, $as: 'x' }] })).toEqual([
+      '$select: Expression has no field or alias — a constant is not allowed',
+    ])
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $fn: 'sum', $expr: { $op: '%', $args: ['a', 'b'] }, $as: 'x' }] })[0])
+      .toMatch(/Unknown operator/)
+  })
+
+  it('rejects an unknown or text operand of a group-level expression', () => {
+    expect(
+      issuesOf({ $groupBy: ['g'], $select: [{ $expr: { $op: '+', $args: ['nope', 1] }, $as: 'x' }] }),
+    ).toEqual(['$select: Expression "x" references "nope" — name an aggregate alias or a $groupBy field'])
+    // a non-grouped plain $select field is not an operand either
+    expect(
+      issuesOf({ $groupBy: ['g'], $select: ['price', { $expr: { $op: '+', $args: ['price', 1] }, $as: 'x' }] }),
+    ).toEqual(['$select: Expression "x" references "price" — name an aggregate alias or a $groupBy field'])
+    expect(
+      issuesOf({
+        $groupBy: ['w'],
+        $select: [{ $bucket: 'week', $field: 'at', $as: 'w' }, { $expr: { $op: '+', $args: ['w', 1] }, $as: 'x' }],
+      }),
+    ).toEqual(['$select: Bucket "w" is a text label and cannot be used in arithmetic'])
+  })
+
+  it('detects expression cycles', () => {
+    expect(
+      issuesOf({
+        $groupBy: ['g'],
+        $select: [
+          { $expr: { $op: '+', $args: ['b', 1] }, $as: 'a' },
+          { $expr: { $op: '+', $args: ['a', 1] }, $as: 'b' },
+        ],
+      }),
+    ).toEqual(['$select: Expression cycle: a → b → a'])
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $expr: { $op: '+', $args: ['a', 1] }, $as: 'a' }] })).toEqual([
+      '$select: Expression cycle: a → a',
+    ])
+  })
+
+  it('checks alias uniqueness and field collisions of expression entries', () => {
+    expect(
+      issuesOf({
+        $groupBy: ['g'],
+        $select: [{ $fn: 'sum', $field: 'a', $as: 'x' }, { $expr: { $op: '+', $args: ['q', 1] }, $as: 'x' }, { $fn: 'max', $field: 'q', $as: 'q' }],
+      }),
+    ).toEqual(['$select: Duplicate alias "x"'])
+    expect(
+      issuesOf({
+        $groupBy: ['g'],
+        $select: ['status', { $fn: 'sum', $expr: 'a', $as: 'status' }],
+      }),
+    ).toEqual(['$select: Alias "status" collides with field "status"'])
+    expect(
+      issuesOf(
+        { $groupBy: ['g'], $select: [{ $fn: 'sum', $expr: 'a', $as: 'revenue' }] },
+        { isField: (n) => n === 'revenue' },
+      ),
+    ).toEqual(['$select: Alias "revenue" collides with field "revenue"'])
+  })
+
+  it('rejects grouping by a computed expression', () => {
+    expect(
+      issuesOf({ $groupBy: ['x'], $select: [{ $fn: 'sum', $expr: 'a', $as: 'x' }] }),
+    ).toEqual(['$groupBy: Cannot group by a computed expression "x"'])
+  })
+
+  it('still rejects unsupported entries', () => {
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ $fn: 'sum', $field: 3 }] })).toEqual([
+      '$select: Unsupported $select entry at index 0',
+    ])
+    expect(issuesOf({ $groupBy: ['g'], $select: [{ foo: 1 }] })).toEqual(['$select: Unsupported $select entry at index 0'])
+  })
+})
+
+describe('resolveBuckets – first / last and $rowOrder', () => {
+  const issuesOf = (controls: Parameters<typeof resolveBuckets>[0]) => {
+    const res = resolveBuckets(controls)
+    return res.ok ? [] : res.issues.map((i) => `${i.path}: ${i.message}`)
+  }
+  const select = ['ticketId', { $fn: 'first', $field: 'title', $as: 'oldest' }]
+
+  it('returns the resolved $rowOrder', () => {
+    const res = resolveBuckets({ $groupBy: ['ticketId'], $select: select, $rowOrder: { raisedAt: 1, id: -1 } })
+    expect(res.ok && res.rowOrder).toEqual([
+      { field: 'raisedAt', desc: false },
+      { field: 'id', desc: true },
+    ])
+  })
+
+  it('requires $rowOrder with first/last and rejects it without', () => {
+    expect(issuesOf({ $groupBy: ['ticketId'], $select: select })).toEqual([
+      '$rowOrder: $rowOrder is required when first() or last() is used',
+    ])
+    expect(issuesOf({ $groupBy: ['ticketId'], $select: ['ticketId'], $rowOrder: { a: 1 } })).toEqual([
+      '$rowOrder: $rowOrder orders rows for first()/last() only',
+    ])
+    expect(issuesOf({ $groupBy: ['t'], $select: [{ $fn: 'sum', $field: 'a' }], $rowOrder: { a: 1 } })).toEqual([
+      '$rowOrder: $rowOrder orders rows for first()/last() only',
+    ])
+  })
+
+  it('validates the $rowOrder shape', () => {
+    const ctl = (o: unknown) => issuesOf({ $groupBy: ['t'], $select: select, $rowOrder: o })
+    expect(ctl({})).toEqual(['$rowOrder: $rowOrder must be a non-empty object of field → 1 | -1'])
+    expect(ctl([1])).toEqual(['$rowOrder: $rowOrder must be a non-empty object of field → 1 | -1'])
+    expect(ctl('a')).toEqual(['$rowOrder: $rowOrder must be a non-empty object of field → 1 | -1'])
+    expect(ctl({ a: 2 })).toEqual(['$rowOrder: $rowOrder "a" must be 1 or -1'])
+  })
+
+  it('rejects first(*)', () => {
+    expect(issuesOf({ $groupBy: ['t'], $select: [{ $fn: 'last', $field: '*' }], $rowOrder: { a: 1 } })).toEqual([
+      '$select: Aggregate "last" needs a field — only count accepts *',
+    ])
+  })
+
+  it('first/last honour the fns allow-list', () => {
+    const res = resolveBuckets(
+      { $groupBy: ['t'], $select: select, $rowOrder: { a: 1 } },
+      { fns: ['sum', 'count'] },
+    )
+    expect(!res.ok && res.issues[0].message).toMatch(/Unknown aggregate function "first"/)
   })
 })

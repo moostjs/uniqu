@@ -1,5 +1,6 @@
 import type {
   AggregateExpr,
+  ArithExpr,
   BucketExpr,
   FilterExpr,
   FilterVisitor,
@@ -7,7 +8,15 @@ import type {
   UniqueryControls,
   WithRelation,
 } from '@uniqu/core'
-import { isBucketExpr, isPlainObject, resolveAlias, walkFilter } from '@uniqu/core'
+import {
+  formatArith,
+  isAggregateOfExpr,
+  isBucketExpr,
+  isPlainObject,
+  isSelectArithExpr,
+  resolveAlias,
+  walkFilter,
+} from '@uniqu/core'
 
 /**
  * Build a URL query string from a Uniquery object.
@@ -65,13 +74,21 @@ function joinParts(children: TUrlPart[], kind: 'and' | 'or'): TUrlPart {
  */
 const urlVisitor: FilterVisitor<TUrlPart> = {
   comparison(field, op, value) {
-    // A RegExp under `$eq` (a bare `{ field: /re/ }` value) is emitted with
-    // the regex operator, matching `{ field: { $regex } }`.
-    const s =
-      op === '$eq' && value instanceof RegExp
-        ? `${field}~=${serializeValue(value)}`
-        : serializeComparison(field, op, value)
-    return { s, kind: 'leaf' }
+    try {
+      // A RegExp under `$eq` (a bare `{ field: /re/ }` value) is emitted with
+      // the regex operator, matching `{ field: { $regex } }`.
+      const s =
+        op === '$eq' && value instanceof RegExp
+          ? `${field}~=${serializeValue(value)}`
+          : serializeComparison(field, op, value)
+      return { s, kind: 'leaf' }
+    } catch (e) {
+      // A value that cannot be spelled (non-finite number) is reported against its field.
+      if (e instanceof TypeError) {
+        throw new TypeError(e.message.replace(/^A value/, `Filter value for "${field}"`))
+      }
+      throw e
+    }
   },
   and: (children) => joinParts(children, 'and'),
   or: (children) => joinParts(children, 'or'),
@@ -113,41 +130,30 @@ function serializeFilter(expr: FilterExpr): string {
 }
 
 function serializeComparison(field: string, op: string, value: unknown): string {
+  const ser = serializeValue
   switch (op) {
     case '$eq':
-      return `${field}=${serializeValue(value)}`
+      return `${field}=${ser(value)}`
     case '$ne':
-      return `${field}!=${serializeValue(value)}`
+      return `${field}!=${ser(value)}`
     case '$gt':
-      return `${field}>${serializeValue(value)}`
+      return `${field}>${ser(value)}`
     case '$gte':
-      return `${field}>=${serializeValue(value)}`
+      return `${field}>=${ser(value)}`
     case '$lt':
-      return `${field}<${serializeValue(value)}`
+      return `${field}<${ser(value)}`
     case '$lte':
-      return `${field}<=${serializeValue(value)}`
+      return `${field}<=${ser(value)}`
     case '$regex':
-      return `${field}~=${serializeValue(value)}`
-    case '$in': {
-      let list = ''
-      for (const item of value as unknown[]) {
-        const s = serializeValue(item)
-        list = list ? list + ',' + s : s
-      }
-      return `${field}{${list}}`
-    }
-    case '$nin': {
-      let list = ''
-      for (const item of value as unknown[]) {
-        const s = serializeValue(item)
-        list = list ? list + ',' + s : s
-      }
-      return `${field}!{${list}}`
-    }
+      return `${field}~=${ser(value)}`
+    case '$in':
+      return `${field}{${(value as unknown[]).map(ser).join(',')}}`
+    case '$nin':
+      return `${field}!{${(value as unknown[]).map(ser).join(',')}}`
     case '$exists':
       return value ? `$exists=${field}` : `$!exists=${field}`
     default:
-      return `${field}${op}${serializeValue(value)}`
+      return `${field}${op}${ser(value)}`
   }
 }
 
@@ -186,11 +192,42 @@ function quote(str: string): string {
   return `'${percentEncode(str.replace(/\\/g, '\\\\').replace(/'/g, "\\'"), VALUE_UNSAFE_RE)}'`
 }
 
+const EXPONENT_RE = /^(-?)(\d+)(?:\.(\d+))?e([+-]\d+)$/u
+
+/**
+ * Plain-decimal text of a finite number. `String(n)` switches to exponent form
+ * (`1e+21`, `1.5e-7`), which the lexer reads as a bare word, not a number. The
+ * digits of the shortest round-trip form are shifted instead (string work, no
+ * `toFixed` rounding), so the number survives `parseUrl`.
+ */
+// Differs from `fmtNumber` in @uniqu/core's arith.ts on purpose: that one keeps exponent
+// form (shorter, read by the arithmetic parser); a filter value must lex as a number.
+function numberToPlain(n: number): string {
+  const s = String(n)
+  // Fast path: only exponent forms need rewriting.
+  if (!s.includes('e')) return s
+  const m = EXPONENT_RE.exec(s)
+  if (!m) return s
+  const [, sign, int, frac = '', exp] = m
+  const digits = int + frac
+  const point = int.length + Number(exp)
+  if (point <= 0) return `${sign}0.${'0'.repeat(-point)}${digits}`
+  if (point >= digits.length) return `${sign}${digits}${'0'.repeat(point - digits.length)}`
+  return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`
+}
+
+function serializeNumber(value: number): string {
+  if (!Number.isFinite(value)) {
+    throw new TypeError(`A value is not a finite number (${value}); it cannot be expressed in a URL`)
+  }
+  return numberToPlain(value)
+}
+
 function serializeValue(value: unknown): string {
   if (value === null) return 'null'
   if (value === true) return 'true'
   if (value === false) return 'false'
-  if (typeof value === 'number') return String(value)
+  if (typeof value === 'number') return serializeNumber(value)
   if (value instanceof RegExp) return quote(value.toString())
   if (value instanceof Date) return quote(value.toISOString())
   const str = String(value)
@@ -220,7 +257,30 @@ function serializeBucket(b: BucketExpr): string {
   return `bucket(${args}):${resolveAlias(b)}`
 }
 
-const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$having', '$sort', '$limit', '$skip', '$count', '$with'])
+/** `name(<arith>):alias` — the text form of an expression `$select` item (`expr` or an aggregate name). */
+function serializeExprItem(name: string, entry: { $expr: ArithExpr; $as?: unknown }): string {
+  return `${name}(${formatArith(entry.$expr, { encodePlus: true })}):${exprAlias(entry.$as)}`
+}
+
+/** The alias of an expression item; the URL form has no spelling without one. */
+function exprAlias(alias: unknown): string {
+  if (typeof alias !== 'string' || alias === '') {
+    throw new TypeError('An expression in $select needs a $as alias; it cannot be expressed in a URL without one')
+  }
+  return alias
+}
+
+/** `$sort=a,-b` / `$rowOrder=a,-b`; empty when `order` has no keys. */
+function serializeOrder(name: string, order: Record<string, 1 | -1 | undefined>): string {
+  let seg = ''
+  for (const [field, dir] of Object.entries(order)) {
+    const s = dir === -1 ? `-${field}` : field
+    seg = seg ? seg + ',' + s : s
+  }
+  return seg && `${name}=${seg}`
+}
+
+const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$having', '$sort', '$rowOrder', '$limit', '$skip', '$count', '$with'])
 
 function serializeControls(controls: UniqueryControls): string {
   let result = ''
@@ -234,6 +294,10 @@ function serializeControls(controls: UniqueryControls): string {
           s = entry
         } else if (isBucketExpr(entry)) {
           s = serializeBucket(entry)
+        } else if (isAggregateOfExpr(entry)) {
+          s = serializeExprItem(entry.$fn, entry)
+        } else if (isSelectArithExpr(entry)) {
+          s = serializeExprItem('expr', entry)
         } else {
           const agg = entry as AggregateExpr
           s = agg.$as ? `${agg.$fn}(${agg.$field}):${agg.$as}` : `${agg.$fn}(${agg.$field})`
@@ -275,16 +339,9 @@ function serializeControls(controls: UniqueryControls): string {
     }
   }
 
-  if (controls.$sort) {
-    let seg = ''
-    for (const [field, dir] of Object.entries(controls.$sort)) {
-      const s = dir === -1 ? `-${field}` : field
-      seg = seg ? seg + ',' + s : s
-    }
-    if (seg) {
-      const part = `$sort=${seg}`
-      result = result ? result + '&' + part : part
-    }
+  for (const [name, order] of [['$sort', controls.$sort], ['$rowOrder', controls.$rowOrder]] as const) {
+    const part = order && serializeOrder(name, order)
+    if (part) result = result ? result + '&' + part : part
   }
 
   if (controls.$limit !== undefined) {

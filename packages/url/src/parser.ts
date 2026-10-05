@@ -176,8 +176,11 @@ export class Parser {
       if (this.match('bang')) negate = true
       this.consume('lbrace')
       const list: Primitive[] = []
-      list.push(this.parseLiteral())
-      while (this.match('comma')) list.push(this.parseLiteral())
+      // `field{}` / `field!{}`: an empty list (matches nothing / excludes nothing)
+      if (this.peek()?.type !== 'rbrace') {
+        list.push(this.parseLiteral())
+        while (this.match('comma')) list.push(this.parseLiteral())
+      }
       this.consume('rbrace')
 
       const out: FilterExpr = {}

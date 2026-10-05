@@ -117,7 +117,7 @@ const { controls, insights } = parseUrl(
 // }
 ```
 
-Aggregate functions (`sum`, `count`, `countDistinct`, `avg`, `min`, `max`) appear as `AggregateExpr` objects in `$select`. The `$fn` field accepts any string for extensibility — consumers validate supported functions.
+Aggregate functions (`sum`, `count`, `countDistinct`, `avg`, `min`, `max`, `first`, `last`) appear as `AggregateExpr` objects in `$select`. The `$fn` field accepts any string for extensibility — consumers validate supported functions. Aggregates over arithmetic (`sum(price*qty):rev`), arithmetic over aliases (`expr(est/open):avgEst`) and `first` / `last` with `$rowOrder` are covered in the [core README](./packages/core/README.md#arithmetic-expressions-arithexpr) and the [URL syntax](./packages/url/README.md#arithmetic-and-first--last-in-select).
 
 Use `$having` to filter groups after aggregation (SQL `HAVING`):
 

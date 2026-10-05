@@ -63,7 +63,11 @@ insights = Map {
 ```
 role{Admin,Editor}        → { role: { $in: ['Admin', 'Editor'] } }
 status!{Draft,Deleted}    → { status: { $nin: ['Draft', 'Deleted'] } }
+role{}                    → { role: { $in: [] } }     (matches nothing)
+role!{}                   → { role: { $nin: [] } }    (excludes nothing)
 ```
+
+An empty list is kept as written, never rewritten to "no constraint": `!(role{})` matches every row, and `role{}&role{a}` stays two `$and` members. `{,}`, `{a,}` and `{,a}` are still a `SyntaxError`. Up to 0.1.12 `role{}` (which `buildUrl` emits for an empty `$in`) threw on parse.
 
 ### Between
 
@@ -215,9 +219,30 @@ $select=sum(amount),currency       → [{ $fn: 'sum', $field: 'amount', $as: 'su
 
 When no alias is given, one is auto-generated as `{fn}_{field}` (with `*` becoming `star`).
 
-Supported functions: `sum`, `count`, `countDistinct`, `avg`, `min`, `max`, plus any custom function name — consumers validate supported functions. See the [core README](../core/README.md#aggregation-groupby--select) for their semantics and for `validateAggregateExpr`. The parser checks syntax only: any `fn(*)` parses, although only `count(*)` is valid.
+Supported functions: `sum`, `count`, `countDistinct`, `avg`, `min`, `max`, `first`, `last`, plus any custom function name — consumers validate supported functions. See the [core README](../core/README.md#aggregation-groupby--select) for their semantics and for `validateAggregateExpr`. The parser checks syntax only: any `fn(*)` parses, although only `count(*)` is valid.
+
+Arithmetic over fields and `first` / `last` have their own forms, below.
 
 When aggregates are present, `$select` always uses the array form (even if `-` prefixed fields are mixed in). Entries keep their URL order.
+
+### Arithmetic and `first` / `last` in `$select`
+
+An aggregate over a per-row expression, and arithmetic over other `$select` aliases:
+
+```
+$select=sum(price*qty):rev            → [{ $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'rev' }]
+$select=expr(est/open):avgEst         → [{ $expr: { $op: '/', $args: ['est', 'open'] }, $as: 'avgEst' }]
+$select=expr(open*10%2BsevMax):rank   → [{ $expr: { $op: '+', $args: [{ $op: '*', $args: ['open', 10] }, 'sevMax'] }, $as: 'rank' }]
+$select=first(raisedAt):oldestAt,last(raisedAt):newestAt&$rowOrder=raisedAt,-id
+                                      → { $fn: 'first', $field: 'raisedAt', $as: 'oldestAt' }, …, $rowOrder: { raisedAt: 1, id: -1 }
+```
+
+- `fn(<arith>):alias` (`sum`, `avg`, `min`, `max`) and `expr(<arith>):alias` take an arithmetic expression. The alias is **required**. `expr` is a reserved name, like `bucket`. Only `sum`, `avg`, `min`, `max` and `expr` take an expression; any other name (`count(a*b):x`) is a `SyntaxError` naming the item.
+- Grammar (shared with core's `parseArith`): names, number literals, `+ - * /`, unary `-`, parentheses and `coalesce(a,b,…)`. `-5` after an operator is a negative literal. Size limits are checked by core's [`validateArith`](../core/README.md#arithmetic-expressions-arithexpr).
+- Write `+` as `%2B` (`buildUrl` does). A raw `+` is also read as plus, because the parser is given the raw query string. A `+` that a framework already turned into a space (`open 1`) is a `SyntaxError` (missing operator); a real space (`%20`) is skipped.
+- `first(field)` / `last(field)` use the plain aggregate form (alias defaults to `first_field`) and read a representative row per group, ordered by `$rowOrder` (same syntax as `$sort`).
+- A bare name in a `fn(…)` call is a field aggregate: `sum(a):s` parses as `{ $fn: 'sum', $field: 'a' }`, so `buildUrl` of `{ $fn: 'sum', $expr: 'a', $as: 's' }` reads back as the field form.
+- **A `$select` item with a function call that matches no form throws** (including an unknown function over an expression) `SyntaxError('Malformed $select item "…"')`. Up to 0.1.12 it was silently dropped, which changed the shape of the result.
 
 ### Calendar Buckets in `$select`
 
@@ -548,6 +573,9 @@ All features are supported:
 - Strings with special characters (`&`, `^`, `=`, spaces, quotes) are quoted and escaped; inside quotes `%`, `&`, `(`, `)`, `#`, tab and line breaks are percent-encoded, so no value can end a segment or unbalance a paren group
 - Custom control values (`$search`, `$relevance`, any `$<custom>`) are percent-encoded for the same characters plus `'` — `"Maison & O'Brien #1"` becomes `$search=Maison %26 O%27Brien %231`. Up to 0.1.8 they were written raw, so a search term containing `&`, `%` or `'` broke the URL
 - A `$with` body gets one extra level of `%` encoding, matching the extra decode on parse
+- Numbers are written as plain decimals: a finite number whose `String(n)` is in exponent form (`1e21`, `1.5e-7`) is expanded digit by digit (`1000000000000000000000`, `0.00000015`), so it parses back as the same number. `NaN`, `Infinity` and `-Infinity` throw a `TypeError` (`Filter value for "price" is not a finite number (NaN); it cannot be expressed in a URL`) instead of turning into the strings `"NaN"` / `"Infinity"`
+- An empty `$in` / `$nin` is written `field{}` / `field!{}`
+- Arithmetic is written `fn(<arith>):alias` and `expr(<arith>):alias` (alias required: an expression without `$as` throws a `TypeError`; `+` is written `%2B`, see above); `$rowOrder` is written like `$sort`
 - Calendar buckets are written as `bucket(field,unit[,tz][,weekStart]):alias`, always with the alias
 - Leading-zero numbers (`007`) stay as bare strings
 - Hyphenated strings and date-times are quoted (`'in-progress'`, `'2026-03-29T14:00'`), although `parseUrl` also accepts them bare

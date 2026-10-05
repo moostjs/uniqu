@@ -19,6 +19,9 @@ export type {
   CalendarBucketLabel,
   BucketExpr,
   ComputedExpr,
+  ArithExpr,
+  AggregateOfExpr,
+  SelectArithExpr,
   SelectExpr,
   WithRelation,
   TypedWithRelation,
@@ -48,11 +51,15 @@ export {
 export { computeInsights, getInsights } from './insights'
 export {
   AGGREGATE_FNS,
+  ROW_ORDER_FNS,
+  EXPR_AGGREGATE_FNS,
   STAR_AGGREGATE_FNS,
   isAggregateFn,
   validateAggregateExpr,
   isAggregateExpr,
   isBucketExpr,
+  isAggregateOfExpr,
+  isSelectArithExpr,
   resolveAlias,
   groupByFields,
   resolveBuckets,
@@ -60,9 +67,21 @@ export {
   type AggregateExprCheck,
   type ValidateAggregateOptions,
   type ResolvedBucket,
+  type ResolvedSelectExpr,
+  type ResolvedRowOrderKey,
   type ResolveBucketsOptions,
   type BucketResolution,
 } from './aggregate'
+export {
+  parseArith,
+  formatArith,
+  arithNames,
+  arithNullable,
+  validateArith,
+  ARITH_MAX_NODES,
+  ARITH_MAX_DEPTH,
+  type FormatArithOptions,
+} from './arith'
 export {
   bucketLabel,
   bucketer,

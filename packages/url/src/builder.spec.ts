@@ -1425,3 +1425,213 @@ describe('buildUrl – relational predicates', () => {
     }
   })
 })
+
+describe('buildUrl – empty IN / NOT IN lists', () => {
+  const cases: Record<string, Uniquery> = {
+    'code{}': { filter: { code: { $in: [] } } },
+    'code!{}': { filter: { code: { $nin: [] } } },
+    'code{}^x=1': { filter: { $or: [{ code: { $in: [] } }, { x: 1 }] } },
+    'code{}&x=1': { filter: { code: { $in: [] }, x: 1 } },
+    '!(code{})': { filter: { $not: { code: { $in: [] } } } },
+    'rel=$some(code{})': { filter: { rel: { $some: { code: { $in: [] } } } } },
+    'code{}&code{a}': { filter: { $and: [{ code: { $in: [] } }, { code: { $in: ['a'] } }] } },
+    'code!{}&$having=n>1': { filter: { code: { $nin: [] } }, controls: { $having: { n: { $gt: 1 } } } },
+  }
+  for (const [url, query] of Object.entries(cases)) {
+    it(`${url} round-trips`, () => {
+      expect(buildUrl(query)).toBe(url.replace('&$having=n>1', '&$having=n>1'))
+      expect(roundTrip(query).filter).toEqual(query.filter)
+      expect(roundTripViaUrl(query).filter).toEqual(query.filter)
+    })
+  }
+})
+
+describe('buildUrl – non-finite numbers', () => {
+  it('throws for NaN and ±Infinity, naming the field', () => {
+    for (const value of [Number.NaN, Infinity, -Infinity]) {
+      expect(() => buildUrl({ filter: { price: value } })).toThrow(TypeError)
+      expect(() => buildUrl({ filter: { price: value } })).toThrow(
+        `Filter value for "price" is not a finite number (${value}); it cannot be expressed in a URL`,
+      )
+      expect(() => buildUrl({ filter: { price: { $gt: value } } })).toThrow(/"price"/)
+      expect(() => buildUrl({ filter: { code: { $in: [1, value] } } })).toThrow(/"code"/)
+      expect(() => buildUrl({ filter: { code: { $nin: [value] } } })).toThrow(/not a finite number/)
+      expect(() => buildUrl({ filter: { $or: [{ a: 1 }, { b: value }] } })).toThrow(/"b"/)
+      expect(() => buildUrl({ filter: { r: { $some: { x: value } } } })).toThrow(/"x"/)
+      expect(() => buildUrl({ controls: { $having: { n: { $gt: value } } } })).toThrow(/"n"/)
+    }
+  })
+
+  it('still accepts finite numbers and numeric-looking strings', () => {
+    expect(buildUrl({ filter: { a: 0, b: -0.5 } })).toBe('a=0&b=-0.5')
+    expect(buildUrl({ filter: { a: 'Infinity' } })).toBe('a=Infinity')
+  })
+})
+
+describe('buildUrl – exponent-form numbers', () => {
+  const cases: [number, string][] = [
+    [1e21, '1000000000000000000000'],
+    [-1e21, '-1000000000000000000000'],
+    [1.5e21, '1500000000000000000000'],
+    [1.2345e25, '12345000000000000000000000'],
+    [1e-7, '0.0000001'],
+    [-1.5e-7, '-0.00000015'],
+    [1.2345e-10, '0.00000000012345'],
+    [Number.MIN_VALUE, '0.' + '0'.repeat(323) + '5'],
+    [1.2345678901234568e20, '123456789012345680000'],
+  ]
+  for (const [n, plain] of cases) {
+    it(`${n} is written as plain decimal`, () => {
+      expect(buildUrl({ filter: { x: n } })).toBe(`x=${plain}`)
+      expect(roundTrip({ filter: { x: n } }).filter).toEqual({ x: n })
+      expect(roundTripViaUrl({ filter: { x: n } }).filter).toEqual({ x: n })
+    })
+  }
+
+  it('round-trips Number.MAX_VALUE, -Number.MAX_VALUE and Number.MIN_VALUE', () => {
+    for (const n of [Number.MAX_VALUE, -Number.MAX_VALUE, Number.MIN_VALUE, -Number.MIN_VALUE, Number.EPSILON]) {
+      const url = buildUrl({ filter: { x: n } })
+      expect(url).not.toMatch(/e/i)
+      expect(url).not.toContain('+')
+      expect(parseUrl(url).filter).toEqual({ x: n })
+    }
+    expect(buildUrl({ filter: { x: Number.MAX_VALUE } })).toBe(`x=17976931348623157${'0'.repeat(292)}`)
+  })
+
+  it('applies inside lists, comparisons and $having', () => {
+    expect(buildUrl({ filter: { x: { $in: [1e21, 2] } } })).toBe('x{1000000000000000000000,2}')
+    expect(buildUrl({ filter: { x: { $lt: 1e-7 } } })).toBe('x<0.0000001')
+    expect(roundTrip({ controls: { $having: { n: { $gt: 1e21 } } } }).controls.$having).toEqual({ n: { $gt: 1e21 } })
+  })
+
+  it('leaves ordinary numbers alone', () => {
+    expect(buildUrl({ filter: { a: 123, b: 1.5, c: -2, d: 0.000001, e: 1e20 } })).toBe(
+      'a=123&b=1.5&c=-2&d=0.000001&e=100000000000000000000',
+    )
+  })
+})
+
+describe('buildUrl – arithmetic $select items and $rowOrder', () => {
+  const trip = (controls: Uniquery['controls']) => roundTrip({ controls }).controls
+  const tripUrl = (controls: Uniquery['controls']) => roundTripViaUrl({ controls }).controls
+
+  it('writes sum(<arith>):alias and expr(<arith>):alias with %2B for plus', () => {
+    expect(
+      buildUrl({
+        controls: {
+          $groupBy: ['ticketId'],
+          $select: [
+            'ticketId',
+            { $fn: 'count', $field: '*', $as: 'open' },
+            { $fn: 'sum', $field: 'estimate', $as: 'est' },
+            { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'revenue' },
+            { $expr: { $op: '/', $args: ['est', 'open'] }, $as: 'avgEst' },
+            { $expr: { $op: '+', $args: [{ $op: '*', $args: ['open', 10] }, 'sevMax'] }, $as: 'rank' },
+            { $fn: 'max', $field: 'severity', $as: 'sevMax' },
+            { $fn: 'first', $field: 'raisedAt', $as: 'oldestAt' },
+            { $fn: 'last', $field: 'raisedAt', $as: 'newestAt' },
+          ],
+          $rowOrder: { raisedAt: 1, id: -1 },
+          $sort: { rank: -1 },
+        },
+      }),
+    ).toBe(
+      '$select=ticketId,count(*):open,sum(estimate):est,sum(price*qty):revenue,expr(est/open):avgEst,' +
+        'expr(open*10%2BsevMax):rank,max(severity):sevMax,first(raisedAt):oldestAt,last(raisedAt):newestAt' +
+        '&$groupBy=ticketId&$sort=-rank&$rowOrder=raisedAt,-id',
+    )
+  })
+
+  const controlsCases: Record<string, Uniquery['controls']> = {
+    'row-level sum': { $groupBy: ['g'], $select: ['g', { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'rev' }] },
+    'row-level avg / min / max': {
+      $groupBy: ['g'],
+      $select: ['g', ...(['avg', 'min', 'max'] as const).map((fn) => ({ $fn: fn, $expr: { $op: '-' as const, $args: ['a', 'b'] as [string, string] }, $as: `${fn}X` }))],
+    },
+    'group-level with plus': {
+      $groupBy: ['g'],
+      $select: ['g', { $expr: { $op: '+', $args: ['a', { $op: '+', $args: ['b', 1] }] }, $as: 'x' }],
+    },
+    'left-associative minus and division': {
+      $groupBy: ['g'],
+      $select: [
+        { $expr: { $op: '-', $args: ['a', { $op: '-', $args: ['b', 'c'] }] }, $as: 'x' },
+        { $expr: { $op: '/', $args: [{ $op: '/', $args: ['a', 'b'] }, 'c'] }, $as: 'y' },
+      ],
+    },
+    'unary minus and negative literals': {
+      $groupBy: ['g'],
+      $select: [
+        { $expr: { $op: '-', $args: ['a'] }, $as: 'n1' },
+        { $expr: { $op: '-', $args: [5] }, $as: 'n2' },
+        { $expr: { $op: '*', $args: ['a', -5] }, $as: 'n3' },
+        { $expr: { $op: '-', $args: [{ $op: '+', $args: ['a', 'b'] }] }, $as: 'n4' },
+      ],
+    },
+    coalesce: {
+      $groupBy: ['g'],
+      $select: [{ $fn: 'sum', $expr: { $op: 'coalesce', $args: ['a', 0] }, $as: 'x' }],
+    },
+    'exponent literal': {
+      $groupBy: ['g'],
+      $select: [{ $fn: 'sum', $expr: { $op: '*', $args: ['a', 1e21] }, $as: 'x' }, { $fn: 'sum', $expr: { $op: '*', $args: ['a', 1.5e-7] }, $as: 'y' }],
+    },
+    'first / last': {
+      $groupBy: ['g'],
+      $select: [{ $fn: 'first', $field: 'title', $as: 'f' }, { $fn: 'last', $field: 'title', $as: 'l' }, { $fn: 'first', $field: 'at', $as: 'first_at' }],
+      $rowOrder: { at: -1, id: 1 },
+    },
+    'mixed with bucket': {
+      $groupBy: ['w'],
+      $select: [
+        { $bucket: 'week', $field: 'at', $as: 'w' },
+        { $fn: 'sum', $expr: { $op: '*', $args: ['a', 2] }, $as: 's' },
+        { $expr: { $op: '*', $args: ['s', 2] }, $as: 'd' },
+      ],
+    },
+  }
+  for (const [name, controls] of Object.entries(controlsCases)) {
+    it(`round-trips: ${name}`, () => {
+      expect(trip(controls)).toEqual(controls)
+      expect(tripUrl(controls)).toEqual(controls)
+    })
+  }
+
+  it('the URL has no raw + and survives a real URL parse', () => {
+    const url = buildUrl({
+      controls: { $groupBy: ['g'], $select: [{ $expr: { $op: '+', $args: ['a', 'b'] }, $as: 'x' }] },
+    })
+    expect(url).not.toContain('+')
+    expect(url).toContain('expr(a%2Bb):x')
+    // `URLSearchParams` would turn a raw + into a space; %2B stays a plus
+    expect(new URLSearchParams(url).get('$select')).toBe('expr(a+b):x')
+  })
+
+  it('a bare-name expression aggregate reads back as the equivalent field aggregate', () => {
+    expect(buildUrl({ controls: { $select: [{ $fn: 'sum', $expr: 'a', $as: 's' }] } })).toBe('$select=sum(a):s')
+    expect(trip({ $select: [{ $fn: 'sum', $expr: 'a', $as: 's' }] })).toEqual({
+      $select: [{ $fn: 'sum', $field: 'a', $as: 's' }],
+    })
+    // a bare name in a group-level expression keeps its form (expr is reserved)
+    expect(trip({ $select: [{ $expr: 'a', $as: 'x' }] })).toEqual({ $select: [{ $expr: 'a', $as: 'x' }] })
+  })
+
+  it('adds a default alias to a first/last item that has none, like other aggregates', () => {
+    expect(buildUrl({ controls: { $select: [{ $fn: 'first', $field: 'at' }] } })).toBe('$select=first(at)')
+  })
+
+  it('refuses an expression without $as and a malformed expression', () => {
+    expect(() => buildUrl({ controls: { $select: [{ $expr: 'a' } as never] } })).toThrow(/needs a \$as alias/)
+    expect(() => buildUrl({ controls: { $select: [{ $fn: 'sum', $expr: 'a', $as: '' }] } })).toThrow(/needs a \$as alias/)
+    expect(() => buildUrl({ controls: { $select: [{ $expr: { $op: '%', $args: ['a', 'b'] }, $as: 'x' } as never] } })).toThrow(
+      /Unknown operator/,
+    )
+    expect(() => buildUrl({ controls: { $select: [{ $expr: Number.NaN, $as: 'x' }] } })).toThrow(/not finite/)
+  })
+
+  it('writes $rowOrder like $sort and keeps it out of the pass-through', () => {
+    expect(buildUrl({ controls: { $rowOrder: { a: 1, b: -1 } } })).toBe('$rowOrder=a,-b')
+    expect(buildUrl({ controls: { $rowOrder: {} } })).toBe('')
+    expect(trip({ $rowOrder: { a: 1, b: -1 } })).toEqual({ $rowOrder: { a: 1, b: -1 } })
+  })
+})

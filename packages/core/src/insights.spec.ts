@@ -418,3 +418,40 @@ describe('computeInsights – relational predicates', () => {
     expect(insights.get('ticket')).toEqual(new Set(['$having']))
   })
 })
+
+describe('computeInsights – expressions, first/last and $rowOrder', () => {
+  const controls: UniqueryControls = {
+    $groupBy: ['ticketId'],
+    $select: [
+      'ticketId',
+      { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'revenue' },
+      { $fn: 'count', $field: '*', $as: 'open' },
+      { $expr: { $op: '/', $args: ['revenue', 'open'] }, $as: 'avgRev' },
+      { $fn: 'first', $field: 'title', $as: 'oldest' },
+    ],
+    $rowOrder: { raisedAt: 1, id: -1 },
+    $sort: { avgRev: -1, oldest: 1 },
+    $having: { avgRev: { $gt: 1 } },
+  }
+
+  it('captures every row-level operand with the aggregate function', () => {
+    const insights = computeInsights(undefined, controls)
+    expect(insights.get('price')).toEqual(new Set(['sum']))
+    expect(insights.get('qty')).toEqual(new Set(['sum']))
+  })
+
+  it('captures first/last fields and $rowOrder keys', () => {
+    const insights = computeInsights(undefined, controls)
+    expect(insights.get('title')?.has('first')).toBe(true)
+    expect(insights.get('raisedAt')).toEqual(new Set(['$order']))
+    expect(insights.get('id')).toEqual(new Set(['$order']))
+  })
+
+  it('does not report expression aliases as fields', () => {
+    const insights = computeInsights(undefined, controls)
+    expect(insights.has('revenue')).toBe(false)
+    expect(insights.has('avgRev')).toBe(false)
+    // alias → source field mapping still holds for first()
+    expect(insights.get('title')).toEqual(new Set(['first', '$order']))
+  })
+})
