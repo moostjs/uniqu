@@ -534,7 +534,19 @@ function checkExprAlias(alias: unknown, issues: QueryIssue[]): string | undefine
   return alias
 }
 
-/** Group-level entries in dependency order; reports a cycle. */
+/**
+ * The deepest chain of group-level expressions that reference each other. Past
+ * it the query expands to more nodes than any consumer evaluates (the db caps
+ * a whole query at 1024), so it is refused here — before any walk can grow
+ * with an unbounded chain.
+ */
+export const MAX_EXPR_CHAIN = 1024
+
+/**
+ * Group-level entries in dependency order; reports a cycle and an over-deep
+ * chain. Iterative (an explicit stack): a chain of any length cannot overflow
+ * the call stack.
+ */
 function orderGroupExprs(
   groupLevel: ResolvedSelectExpr[],
   deps: Map<string, string[]>,
@@ -544,22 +556,52 @@ function orderGroupExprs(
   const byAlias = new Map(groupLevel.map((e) => [e.alias, e]))
   const state = new Map<string, 1 | 2>() // 1 = visiting, 2 = done
   let cycleReported = false
-  const visit = (alias: string, path: string[]): void => {
-    if (state.get(alias) === 2) return
-    if (state.get(alias) === 1) {
-      if (!cycleReported) {
-        cycleReported = true
-        const loop = [...path.slice(path.indexOf(alias)), alias]
-        issues.push({ path: '$select', message: `Expression cycle: ${loop.join(' → ')}` })
+  let depthReported = false
+  for (const root of byAlias.keys()) {
+    if (state.has(root)) continue
+    // `path` is the chain being visited; `next[i]` the next dependency of `path[i]` to look at
+    const path: string[] = [root]
+    const next: number[] = [0]
+    state.set(root, 1)
+    while (path.length > 0) {
+      const top = path.length - 1
+      const alias = path[top]!
+      const edges = deps.get(alias) ?? []
+      if (next[top]! >= edges.length) {
+        state.set(alias, 2)
+        out.push(byAlias.get(alias)!)
+        path.pop()
+        next.pop()
+        continue
       }
-      return
+      const dep = edges[next[top]!++]!
+      if (!byAlias.has(dep)) continue
+      const seen = state.get(dep)
+      if (seen === 2) continue
+      if (seen === 1) {
+        if (!cycleReported) {
+          cycleReported = true
+          const loop = [...path.slice(path.indexOf(dep)), dep]
+          issues.push({ path: '$select', message: `Expression cycle: ${loop.join(' → ')}` })
+        }
+        continue
+      }
+      if (path.length >= MAX_EXPR_CHAIN) {
+        // refuse the chain: mark the rest of it done without walking deeper
+        if (!depthReported) {
+          depthReported = true
+          issues.push({
+            path: '$select',
+            message: `Expression chain is too deep (more than ${MAX_EXPR_CHAIN} expressions refer to each other)`,
+          })
+        }
+        continue
+      }
+      state.set(dep, 1)
+      path.push(dep)
+      next.push(0)
     }
-    state.set(alias, 1)
-    for (const dep of deps.get(alias) ?? []) if (byAlias.has(dep)) visit(dep, [...path, alias])
-    state.set(alias, 2)
-    out.push(byAlias.get(alias)!)
   }
-  for (const alias of byAlias.keys()) visit(alias, [])
   return out
 }
 

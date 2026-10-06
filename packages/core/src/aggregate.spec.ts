@@ -14,6 +14,7 @@ import {
   resolveBuckets,
   validateAggregateExpr,
 } from './aggregate'
+import { MAX_EXPR_CHAIN } from './aggregate'
 import { WEEK_STARTS } from './calendar'
 import type { BucketExpr } from './types'
 
@@ -558,6 +559,37 @@ describe('resolveBuckets – arithmetic entries', () => {
     expect(issuesOf({ $groupBy: ['g'], $select: [{ $expr: { $op: '+', $args: ['a', 1] }, $as: 'a' }] })).toEqual([
       '$select: Expression cycle: a → a',
     ])
+  })
+
+  describe('long expression chains', () => {
+    // e0 = e1 + 1, e1 = e2 + 1, …, e(n-1) = n + 1 where n is a count alias
+    const chain = (length: number) => [
+      { $fn: 'count', $field: '*', $as: 'n' },
+      ...Array.from({ length }, (_, i) => ({
+        $expr: { $op: '+', $args: [i === length - 1 ? 'n' : `e${i + 1}`, 1] },
+        $as: `e${i}`,
+      })),
+    ]
+
+    it('a 10k-entry chain is an error, not a stack overflow', () => {
+      expect(() => issuesOf({ $groupBy: ['g'], $select: chain(10_000) as never })).not.toThrow()
+      expect(issuesOf({ $groupBy: ['g'], $select: chain(10_000) as never })).toEqual([
+        `$select: Expression chain is too deep (more than ${MAX_EXPR_CHAIN} expressions refer to each other)`,
+      ])
+    })
+
+    it('a chain at the cap is fine, one past it is refused', () => {
+      expect(issuesOf({ $groupBy: ['g'], $select: chain(MAX_EXPR_CHAIN) as never })).toEqual([])
+      expect(issuesOf({ $groupBy: ['g'], $select: chain(MAX_EXPR_CHAIN + 1) as never })).toHaveLength(1)
+    })
+
+    it('a long cycle is still reported once', () => {
+      const select = chain(500) as unknown as Array<{ $expr?: { $args: unknown[] } }>
+      // close the loop: the last expression refers back to the first
+      select[500]!.$expr!.$args[0] = 'e0'
+      const issues = issuesOf({ $groupBy: ['g'], $select: select as never })
+      expect(issues.filter((m) => m.includes('Expression cycle'))).toHaveLength(1)
+    })
   })
 
   it('checks alias uniqueness and field collisions of expression entries', () => {
