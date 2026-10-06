@@ -77,6 +77,12 @@ describe('parseArith', () => {
 })
 
 describe('formatArith', () => {
+  it('rejects a hostile deep tree with a TypeError instead of overflowing the stack', () => {
+    let e: ArithExpr = 'a'
+    for (let i = 0; i < 100_000; i++) e = { $op: '-', $args: [e] } as ArithExpr
+    expect(() => formatArith(e)).toThrow(TypeError)
+  })
+
   it('prints minimal parentheses', () => {
     expect(formatArith(bin('+', 'a', bin('*', 'b', 'c')))).toBe('a+b*c')
     expect(formatArith(bin('*', bin('+', 'a', 'b'), 'c'))).toBe('(a+b)*c')

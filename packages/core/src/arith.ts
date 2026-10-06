@@ -9,6 +9,8 @@ export const ARITH_MAX_DEPTH = 16
 const NAME_RE = /^[A-Za-z_][\w.]*$/u
 /** Nesting of parentheses and unary minus the text parser follows before giving up. */
 const MAX_PARSE_NESTING = 64
+/** Recursion cap of `formatArith`, which may receive an unvalidated tree. */
+const FORMAT_MAX_DEPTH = 1000
 
 type Node = Exclude<ArithExpr, number | string>
 
@@ -204,20 +206,22 @@ export interface FormatArithOptions {
  */
 export function formatArith(expr: ArithExpr, opts: FormatArithOptions = {}): string {
   const plus = opts.encodePlus ? '%2B' : '+'
-  function fmt(e: ArithExpr, parent: number, rightOfSamePrec: boolean): string {
+  function fmt(e: ArithExpr, parent: number, rightOfSamePrec: boolean, depth = 0): string {
+    // Recursive: an unvalidated hostile tree must fail cleanly, not overflow the stack.
+    if (depth > FORMAT_MAX_DEPTH) throw new TypeError('Expression is nested too deeply to format')
     const problem = nodeProblem(e)
     if (problem) throw new TypeError(problem)
     if (typeof e === 'number') return fmtNumber(e)
     if (typeof e === 'string') return e
-    if (e.$op === 'coalesce') return `coalesce(${e.$args.map((a) => fmt(a, 0, false)).join(',')})`
+    if (e.$op === 'coalesce') return `coalesce(${e.$args.map((a) => fmt(a, 0, false, depth + 1)).join(',')})`
     if (e.$args.length === 1) {
       const arg = e.$args[0]
-      const inner = typeof arg === 'number' ? `(${fmtNumber(arg)})` : fmt(arg, 3, false)
+      const inner = typeof arg === 'number' ? `(${fmtNumber(arg)})` : fmt(arg, 3, false, depth + 1)
       return `-${inner}`
     }
     const prec = PREC[e.$op]
     const [l, r] = e.$args
-    const text = `${fmt(l, prec, false)}${e.$op === '+' ? plus : e.$op}${fmt(r, prec, true)}`
+    const text = `${fmt(l, prec, false, depth + 1)}${e.$op === '+' ? plus : e.$op}${fmt(r, prec, true, depth + 1)}`
     return prec < parent || (prec === parent && rightOfSamePrec) ? `(${text})` : text
   }
   return fmt(expr, 0, false)

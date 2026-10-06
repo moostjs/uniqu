@@ -219,6 +219,8 @@ Known functions are `sum`, `count`, `countDistinct`, `avg`, `min`, `max`, `first
 
 `countDistinct` counts the distinct non-null values of `$field`; the result is a number. In `AggregateControls` it may target a dimension or a measure field (other aggregates take measures only). Only `count` accepts `'*'` (`STAR_AGGREGATE_FNS`): `countDistinct(*)` is not valid.
 
+Aliases starting with `__as_` (`RESERVED_ALIAS_PREFIX`) are reserved for the engine's internal column names and rejected. A `$select` expression may refer to other aliases, but a chain of more than 1024 expressions referring to each other (`MAX_EXPR_CHAIN`) is rejected as too deep.
+
 Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`, `countDistinct(customerId)` → `countDistinct_customerId`). `resolveAlias(expr)` applies that rule for aggregates and buckets alike — use it instead of re-deriving aliases.
 
 #### Arithmetic expressions (`ArithExpr`)
