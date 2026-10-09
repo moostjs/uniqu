@@ -1458,3 +1458,84 @@ describe('parseUrl – $rowOrder', () => {
     expect(c.$sort).toEqual({ b: -1 })
   })
 })
+
+describe('parseUrl – null placement suffix', () => {
+  it('reads :first / :last on $sort keys into $nulls', () => {
+    const c = parseUrl('$sort=-amount:last,name:first,id').controls
+    expect(c.$sort).toEqual({ amount: -1, name: 1, id: 1 })
+    expect(c.$nulls).toEqual({ amount: 'last', name: 'first' })
+  })
+
+  it('adds no $nulls without a suffix', () => {
+    expect(parseUrl('$sort=-amount,name').controls).toEqual({ $sort: { amount: -1, name: 1 } })
+  })
+
+  it('accepts the suffix through the $order alias and on $rowOrder', () => {
+    expect(parseUrl('$order=-amount:last').controls).toEqual({ $sort: { amount: -1 }, $nulls: { amount: 'last' } })
+    expect(parseUrl('$rowOrder=raisedAt:first,-id').controls).toEqual({
+      $rowOrder: { raisedAt: 1, id: -1 },
+      $nulls: { raisedAt: 'first' },
+    })
+  })
+
+  it('shares one $nulls between $sort and $rowOrder', () => {
+    expect(parseUrl('$sort=-total:last&$rowOrder=at:first').controls.$nulls).toEqual({ total: 'last', at: 'first' })
+    // The same placement on both is not a conflict
+    expect(parseUrl('$sort=a:last&$rowOrder=-a:last').controls.$nulls).toEqual({ a: 'last' })
+  })
+
+  it('keeps the placement when a later key names none', () => {
+    const c = parseUrl('$sort=a:first&$sort=-a').controls
+    expect(c.$sort).toEqual({ a: -1 })
+    expect(c.$nulls).toEqual({ a: 'first' })
+  })
+
+  it('handles dotted paths and splits on the last ":"', () => {
+    expect(parseUrl('$sort=-author.name:last').controls).toEqual({
+      $sort: { 'author.name': -1 },
+      $nulls: { 'author.name': 'last' },
+    })
+    expect(parseUrl('$sort=a:b:first').controls).toEqual({ $sort: { 'a:b': 1 }, $nulls: { 'a:b': 'first' } })
+  })
+
+  it('reads a percent-encoded ":" as the suffix separator', () => {
+    expect(parseUrl('$sort=-amount%3Alast').controls).toEqual({ $sort: { amount: -1 }, $nulls: { amount: 'last' } })
+    expect(() => parseUrl('$sort=a%3Alast%20')).toThrow(SyntaxError)
+  })
+
+  it('works inside a $with relation', () => {
+    const rel = parseUrl('$with=posts($sort=-date:last&$limit=5)').controls.$with![0] as { controls: unknown }
+    expect(rel.controls).toEqual({ $sort: { date: -1 }, $nulls: { date: 'last' }, $limit: 5 })
+    const encoded = parseUrl('$with=posts($sort=-date%253Alast,id:first)').controls.$with![0] as { controls: unknown }
+    expect(encoded.controls).toEqual({ $sort: { date: -1, id: 1 }, $nulls: { date: 'last', id: 'first' } })
+  })
+
+  it('reports sorted fields in insights as before', () => {
+    expect(parseUrl('$sort=-amount:last').insights).toEqual(new Map([['amount', new Set(['$order'])]]))
+  })
+
+  it('rejects an unknown or empty placement', () => {
+    expect(() => parseUrl('$sort=a:middle')).toThrow('Malformed $sort item "a:middle": null placement must be "first" or "last"')
+    expect(() => parseUrl('$sort=a:')).toThrow('Malformed $sort item "a:": null placement must be "first" or "last"')
+    expect(() => parseUrl('$sort=a:LAST')).toThrow(SyntaxError)
+    expect(() => parseUrl('$order=a:x')).toThrow('Malformed $order item "a:x"')
+    expect(() => parseUrl('$rowOrder=a:x')).toThrow('Malformed $rowOrder item "a:x"')
+    // A colon in a field name is only readable with a placement after it
+    expect(() => parseUrl('$sort=a:b')).toThrow(SyntaxError)
+  })
+
+  it('rejects a placement without a field', () => {
+    expect(() => parseUrl('$sort=:first')).toThrow('Malformed $sort item ":first": missing field')
+    expect(() => parseUrl('$sort=-:last')).toThrow('Malformed $sort item "-:last": missing field')
+  })
+
+  it('rejects conflicting placements for one field', () => {
+    expect(() => parseUrl('$sort=a:first,a:last')).toThrow('Conflicting null placement for "a": "first" and "last"')
+    expect(() => parseUrl('$sort=a:first&$rowOrder=a:last')).toThrow('Conflicting null placement for "a"')
+  })
+
+  it('rejects $nulls as a URL control', () => {
+    expect(() => parseUrl('$nulls=a:first')).toThrow('$nulls is not a URL control')
+    expect(() => parseUrl('$with=posts($nulls=a)')).toThrow(SyntaxError)
+  })
+})

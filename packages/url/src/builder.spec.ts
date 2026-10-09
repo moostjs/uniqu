@@ -1635,3 +1635,71 @@ describe('buildUrl – arithmetic $select items and $rowOrder', () => {
     expect(trip({ $rowOrder: { a: 1, b: -1 } })).toEqual({ $rowOrder: { a: 1, b: -1 } })
   })
 })
+
+describe('buildUrl – null placement', () => {
+  const trip = (controls: Uniquery['controls']) => roundTrip({ controls }).controls
+  const tripUrl = (controls: Uniquery['controls']) => roundTripViaUrl({ controls }).controls
+
+  it('writes $nulls as a suffix on the ordered keys', () => {
+    expect(buildUrl({ controls: { $sort: { amount: -1, name: 1, id: 1 }, $nulls: { amount: 'last', name: 'first' } } })).toBe(
+      '$sort=-amount:last,name:first,id',
+    )
+    expect(buildUrl({ controls: { $rowOrder: { raisedAt: 1, id: -1 }, $nulls: { raisedAt: 'first' } } })).toBe(
+      '$rowOrder=raisedAt:first,-id',
+    )
+  })
+
+  it('applies one entry to $sort and $rowOrder alike', () => {
+    expect(buildUrl({ controls: { $sort: { a: -1 }, $rowOrder: { a: 1 }, $nulls: { a: 'last' } } })).toBe(
+      '$sort=-a:last&$rowOrder=a:last',
+    )
+  })
+
+  it('drops entries for keys that are not ordered by and never passes $nulls through', () => {
+    expect(buildUrl({ controls: { $nulls: { a: 'first' } } })).toBe('')
+    expect(buildUrl({ controls: { $sort: { b: 1 }, $nulls: { a: 'first' } } })).toBe('$sort=b')
+    expect(buildUrl({ controls: { $sort: { b: 1 }, $nulls: {} } })).toBe('$sort=b')
+  })
+
+  it('rejects an unknown placement', () => {
+    expect(() => buildUrl({ controls: { $sort: { a: 1 }, $nulls: { a: 'middle' as 'first' } } })).toThrow(
+      `$nulls "a" must be 'first' or 'last'; got middle`,
+    )
+  })
+
+  it('rejects an ordered field containing ":" without a placement', () => {
+    expect(() => buildUrl({ controls: { $sort: { 'a:b': 1 } } })).toThrow(TypeError)
+    expect(buildUrl({ controls: { $sort: { 'a:b': 1 }, $nulls: { 'a:b': 'last' } } })).toBe('$sort=a:b:last')
+  })
+
+  it('round-trips', () => {
+    const cases: Uniquery['controls'][] = [
+      { $sort: { amount: -1, name: 1 }, $nulls: { amount: 'last', name: 'first' } },
+      { $sort: { 'author.name': -1 }, $nulls: { 'author.name': 'last' } },
+      { $sort: { 'a:b': 1 }, $nulls: { 'a:b': 'first' } },
+      {
+        $groupBy: ['g'],
+        $select: ['g', { $fn: 'first', $field: 'title', $as: 'oldest' }],
+        $rowOrder: { raisedAt: 1, id: -1 },
+        $sort: { oldest: -1 },
+        $nulls: { raisedAt: 'last', oldest: 'first' },
+      },
+    ]
+    for (const c of cases) {
+      expect(trip(c)).toEqual(c)
+      expect(tripUrl(c)).toEqual(c)
+    }
+  })
+
+  it('round-trips inside a $with relation', () => {
+    const query: Uniquery = {
+      filter: {},
+      controls: {
+        $with: [{ name: 'posts', filter: {}, controls: { $sort: { date: -1 }, $nulls: { date: 'last' }, $limit: 5 } }],
+      },
+    }
+    expect(buildUrl(query)).toBe('$with=posts($sort=-date:last&$limit=5)')
+    const rel = roundTrip(query).controls.$with![0] as WithRelation
+    expect(rel.controls).toEqual({ $sort: { date: -1 }, $nulls: { date: 'last' }, $limit: 5 })
+  })
+})

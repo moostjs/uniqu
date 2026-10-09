@@ -104,6 +104,7 @@ means `a = 1` AND the `$and` branch AND the `$or` branch.
 | `$count` | `boolean` | Request total count |
 | `$select` | `SelectExpr<T>` | Field projection — array of strings/aggregates for inclusion, object for exclusion/mixed |
 | `$rowOrder` | `Record<string, 1 \| -1>` | Row order inside each group for `first()` / `last()` — see [representative row](#representative-row-first--last-and-roworder) |
+| `$nulls` | `Record<string, 'first' \| 'last'>` | Opt-in NULL placement for `$sort` / `$rowOrder` keys: NULL and missing values go before (`'first'`) or after (`'last'`) the rest, whatever the direction. Keys without an entry keep the backend's default. One map serves both controls. An entry for a key that is not ordered by has no effect — rejecting it, and rejecting a placement the backend cannot honor, is the consumer's call |
 | `$groupBy` | `string[]` | Fields — or [calendar bucket](#calendar-buckets-bucketexpr) aliases — to group by for aggregate queries |
 | `$having` | `FilterExpr` | Post-aggregation filter on aliases and dimension fields |
 | `$with` | `(WithRelation \| string)[]` | Relations to populate alongside the primary query |
@@ -314,7 +315,7 @@ Validation that needs no schema lives here, so every consumer rejects the same i
 
 `validateAggregateExpr(expr, { fns? })` checks one aggregate: its `$fn` is in `fns` (only when given — by default any name passes, so custom functions work), and a known function other than `count` is not applied to `'*'`. It returns `{ ok: true }` or `{ ok: false, message }`.
 
-`resolveBuckets` also validates the arithmetic entries and `first` / `last` (rules above): `exprs` lists the arithmetic entries as `{ alias, expr, names, level: 'row' | 'group', fn? }`, row-level first, then group-level in dependency order (a cycle is reported as `Expression cycle: a → b → a`); `rowOrder` is `[{ field, desc }]` when `first` / `last` is used. Pass `$rowOrder` in the controls. It reports an expression alias that collides with a field or another alias, an operand that is not an alias or `$groupBy` field, a bucket alias used as an operand, grouping by an expression alias, and a missing or superfluous `$rowOrder`. Whether an operand is numeric is the caller's rule. Issue paths are `$select`, `$groupBy` or `$rowOrder`.
+`resolveBuckets` also validates the arithmetic entries and `first` / `last` (rules above): `exprs` lists the arithmetic entries as `{ alias, expr, names, level: 'row' | 'group', fn? }`, row-level first, then group-level in dependency order (a cycle is reported as `Expression cycle: a → b → a`); `rowOrder` is `[{ field, desc, nulls? }]` when `first` / `last` is used, with `nulls` taken from the query's `$nulls`. Pass `$rowOrder` (and `$nulls`) in the controls; a `$nulls` that is not an object, or an entry for a `$rowOrder` key that is not `'first'` / `'last'`, is reported under `$nulls` (entries for other keys are not checked). It reports an expression alias that collides with a field or another alias, an operand that is not an alias or `$groupBy` field, a bucket alias used as an operand, grouping by an expression alias, and a missing or superfluous `$rowOrder`. Whether an operand is numeric is the caller's rule. Issue paths are `$select`, `$groupBy`, `$rowOrder` or `$nulls`.
 
 `groupByFields(controls)` maps `$groupBy` to source fields — a bucket alias becomes its `$field` — for access-control whitelists. `isAggregateExpr` / `isBucketExpr` / `isAggregateOfExpr` / `isSelectArithExpr` tell `$select` entries apart.
 
@@ -587,7 +588,8 @@ const insights = getInsights(query)
 | `NumericKeys<T>` | Keys of `T` whose value is a number (optionally null / undefined) |
 | `AggregateExpr<Fn, Field, Alias>` | `{ $fn, $field, $as? }` — aggregate function call in `$select`. Generic params preserve literal types for result inference |
 | `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
-| `UniqueryControls<T>` | Pagination, sorting, projection, grouping, `$having` — `$select`/`$sort`/`$groupBy` constrained to `keyof T` when typed |
+| `UniqueryControls<T>` | Pagination, sorting, projection, grouping, `$having` — `$select`/`$sort`/`$nulls`/`$groupBy` constrained to `keyof T` when typed |
+| `NullsPlacement` | `'first' \| 'last'` — a `$nulls` entry |
 | `Uniquery<T>` | `{ name?, filter, controls, insights? }` — root query (no name) or nested relation (with name) |
 | `TypedWithRelation<Nav>` | Typed `$with` entry — `keyof Nav & string` or object with typed filter/controls |
 | `WithRelation` | Untyped `$with` relation with `{ name: string, filter?, controls?, insights? }` |
@@ -613,6 +615,7 @@ const insights = getInsights(query)
 | `hasRelationOp` | `(value: unknown) => boolean` | True for an operator map carrying any `$some` / `$none` key, malformed or mixed. Like `walkFilter`, it treats a primitive, `RegExp`, `Date` or class instance as a value, never an operator map. `walkFilter` dispatches every such key to `relation`, so a gate should reject values where `hasRelationOp` holds but `isRelationPredicate` does not |
 | `AGGREGATE_FNS` | `readonly AggregateFn[]` | The known aggregate function names |
 | `isAggregateFn` | `(name: unknown) => name is AggregateFn` | True for a known aggregate function name |
+| `NULLS_PLACEMENTS` / `isNullsPlacement` | `readonly NullsPlacement[]` / `(v: unknown) => v is NullsPlacement` | `['first', 'last']` and its guard, for validating `$nulls` entries |
 | `ROW_ORDER_FNS` / `EXPR_AGGREGATE_FNS` | `readonly AggregateFn[]` | `['first', 'last']` (need `$rowOrder`) / `['sum', 'avg', 'min', 'max']` (accept `$expr`) |
 | `parseArith` / `formatArith` | `(text) => ArithExpr` / `(expr, { encodePlus? }) => string` | The single arithmetic grammar, text ⇄ JSON |
 | `arithNames` / `arithNullable` / `validateArith` | see [Arithmetic expressions](#arithmetic-expressions-arithexpr) | Names, nullability and schema-free validation (limits `ARITH_MAX_NODES` 64, `ARITH_MAX_DEPTH` 16) |

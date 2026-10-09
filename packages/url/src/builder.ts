@@ -12,6 +12,7 @@ import {
   formatArith,
   isAggregateOfExpr,
   isBucketExpr,
+  isNullsPlacement,
   isPlainObject,
   isSelectArithExpr,
   resolveAlias,
@@ -270,17 +271,34 @@ function exprAlias(alias: unknown): string {
   return alias
 }
 
-/** `$sort=a,-b` / `$rowOrder=a,-b`; empty when `order` has no keys. */
-function serializeOrder(name: string, order: Record<string, 1 | -1 | undefined>): string {
+/**
+ * `$sort=a,-b:last` / `$rowOrder=a:first,-b`; empty when `order` has no keys. A key with a
+ * `$nulls` entry gets its `:first` / `:last` suffix.
+ */
+function serializeOrder(
+  name: string,
+  order: Record<string, 1 | -1 | undefined>,
+  nulls: Record<string, unknown> | undefined,
+): string {
   let seg = ''
   for (const [field, dir] of Object.entries(order)) {
-    const s = dir === -1 ? `-${field}` : field
+    let s = dir === -1 ? `-${field}` : field
+    const placement = nulls && Object.hasOwn(nulls, field) ? nulls[field] : undefined
+    if (placement !== undefined) {
+      if (!isNullsPlacement(placement)) {
+        throw new TypeError(`$nulls "${field}" must be 'first' or 'last'; got ${String(placement)}`)
+      }
+      s += ':' + placement
+    } else if (field.includes(':')) {
+      // parseUrl would read the text after the last `:` as a null placement.
+      throw new TypeError(`${name} field "${field}" contains ":"; it cannot be expressed in a URL without a $nulls placement`)
+    }
     seg = seg ? seg + ',' + s : s
   }
   return seg && `${name}=${seg}`
 }
 
-const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$having', '$sort', '$rowOrder', '$limit', '$skip', '$count', '$with'])
+const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$having', '$sort', '$rowOrder', '$nulls', '$limit', '$skip', '$count', '$with'])
 
 function serializeControls(controls: UniqueryControls): string {
   let result = ''
@@ -339,8 +357,11 @@ function serializeControls(controls: UniqueryControls): string {
     }
   }
 
+  // `$nulls` has no segment of its own: it rides on the `$sort` / `$rowOrder` keys it names,
+  // and an entry for a key that is not ordered by (no effect) is dropped.
+  const nulls = controls.$nulls as Record<string, unknown> | undefined
   for (const [name, order] of [['$sort', controls.$sort], ['$rowOrder', controls.$rowOrder]] as const) {
-    const part = order && serializeOrder(name, order)
+    const part = order && serializeOrder(name, order, nulls)
     if (part) result = result ? result + '&' + part : part
   }
 

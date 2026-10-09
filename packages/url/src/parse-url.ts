@@ -2,6 +2,7 @@ import {
   EXPR_AGGREGATE_FNS,
   TIME_ZONE_NAME_RE,
   computeInsights,
+  isNullsPlacement,
   parseArith,
   resolveAlias,
 } from '@uniqu/core'
@@ -12,6 +13,7 @@ import type {
   BucketUnit,
   WeekStart,
   FilterExpr,
+  NullsPlacement,
   SelectArithExpr,
   WithRelation,
   UniqueryControls,
@@ -293,6 +295,20 @@ function parseWithSegment(seg: string): WithRelation | null {
   return rel
 }
 
+/** Record the `:first` / `:last` suffix of a `$sort` / `$order` / `$rowOrder` item in `$nulls`. */
+function setNulls(controls: UniqueryControls, key: string, item: string, field: string, placement: string): void {
+  if (!field) throw new SyntaxError(`Malformed ${key} item "${item}": missing field`)
+  if (!isNullsPlacement(placement)) {
+    throw new SyntaxError(`Malformed ${key} item "${item}": null placement must be "first" or "last"`)
+  }
+  const nulls: Partial<Record<string, NullsPlacement>> = (controls.$nulls ??= {})
+  const prev = Object.hasOwn(nulls, field) ? nulls[field] : undefined
+  if (prev !== undefined && prev !== placement) {
+    throw new SyntaxError(`Conflicting null placement for "${field}": "${prev}" and "${placement}"`)
+  }
+  nulls[field] = placement
+}
+
 function handleControls(parts: string[]): UniqueryControls {
   const controls = {} as UniqueryControls
 
@@ -371,13 +387,24 @@ function handleControls(parts: string[]): UniqueryControls {
       case '$order': {
         const orderKey = key === '$rowOrder' ? '$rowOrder' : '$sort'
         const order: Partial<Record<string, 1 | -1>> = (controls[orderKey] ??= {})
-        for (const f of value.split(',')) {
-          if (!f) continue
-          if (f.startsWith('-')) order[f.slice(1)] = -1
-          else order[f] = 1
+        const hasNulls = value.includes(':')
+        for (const item of value.split(',')) {
+          if (!item) continue
+          // `[-]field[:first|:last]` — the null placement follows the last `:`.
+          const colon = hasNulls ? item.lastIndexOf(':') : -1
+          const f = colon === -1 ? item : item.slice(0, colon)
+          const desc = f.charCodeAt(0) === 45 /* - */
+          const field = desc ? f.slice(1) : f
+          order[field] = desc ? -1 : 1
+          if (colon !== -1) setNulls(controls, key, item, field, item.slice(colon + 1))
         }
         break
       }
+
+      case '$nulls':
+        throw new SyntaxError(
+          '$nulls is not a URL control: write the null placement as a suffix on the order key ($sort=-amount:last)',
+        )
 
       case '$groupBy': {
         if (!value) break

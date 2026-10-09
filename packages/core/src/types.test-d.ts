@@ -14,6 +14,7 @@ import type {
   ResolveAlias,
   SelectExpr,
   NumericKeys,
+  NullsPlacement,
   UniqueryControls,
   ValidGroupBy,
 } from './types'
@@ -427,3 +428,16 @@ describe('NumericKeys', () => {
   })
 })
 
+describe('$nulls', () => {
+  it('constrains keys like $sort and values to first | last', () => {
+    const ok: UniqueryControls<Ticket> = { $sort: { closedAt: -1 }, $nulls: { closedAt: 'last' } }
+    expectTypeOf(ok).toExtend<UniqueryControls<Ticket>>()
+    // @ts-expect-error — not a field of Ticket
+    const badKey: UniqueryControls<Ticket> = { $nulls: { bogus: 'first' } }
+    // @ts-expect-error — not a placement
+    const badValue: UniqueryControls<Ticket> = { $nulls: { closedAt: 'middle' } }
+    void badKey
+    void badValue
+    expectTypeOf<NonNullable<AggregateControls['$nulls']>>().toEqualTypeOf<Record<string, NullsPlacement>>()
+  })
+})

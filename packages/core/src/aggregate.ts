@@ -8,6 +8,7 @@ import type {
   BucketExpr,
   BucketUnit,
   ComputedExpr,
+  NullsPlacement,
   SelectArithExpr,
   WeekStart,
 } from './types'
@@ -26,6 +27,11 @@ export const AGGREGATE_FNS: readonly AggregateFn[] = [
 /** The aggregate functions that read a representative row and so need `$rowOrder`. */
 export const ROW_ORDER_FNS: readonly AggregateFn[] = ['first', 'last']
 const isRowOrderFn = (fn: unknown) => (ROW_ORDER_FNS as readonly unknown[]).includes(fn)
+/** The values of a `$nulls` entry. */
+export const NULLS_PLACEMENTS: readonly NullsPlacement[] = ['first', 'last']
+/** Whether `value` is a `$nulls` placement (`'first'` or `'last'`). */
+export const isNullsPlacement = (value: unknown): value is NullsPlacement =>
+  value === 'first' || value === 'last'
 /** The aggregate functions that accept an arithmetic `$expr` instead of a `$field`. */
 export const EXPR_AGGREGATE_FNS: readonly AggregateOfExpr['$fn'][] = ['sum', 'avg', 'min', 'max']
 const isExprAggregateFn = (fn: unknown): fn is AggregateOfExpr['$fn'] =>
@@ -193,6 +199,8 @@ export interface ResolvedSelectExpr {
 export interface ResolvedRowOrderKey {
   field: string
   desc: boolean
+  /** NULL placement from `$nulls`; absent when the query names none for this key. */
+  nulls?: NullsPlacement
 }
 
 /** Result of {@link resolveBuckets}. */
@@ -312,7 +320,7 @@ export interface ResolveBucketsOptions {
  * - buckets, expressions and `first`/`last` appear only in aggregate mode
  *   (`aggregate` when given, else a non-empty `$groupBy`);
  * - `first`/`last` need a non-empty `$rowOrder` (`1 | -1` values), and `$rowOrder`
- *   is rejected without them;
+ *   is rejected without them; the `$nulls` entry of a `$rowOrder` key is `'first'` / `'last'`;
  * - each bucket alias is listed in `$groupBy`; no `$groupBy` entry is an expression alias;
  * - a bucket or expression alias is unique among `$select` aliases and is not a
  *   field name (`isField`; pass the table's field set to check this fully here);
@@ -320,16 +328,16 @@ export interface ResolveBucketsOptions {
  *
  * Schema-dependent rules (numeric operand types, timestamp-typed bucket source,
  * encryption, dimensions) are the caller's. Issues carry `path` `'$select'`,
- * `'$groupBy'` or `'$rowOrder'`.
+ * `'$groupBy'`, `'$rowOrder'` or `'$nulls'`.
  */
 export function resolveBuckets(
-  controls: { $select?: unknown; $groupBy?: unknown; $rowOrder?: unknown } | undefined,
+  controls: { $select?: unknown; $groupBy?: unknown; $rowOrder?: unknown; $nulls?: unknown } | undefined,
   opts: ResolveBucketsOptions = {},
 ): BucketResolution {
   const issues: QueryIssue[] = []
   const buckets: ResolvedBucket[] = []
   let exprs: ResolvedSelectExpr[] = []
-  const { $select: select, $groupBy: rawGroupBy, $rowOrder: rawRowOrder } = controls ?? {}
+  const { $select: select, $groupBy: rawGroupBy, $rowOrder: rawRowOrder, $nulls: rawNulls } = controls ?? {}
   const groupBy = Array.isArray(rawGroupBy) ? rawGroupBy : []
   const aggregateMode = opts.aggregate ?? groupBy.length > 0
   let sawRowFn = false
@@ -442,7 +450,7 @@ export function resolveBuckets(
     }
   }
 
-  const rowOrder = checkRowOrder(rawRowOrder, sawRowFn, issues)
+  const rowOrder = checkRowOrder(rawRowOrder, rawNulls, sawRowFn, issues)
 
   if (issues.length) return { ok: false, issues }
   return rowOrder ? { ok: true, buckets, exprs, rowOrder } : { ok: true, buckets, exprs }
@@ -605,8 +613,16 @@ function orderGroupExprs(
   return out
 }
 
-/** Validate `$rowOrder`; returns its keys when `first()` / `last()` are used. */
-function checkRowOrder(raw: unknown, usesRowFn: boolean, issues: QueryIssue[]): ResolvedRowOrderKey[] | undefined {
+/**
+ * Validate `$rowOrder` and the `$nulls` entries of its keys; returns its keys when
+ * `first()` / `last()` are used. `$nulls` keys outside `$rowOrder` are not checked here.
+ */
+function checkRowOrder(
+  raw: unknown,
+  rawNulls: unknown,
+  usesRowFn: boolean,
+  issues: QueryIssue[],
+): ResolvedRowOrderKey[] | undefined {
   if (raw === undefined) {
     if (usesRowFn) {
       issues.push({ path: '$rowOrder', message: '$rowOrder is required when first() or last() is used' })
@@ -621,11 +637,27 @@ function checkRowOrder(raw: unknown, usesRowFn: boolean, issues: QueryIssue[]): 
     issues.push({ path: '$rowOrder', message: '$rowOrder must be a non-empty object of field → 1 | -1' })
     return undefined
   }
+  let nulls: Record<string, unknown> | undefined
+  if (rawNulls !== undefined) {
+    if (typeof rawNulls === 'object' && rawNulls !== null && !Array.isArray(rawNulls)) {
+      nulls = rawNulls as Record<string, unknown>
+    } else {
+      issues.push({ path: '$nulls', message: "$nulls must be an object of field → 'first' | 'last'" })
+    }
+  }
   const keys: ResolvedRowOrderKey[] = []
   for (const [field, dir] of Object.entries(raw)) {
     if (dir !== 1 && dir !== -1) {
       issues.push({ path: '$rowOrder', message: `$rowOrder "${field}" must be 1 or -1` })
-    } else keys.push({ field, desc: dir === -1 })
+      continue
+    }
+    const key: ResolvedRowOrderKey = { field, desc: dir === -1 }
+    const placement = nulls && Object.hasOwn(nulls, field) ? nulls[field] : undefined
+    if (isNullsPlacement(placement)) key.nulls = placement
+    else if (placement !== undefined) {
+      issues.push({ path: '$nulls', message: `$nulls "${field}" must be 'first' or 'last'` })
+    }
+    keys.push(key)
   }
   return keys
 }

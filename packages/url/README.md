@@ -204,6 +204,20 @@ Control keywords start with `$` and are separated from filter expressions:
 
 Prefix a field with `-` in `$select` to exclude it. When any exclusion is present, `$select` produces an object (`{ name: 1, password: 0 }`); otherwise it produces an array (`['name', 'email']`). Prefix with `-` in `$order` for descending sort.
 
+### NULL placement in `$sort`
+
+Suffix a sort key with `:first` or `:last` to put NULL (and missing) values before or after every other value, whatever the direction. Keys without a suffix keep the backend's default placement:
+
+```
+$sort=-amount:last,name:first,id   → { $sort: { amount: -1, name: 1, id: 1 }, $nulls: { amount: 'last', name: 'first' } }
+$rowOrder=raisedAt:first,-id       → { $rowOrder: { raisedAt: 1, id: -1 }, $nulls: { raisedAt: 'first' } }
+```
+
+- Works on `$sort`, its alias `$order`, and `$rowOrder`, including inside `$with` bodies. `$sort` values stay `1 | -1`; the placement lands in the sibling `$nulls` control, shared by `$sort` and `$rowOrder`.
+- The suffix follows the **last** `:` (`author.name:last` → field `author.name`).
+- **Throws `SyntaxError`:** a suffix other than exactly `first` / `last` (`a:middle`, `a:`, `a:LAST`), a suffix with no field (`:first`), two different placements for one field (`$sort=a:first&$rowOrder=a:last`), and a `$nulls=…` segment (`$nulls` has no URL form of its own). A sort key containing `:` without a valid suffix (`$sort=a:b`) is therefore an error; before 0.1.15 it parsed as the field `a:b`.
+- Whether a backend supports the placement, and whether to reject it, is up to the consumer.
+
 ### Aggregate Functions in `$select`
 
 `$select` supports aggregate function calls using `fn(field)` syntax. An optional alias can be specified with `:alias`:
@@ -562,7 +576,7 @@ Accepts a `Uniquery` object and returns a URL query string (without leading `?`)
 
 All features are supported:
 - Filter expressions (comparisons, `$and`/`$or`/`$not`, `$in`/`$nin`, `$exists`, `$regex`)
-- Controls (`$select`, `$sort`, `$limit`, `$skip`, `$count`, `$groupBy`, `$having`, `$with`)
+- Controls (`$select`, `$sort` / `$rowOrder` with `$nulls`, `$limit`, `$skip`, `$count`, `$groupBy`, `$having`, `$with`)
 - Aggregates in `$select` (`sum(amount):total`)
 - Nested `$with` sub-queries
 - Pass-through custom `$`-prefixed controls
@@ -576,6 +590,7 @@ All features are supported:
 - Numbers are written as plain decimals: a finite number whose `String(n)` is in exponent form (`1e21`, `1.5e-7`) is expanded digit by digit (`1000000000000000000000`, `0.00000015`), so it parses back as the same number. `NaN`, `Infinity` and `-Infinity` throw a `TypeError` (`Filter value for "price" is not a finite number (NaN); it cannot be expressed in a URL`) instead of turning into the strings `"NaN"` / `"Infinity"`
 - An empty `$in` / `$nin` is written `field{}` / `field!{}`
 - Arithmetic is written `fn(<arith>):alias` and `expr(<arith>):alias` (alias required: an expression without `$as` throws a `TypeError`; `+` is written `%2B`, see above); `$rowOrder` is written like `$sort`
+- `$nulls` is written as a `:first` / `:last` suffix on each `$sort` / `$rowOrder` key it names (`$sort=-amount:last`); an entry for a key that is not ordered by has no effect and is dropped. A placement other than `'first'` / `'last'`, or an ordered field containing `:` without a placement, throws a `TypeError`
 - Calendar buckets are written as `bucket(field,unit[,tz][,weekStart]):alias`, always with the alias
 - Leading-zero numbers (`007`) stay as bare strings
 - Hyphenated strings and date-times are quoted (`'in-progress'`, `'2026-03-29T14:00'`), although `parseUrl` also accepts them bare

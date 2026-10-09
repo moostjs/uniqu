@@ -27,6 +27,7 @@ export type {
   WithRelation,
   TypedWithRelation,
   NavTarget,
+  NullsPlacement,
   UniqueryControls,
   Uniquery,
   InsightOp,
@@ -53,6 +54,8 @@ export { computeInsights, getInsights } from './insights'
 export {
   AGGREGATE_FNS,
   ROW_ORDER_FNS,
+  NULLS_PLACEMENTS,
+  isNullsPlacement,
   EXPR_AGGREGATE_FNS,
   STAR_AGGREGATE_FNS,
   isAggregateFn,

@@ -247,12 +247,24 @@ export type SelectExpr<T = Record<string, unknown>> =
   | ((keyof T & string) | AggregateExpr | BucketExpr<keyof T & string> | AggregateOfExpr<'sum' | 'avg' | 'min' | 'max', NumericKeys<T>> | SelectArithExpr)[]
   | Partial<Record<keyof T & string, 0 | 1>>
 
+/**
+ * Where NULL (and missing) values go when ordering by a field: before (`'first'`) or after
+ * (`'last'`) every non-null value, whatever the sort direction.
+ */
+export type NullsPlacement = 'first' | 'last'
+
 /** Query controls (pagination, projection, sorting, grouping). Generic `T` constrains field names. */
 export interface UniqueryControls<
   T = Record<string, unknown>,
   Nav extends Record<string, unknown> = Record<string, unknown>,
 > {
   $sort?: Partial<Record<keyof T & string, 1 | -1>>
+  /**
+   * Opt-in NULL placement per ordered field, for keys of `$sort` and `$rowOrder`. A field
+   * without an entry keeps the backend's default placement. Keys that are not ordered by
+   * have no effect; whether to reject them is the consumer's call.
+   */
+  $nulls?: Partial<Record<keyof T & string, NullsPlacement>>
   $skip?: number
   $limit?: number
   $count?: boolean
@@ -346,6 +358,8 @@ export interface AggregateControls<
   $sort?: Record<string, 1 | -1>
   /** Row order inside each group for `first()` / `last()`; required with them, rejected without. */
   $rowOrder?: Partial<Record<keyof T & string, 1 | -1>>
+  /** Opt-in NULL placement per `$sort` / `$rowOrder` key; see {@link UniqueryControls.$nulls}. */
+  $nulls?: Record<string, NullsPlacement>
   $skip?: number
   $limit?: number
   $count?: boolean

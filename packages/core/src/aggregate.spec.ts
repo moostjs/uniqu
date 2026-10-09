@@ -662,6 +662,29 @@ describe('resolveBuckets – first / last and $rowOrder', () => {
     expect(ctl({ a: 2 })).toEqual(['$rowOrder: $rowOrder "a" must be 1 or -1'])
   })
 
+  it('attaches $nulls placements to the $rowOrder keys', () => {
+    const res = resolveBuckets({
+      $groupBy: ['ticketId'],
+      $select: select,
+      $rowOrder: { raisedAt: 1, id: -1 },
+      $nulls: { raisedAt: 'last', other: 'first' },
+    })
+    expect(res.ok && res.rowOrder).toEqual([
+      { field: 'raisedAt', desc: false, nulls: 'last' },
+      { field: 'id', desc: true },
+    ])
+  })
+
+  it('validates the $nulls entries of $rowOrder keys only', () => {
+    const ctl = (nulls: unknown) =>
+      issuesOf({ $groupBy: ['t'], $select: select, $rowOrder: { a: 1, constructor: -1 }, $nulls: nulls })
+    expect(ctl({ a: 'middle' })).toEqual([`$nulls: $nulls "a" must be 'first' or 'last'`])
+    expect(ctl({ b: 'middle' })).toEqual([])
+    expect(ctl({})).toEqual([])
+    expect(ctl('a')).toEqual([`$nulls: $nulls must be an object of field → 'first' | 'last'`])
+    expect(ctl(['first'])).toEqual([`$nulls: $nulls must be an object of field → 'first' | 'last'`])
+  })
+
   it('rejects first(*)', () => {
     expect(issuesOf({ $groupBy: ['t'], $select: [{ $fn: 'last', $field: '*' }], $rowOrder: { a: 1 } })).toEqual([
       '$select: Aggregate "last" needs a field — only count accepts *',
