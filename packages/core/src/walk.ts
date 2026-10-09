@@ -1,7 +1,6 @@
 import type {
   FilterExpr,
   ComparisonOp,
-  FieldOps,
   Primitive,
   RelationOp,
   RelationPredicate,
@@ -93,8 +92,13 @@ export function walkFilter<R>(expr: FilterExpr | undefined, visitor: FilterVisit
   if (!expr) return undefined
 
   const results: R[] = []
+  const node = expr as Record<string, unknown>
+  // Indexed key loops: no per-entry [key, value] pair arrays on this hot path.
+  const keys = Object.keys(node)
 
-  for (const [key, value] of Object.entries(expr as Record<string, unknown>)) {
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]
+    const value = node[key]
     if (isLogicalKey(key)) {
       // Guard with !== undefined to handle malformed objects (e.g. from JSON.parse)
       // where a logical key exists but has value undefined.
@@ -102,7 +106,11 @@ export function walkFilter<R>(expr: FilterExpr | undefined, visitor: FilterVisit
     } else if (isPrimitive(value)) {
       results.push(visitor.comparison(key, '$eq', value))
     } else {
-      for (const [op, opValue] of Object.entries(value as FieldOps)) {
+      const fieldOps = value as Record<string, unknown>
+      const ops = Object.keys(fieldOps)
+      for (let j = 0; j < ops.length; j++) {
+        const op = ops[j]
+        const opValue = fieldOps[op]
         if (isRelationOp(op)) {
           if (!visitor.relation) {
             throw new Error(

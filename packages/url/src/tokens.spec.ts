@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { lex } from './tokens'
+import { lex, tokens, type Token } from './tokens'
 
 describe('Lexer', () => {
   it('should tokenize a simple query', () => {
@@ -97,6 +97,50 @@ describe('Lexer – bare words with hyphens and literal prefixes', () => {
   it('lexes a literal-prefixed word (nullable, trueish, 1.5.3) as one word', () => {
     for (const v of ['nullable', 'trueish', 'false_flag', 'null.x', '1.5.3', '5.']) {
       expect(lex(v), v).toEqual([{ pos: 0, type: 'word', value: v }])
+    }
+  })
+})
+
+describe('Lexer – first-char candidate table', () => {
+  // Reference: try every definition, in order, on the remaining input.
+  function lexFullScan(input: string): Token[] {
+    const out: Token[] = []
+    let idx = 0
+    while (idx < input.length) {
+      const rest = input.slice(idx)
+      const def = tokens.find(({ r }) => r.test(rest))
+      if (!def) throw new SyntaxError(`Unexpected char '${input[idx]}' at ${idx} --- ${input}`)
+      const value = def.r.exec(rest)![0]
+      if (def.type !== 'ws') out.push({ type: def.type, value, pos: idx })
+      idx += value.length
+    }
+    return out
+  }
+  const outcome = (fn: (s: string) => Token[], s: string) => {
+    try {
+      return fn(s)
+    } catch (error) {
+      return String(error)
+    }
+  }
+
+  it('lexes exactly like a full ordered scan of every definition', () => {
+    const chars = [..."ab1_.-0 9'\\/=<>!~^&(){},$+:TZtfnul%\t\n", 'é', 'а', '😀', ...String.fromCharCode(0xa0, 0x3000)]
+    const atoms = [
+      'true', 'false', 'null', 'nullable', '0', '-0', '007', '-12.34', '1.5.3', '2026-01-01',
+      '2026-01-01T10:30', '2026-01-01T10:30:59', 'in-progress', "'New York'", "'it\\'s'",
+      '/^Jo/i', '/a\\/b/u', '$exists', '$!exists', 'John Doe', 'a+b', 'é', 'Привет мир',
+      '!=', '>=', '<=', '~=', '!',
+    ]
+    let seed = 42
+    const rnd = (n: number) => {
+      seed = (seed * 1103515245 + 12345) >>> 0
+      return Math.floor((seed / 2 ** 32) * n)
+    }
+    for (let i = 0; i < 5000; i++) {
+      let s = ''
+      for (let j = 1 + rnd(8); j > 0; j--) s += rnd(2) ? chars[rnd(chars.length)] : atoms[rnd(atoms.length)]
+      expect(outcome(lex, s), JSON.stringify(s)).toEqual(outcome(lexFullScan, s))
     }
   })
 })

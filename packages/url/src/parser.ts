@@ -265,7 +265,11 @@ export class Parser {
 
 /** Body of a single-quoted literal `'…'`: the quotes stripped and `\\x` escapes unescaped. */
 export function unescapeString(str: string): string {
-  return str.replace(/(^'|'$)/gu, '').replace(/\\(.)/gu, '$1')
+  // Bare multi-word / hyphenated strings carry neither quotes nor escapes.
+  const hasEscape = str.includes('\\')
+  if (!hasEscape && !str.includes("'")) return str
+  const body = str.replace(/(^'|'$)/gu, '')
+  return hasEscape ? body.replace(/\\(.)/gu, '$1') : body
 }
 
 /**
