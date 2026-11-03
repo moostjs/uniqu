@@ -344,12 +344,12 @@ describe('computeInsights', () => {
       expect(insights.get('points')).toEqual(new Set(['sum', '$having']))
     })
 
-    it('ignores unsupported $select entries and non-string $groupBy entries', () => {
+    it('reports unsupported $select entries under the $select marker (fail closed) and skips non-string $groupBy entries', () => {
       const insights = computeInsights({}, {
         $select: ['a', { nope: 1 } as never, null as never],
         $groupBy: ['a', 7 as never],
       })
-      expect([...insights.keys()]).toEqual(['a'])
+      expect([...insights.keys()]).toEqual(['a', '$select'])
     })
   })
 })
@@ -453,5 +453,223 @@ describe('computeInsights – expressions, first/last and $rowOrder', () => {
     expect(insights.has('avgRev')).toBe(false)
     // alias → source field mapping still holds for first()
     expect(insights.get('title')).toEqual(new Set(['first', '$order']))
+  })
+})
+
+/** Insights as a plain object of sorted operator lists, for whole-map comparisons. */
+function plain(insights: Map<string, Set<string>>): Record<string, string[]> {
+  return Object.fromEntries([...insights].map(([k, v]) => [k, [...v].sort()]))
+}
+
+describe('computeInsights – countDistinct over several fields', () => {
+  it('reports every listed field, and every field behind an alias reference', () => {
+    const insights = computeInsights(undefined, {
+      $groupBy: ['region'],
+      $select: ['region', { $fn: 'countDistinct', $field: ['customerId', 'day'], $as: 'pairs' }],
+      $having: { pairs: { $gt: 1 } },
+      $sort: { pairs: -1 },
+    })
+    expect(plain(insights)).toEqual({
+      region: ['$groupBy', '$select'],
+      customerId: ['$having', '$order', 'countDistinct'],
+      day: ['$having', '$order', 'countDistinct'],
+    })
+  })
+})
+
+describe('computeInsights – conditional aggregates ($where)', () => {
+  it('reports $where fields as filter usage, exactly like filter fields', () => {
+    const controls: UniqueryControls = {
+      $groupBy: ['projectId'],
+      $select: [
+        'projectId',
+        { $fn: 'count', $field: '*', $as: 'estimated', $where: { status: 'ESTIMATED' } },
+        { $fn: 'sum', $field: 'amount', $as: 'big', $where: { $or: [{ amount: { $gt: 100 } }, { $not: { vip: false } }] } },
+        { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'paid', $where: { paidAt: { $exists: true } } },
+        { $fn: 'countDistinct', $field: ['a', 'b'], $as: 'n', $where: { secret: { $regex: '^x' } } },
+      ],
+    }
+    const insights = computeInsights(undefined, controls)
+    expect(plain(insights)).toEqual({
+      projectId: ['$groupBy', '$select'],
+      '*': ['count'],
+      status: ['$eq'],
+      amount: ['$gt', 'sum'],
+      vip: ['$eq'],
+      price: ['sum'],
+      qty: ['sum'],
+      paidAt: ['$exists'],
+      a: ['countDistinct'],
+      b: ['countDistinct'],
+      secret: ['$regex'],
+    })
+    // the same operators as the equivalent filter
+    const asFilter = computeInsights({ status: 'ESTIMATED', secret: { $regex: '^x' }, paidAt: { $exists: true } })
+    for (const field of ['status', 'secret', 'paidAt']) expect(insights.get(field)).toEqual(asFilter.get(field))
+  })
+
+  it('reports relational predicates in $where like the filter does (nav-prefixed)', () => {
+    const insights = computeInsights(undefined, {
+      $groupBy: ['g'],
+      $select: [{ $fn: 'count', $field: '*', $as: 'c', $where: { tags: { $some: { label: 'hot' } } } }],
+    })
+    expect(insights.get('tags')).toEqual(new Set(['$some']))
+    expect(insights.get('tags.label')).toEqual(new Set(['$eq']))
+  })
+})
+
+describe('computeInsights – two-level aggregates ($from)', () => {
+  const controls = {
+    $from: {
+      $groupBy: ['userId', 'day'],
+      $select: [
+        { $bucket: 'day', $field: 'createdAt', $as: 'day' },
+        { $fn: 'count', $field: '*', $as: 'n' },
+        { $fn: 'count', $field: '*', $as: 'est', $where: { status: 'ESTIMATED' } },
+        { $fn: 'first', $field: 'title', $as: 'firstTitle' },
+      ],
+      $rowOrder: { createdAt: 1 },
+      $having: { n: { $gt: 0 } },
+    },
+    $groupBy: ['userId'],
+    $select: [
+      'userId',
+      { $fn: 'avg', $field: 'n', $as: 'avgDaily' },
+      { $fn: 'count', $field: '*', $as: 'busy', $where: { est: { $gt: 3 } } },
+    ],
+    $sort: { avgDaily: -1 },
+    $rowOrder: { day: 1 },
+  } as UniqueryControls
+
+  it('reports the inner level, and root names that are not computed aliases of either level', () => {
+    const insights = computeInsights({ projectId: 7 }, controls)
+    expect(plain(insights)).toEqual({
+      projectId: ['$eq'],
+      userId: ['$groupBy', '$select'],
+      createdAt: ['$bucket', '$groupBy', '$order'],
+      '*': ['$having', 'count'],
+      status: ['$eq'],
+      title: ['first'],
+    })
+  })
+
+  it('fail closed: a root name that is no alias is reported with its usual op (an engine ignoring $from reads the table)', () => {
+    const probe = {
+      ...controls,
+      $groupBy: ['userId', 'secretKey'],
+      $select: [...(controls.$select as unknown[]), 'email', { $fn: 'count', $field: '*', $as: 'c', $where: { hidden: { $gt: 3 } } }],
+      $sort: { avgDaily: -1, cost: 1 },
+      $rowOrder: { salary: 1 },
+      $having: { margin: { $gt: 0 } },
+    } as UniqueryControls
+    const insights = computeInsights(undefined, probe)
+    expect(insights.get('secretKey')).toEqual(new Set(['$groupBy']))
+    expect(insights.get('email')).toEqual(new Set(['$select']))
+    expect(insights.get('hidden')).toEqual(new Set(['$gt']))
+    expect(insights.get('cost')).toEqual(new Set(['$order']))
+    expect(insights.get('salary')).toEqual(new Set(['$order']))
+    expect(insights.get('margin')).toEqual(new Set(['$having']))
+    // aliases of either level are not table fields
+    for (const alias of ['n', 'est', 'day', 'avgDaily', 'busy', 'c']) expect(insights.has(alias), alias).toBe(false)
+  })
+
+  it('the value-help probe: a $from with only a $groupBy cannot hide a root $sort', () => {
+    const insights = computeInsights(undefined, { $groupBy: ['x'], $from: { $groupBy: ['id'] }, $sort: { cost: 1 } })
+    expect(plain(insights)).toEqual({ id: ['$groupBy'], x: ['$groupBy'], cost: ['$order'] })
+  })
+
+  it('a root $with is reported (and resolveNested rejects it)', () => {
+    const insights = computeInsights(undefined, {
+      ...controls,
+      $with: [{ name: 'secretRel', filter: { x: 1 }, controls: {} }],
+    } as UniqueryControls)
+    expect(insights.get('secretRel')).toEqual(new Set(['$with']))
+    expect(insights.get('secretRel.x')).toEqual(new Set(['$eq']))
+  })
+
+  it('a $from inside a $with relation is not stage-aware: everything is reported, plus the $from marker', () => {
+    const insights = computeInsights(undefined, {
+      $with: [{ name: 'rel', filter: {}, controls: { $from: { $groupBy: ['x'] }, $groupBy: ['secret'], $sort: { n: 1 } } }],
+    })
+    expect(plain(insights)).toEqual({
+      rel: ['$with'],
+      'rel.$from': ['$from'],
+      'rel.x': ['$groupBy'],
+      'rel.secret': ['$groupBy'],
+      'rel.n': ['$order'],
+    })
+  })
+
+  it('a malformed $from is reported under the $from marker, with every root name', () => {
+    const insights = computeInsights(undefined, { ...controls, $from: 'x' } as UniqueryControls)
+    expect(insights.get('$from')).toEqual(new Set(['$from']))
+    expect(insights.has('userId')).toBe(true)
+    expect(insights.get('n')).toEqual(new Set(['avg', '$order']))
+  })
+
+  it('getInsights uses the same rule', () => {
+    const q: Uniquery = { filter: { projectId: 7 }, controls: { ...controls, $sort: { cost: 1 } } as UniqueryControls }
+    expect(getInsights(q).get('cost')).toEqual(new Set(['$order']))
+    expect(getInsights(q).has('avgDaily')).toBe(false)
+  })
+})
+
+describe('computeInsights – malformed input never throws and fails closed', () => {
+  it('a $where that is not a filter object is reported under the $where marker, not walked', () => {
+    for (const $where of [[{ secret: 1 }], 'secret=1', 5, null, { $and: 'x' }, { $or: { a: 1 } }]) {
+      const insights = computeInsights(undefined, {
+        $groupBy: ['a'],
+        $select: [{ $fn: 'count', $field: '*', $as: 'n', $where: $where as never }],
+      })
+      expect(plain(insights), JSON.stringify($where)).toEqual({ a: ['$groupBy'], '*': ['count'], $where: ['$where'] })
+    }
+  })
+
+  it('a $where with a malformed structure is reported under the $where marker, not walked (no fake fields)', () => {
+    for (const $where of [{ $not: 5 }, { a: [1, 2] }, { $and: ['ab'] }, { ok: 1, t: { $some: 'x' } }]) {
+      const insights = computeInsights(undefined, {
+        $groupBy: ['g'],
+        $select: [{ $fn: 'count', $field: '*', $as: 'n', $where: $where as never }],
+      })
+      expect(plain(insights), JSON.stringify($where)).toEqual({ g: ['$groupBy'], '*': ['count'], $where: ['$where'] })
+    }
+  })
+
+  it('a malformed filter, $having, $groupBy, $select, $sort, $rowOrder or $with is reported under its marker', () => {
+    const insights = computeInsights({ $and: 'x' } as never, {
+      $groupBy: 5,
+      $select: 7,
+      $having: { $or: 1 },
+      $sort: 'cost',
+      $rowOrder: ['a'],
+      $with: { name: 'rel' },
+    } as never)
+    expect(plain(insights)).toEqual({
+      $filter: ['$filter'],
+      $groupBy: ['$groupBy'],
+      $select: ['$select'],
+      $having: ['$having'],
+      $sort: ['$sort'],
+      $rowOrder: ['$rowOrder'],
+      $with: ['$with'],
+    })
+    expect(plain(computeInsights(undefined, { $with: [null, { name: 1 }] } as never))).toEqual({ $with: ['$with'] })
+  })
+
+  it('a $select entry of no known kind is reported under the $select marker', () => {
+    const insights = computeInsights(undefined, {
+      $groupBy: ['a'],
+      $select: ['a', { $fn: 'countDistinct', $field: ['secret', 1] }, { $fn: 'sum', $field: 'x', $expr: 'y', $as: 's' }, null],
+    } as never)
+    expect(plain(insights)).toEqual({ a: ['$groupBy', '$select'], $select: ['$select'] })
+  })
+
+  it('a string $groupBy is reported as one field, not as its characters', () => {
+    expect(plain(computeInsights(undefined, { $groupBy: 'secret' } as never))).toEqual({ secret: ['$groupBy'] })
+  })
+
+  it('never throws on hostile shapes', () => {
+    const bad: unknown[] = [null, 1, 'x', [], { $from: null }, { $from: { $select: 'x', $groupBy: 3 } }, { $select: [null, 1, { $fn: 1 }] }]
+    for (const c of bad) expect(() => computeInsights(undefined, c as never)).not.toThrow()
   })
 })

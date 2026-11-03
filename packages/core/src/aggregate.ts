@@ -1,5 +1,6 @@
 import { BUCKET_UNITS, WEEK_STARTS, checkTimeZone, type IsoWeekday } from './calendar'
 import { arithNames, validateArith } from './arith'
+import { filterShapeProblem, forEachFilterField, isPlainObject } from './walk'
 import type {
   AggregateExpr,
   AggregateFn,
@@ -44,15 +45,17 @@ export function isAggregateFn(name: unknown): name is AggregateFn {
   return (AGGREGATE_FNS as readonly unknown[]).includes(name)
 }
 
-/** True for an aggregate `$select` entry: `$fn` and `$field` strings, no `$bucket`. */
+/**
+ * True for an aggregate `$select` entry: a `$fn` string and a `$field` string or list of
+ * strings (`countDistinct` over several fields), no `$bucket`. Shape only: which functions
+ * take a list, and that it is non-empty, is {@link validateAggregateExpr}'s.
+ */
 export function isAggregateExpr(v: unknown): v is AggregateExpr {
-  return (
-    typeof v === 'object' &&
-    v !== null &&
-    typeof (v as AggregateExpr).$fn === 'string' &&
-    typeof (v as AggregateExpr).$field === 'string' &&
-    !('$bucket' in v)
-  )
+  if (typeof v !== 'object' || v === null || typeof (v as AggregateExpr).$fn !== 'string' || '$bucket' in v) {
+    return false
+  }
+  const field: unknown = (v as AggregateExpr).$field
+  return typeof field === 'string' || (Array.isArray(field) && field.every((f) => typeof f === 'string'))
 }
 
 /** True for an expression aggregate `$select` entry: `$fn` string and `$expr`, no `$field` / `$bucket`. */
@@ -93,30 +96,39 @@ export function isBucketExpr(v: unknown): v is BucketExpr {
 /**
  * Output alias of a computed `$select` entry: `$as`, else `{fn}_{field}` for an
  * aggregate or `{unit}_{field}` for a bucket, with `'*'` spelled `star`
- * (`count(*)` → `count_star`). Runtime twin of the `ResolveAlias` type.
+ * (`count(*)` → `count_star`) and a field list joined with `_`
+ * (`countDistinct(a,b)` → `countDistinct_a_b`). Runtime twin of the `ResolveAlias` type.
  */
 export function resolveAlias(expr: ComputedExpr): string {
   if (expr.$as) return expr.$as
   if (!('$field' in expr)) return ''
   const head = isBucketExpr(expr) ? expr.$bucket : (expr as AggregateExpr).$fn
-  return `${head}_${expr.$field === '*' ? 'star' : expr.$field}`
+  const field = expr.$field
+  return `${head}_${typeof field === 'string' ? (field === '*' ? 'star' : field) : field.join('_')}`
 }
 
-function isComputedExpr(v: unknown): v is ComputedExpr {
+/** @internal Any computed `$select` entry: a bucket, an aggregate, or an expression. */
+export function isComputedExpr(v: unknown): v is ComputedExpr {
   return isBucketExpr(v) || isAggregateExpr(v) || isAggregateOfExpr(v) || isSelectArithExpr(v)
 }
 
+/** @internal An aggregate's `$field` (or the source of an alias) as a list: a `countDistinct` may read several fields. */
+export function aggregateFields(field: string | readonly string[]): readonly string[] {
+  return typeof field === 'string' ? [field] : field
+}
+
 /**
- * @internal Computed-column alias → source field for the computed entries of an
- * array `$select` accepted by `accept` (default: every computed kind). An
- * expression entry has no single source field and is left out (its alias is its
- * own `$as`). Later entries win on a repeated alias. Empty for a non-array `$select`.
+ * @internal Computed-column alias → source field (or field list, for `countDistinct`
+ * over several fields) for the computed entries of an array `$select` accepted by
+ * `accept` (default: every computed kind). An expression entry has no single source
+ * field and is left out (its alias is its own `$as`). Later entries win on a repeated
+ * alias. Empty for a non-array `$select`.
  */
 export function computedAliases(
   select: unknown,
   accept: (entry: unknown) => entry is ComputedExpr = isComputedExpr,
-): Map<string, string> {
-  const out = new Map<string, string>()
+): Map<string, string | readonly string[]> {
+  const out = new Map<string, string | readonly string[]>()
   if (Array.isArray(select)) {
     for (const entry of select) {
       if (accept(entry) && '$field' in entry) out.set(resolveAlias(entry), entry.$field)
@@ -140,7 +152,7 @@ export function groupByFields(controls: { $select?: unknown; $groupBy?: unknown 
   const seen = new Set<string>()
   for (const entry of $groupBy) {
     if (typeof entry !== 'string') continue
-    const field = bucketField.get(entry) ?? entry
+    const field = (bucketField.get(entry) as string | undefined) ?? entry
     if (!seen.has(field)) {
       seen.add(field)
       out.push(field)
@@ -149,10 +161,27 @@ export function groupByFields(controls: { $select?: unknown; $groupBy?: unknown 
   return out
 }
 
+/** Machine-readable reasons of the two-level aggregate rules (see {@link resolveNested}). */
+export type NestedIssueCode =
+  /** A `$from` inside `$from`: depth is fixed at two. */
+  | 'AGG_NESTED_DEPTH'
+  /** `$from` is not an object, or a control that is not valid at its level. */
+  | 'AGG_NESTED_CONTROL'
+  /** The inner level has no (or an empty) `$groupBy`. */
+  | 'AGG_NESTED_UNGROUPED'
+  /** Two inner columns share a name (`$groupBy` keys and computed aliases). */
+  | 'AGG_NESTED_DUPLICATE_COLUMN'
+  /** The outer level reads a name that is not an inner column, or `$having` / `$sort` a name that is not an outer column. */
+  | 'AGG_NESTED_UNKNOWN_COLUMN'
+  /** `sum` / `avg` / arithmetic / a bucket at the outer level over an inner column known not to hold numbers. */
+  | 'AGG_NESTED_NOT_NUMERIC'
+
 /** One validation failure: the control it concerns and a user-facing message. */
 export interface QueryIssue {
   path: string
   message: string
+  /** Machine-readable reason, on the issues that have one ({@link NestedIssueCode}). */
+  code?: NestedIssueCode
 }
 
 /** A validated, normalized calendar bucket. */
@@ -270,8 +299,10 @@ function validateBucketExpr(expr: BucketExpr): BucketExprCheck {
 
 /**
  * Validate one `AggregateExpr` — the rules knowable without a table schema:
- * `$fn` is in `fns` (only when given), and `'*'` is used only by a known
- * function that accepts it ({@link STAR_AGGREGATE_FNS}). A custom function's
+ * `$fn` is in `fns` (only when given), `'*'` is used only by a known
+ * function that accepts it ({@link STAR_AGGREGATE_FNS}), a field list only by
+ * `countDistinct` (non-empty, distinct field names, no `'*'`), and a `$where`
+ * is a filter object on an entry with an explicit `$as`. A custom function's
  * `$field` is the consumer's concern.
  */
 export function validateAggregateExpr(
@@ -282,11 +313,49 @@ export function validateAggregateExpr(
   if (opts.fns && !opts.fns.includes(fn)) {
     return { ok: false, message: `Unknown aggregate function "${fn}" — use ${orList(opts.fns)}` }
   }
-  if (expr.$field === '*' && isAggregateFn(fn) && !STAR_AGGREGATE_FNS.includes(fn)) {
+  const field: unknown = expr.$field
+  if (Array.isArray(field)) {
+    const message = fieldListProblem(fn, field)
+    if (message) return { ok: false, message }
+  } else if (field === '*' && isAggregateFn(fn) && !STAR_AGGREGATE_FNS.includes(fn)) {
     const message = `Aggregate "${fn}" needs a field — only ${orList(STAR_AGGREGATE_FNS)} accepts *`
     return { ok: false, message }
   }
-  return { ok: true }
+  const message = whereProblem(expr)
+  return message ? { ok: false, message } : { ok: true }
+}
+
+/** The problem with a `$field` list, if any: `countDistinct` only, non-empty, distinct field names. */
+function fieldListProblem(fn: string, fields: readonly unknown[]): string | undefined {
+  if (fn !== 'countDistinct') return `Aggregate "${fn}" takes one field — only countDistinct takes a list of fields`
+  if (fields.length === 0) return 'countDistinct needs at least one field'
+  const seen = new Set<string>()
+  for (const f of fields) {
+    if (typeof f !== 'string' || f === '' || f === '*') {
+      return `countDistinct field list entries must be field names, not ${JSON.stringify(f)}`
+    }
+    if (seen.has(f)) return `countDistinct lists "${f}" twice`
+    seen.add(f)
+  }
+  return undefined
+}
+
+/** The problem with an entry's `$where`, if any: a filter object, and the entry names its `$as`. */
+function whereProblem(entry: { $where?: unknown; $as?: unknown }): string | undefined {
+  if (entry.$where === undefined) return undefined
+  const shape = whereShapeProblem(entry.$where)
+  if (shape) return shape
+  if (typeof entry.$as !== 'string' || entry.$as === '') {
+    return 'A conditional aggregate ($where) needs an explicit $as'
+  }
+  return undefined
+}
+
+/** The structural problem of a `$where` value, if any: a well-formed filter object. */
+function whereShapeProblem(where: unknown): string | undefined {
+  if (!isPlainObject(where)) return '$where must be a filter object'
+  const shape = filterShapeProblem(where)
+  return shape && `Malformed $where: ${shape}`
 }
 
 /** Options of {@link resolveBuckets}. */
@@ -334,6 +403,18 @@ export function resolveBuckets(
   controls: { $select?: unknown; $groupBy?: unknown; $rowOrder?: unknown; $nulls?: unknown } | undefined,
   opts: ResolveBucketsOptions = {},
 ): BucketResolution {
+  return resolveComputed(controls, opts, true)
+}
+
+/**
+ * {@link resolveBuckets}; `dupes: false` leaves duplicate computed aliases unreported, for a
+ * caller that reports duplicate columns itself ({@link resolveNested}).
+ */
+function resolveComputed(
+  controls: { $select?: unknown; $groupBy?: unknown; $rowOrder?: unknown; $nulls?: unknown } | undefined,
+  opts: ResolveBucketsOptions,
+  dupes: boolean,
+): BucketResolution {
   const issues: QueryIssue[] = []
   const buckets: ResolvedBucket[] = []
   let exprs: ResolvedSelectExpr[] = []
@@ -352,6 +433,8 @@ export function resolveBuckets(
     const exprAliases = new Set<string>()
     const rowExprs: ResolvedSelectExpr[] = []
     const groupExprs: { alias: string; expr: ArithExpr }[] = []
+    // Default aliases of `countDistinct` over a field list (`countDistinct_a_b`) can meet a single field's.
+    const listAliases: string[] = []
     let sawBucket = false
     let sawExpr = false
     for (let i = 0; i < select.length; i++) {
@@ -380,6 +463,10 @@ export function resolveBuckets(
         continue
       }
       aliasCount.set(entryAlias, (aliasCount.get(entryAlias) ?? 0) + 1)
+      if ((isBucketExpr(entry) || isSelectArithExpr(entry)) && (entry as { $where?: unknown }).$where !== undefined) {
+        const what = isBucketExpr(entry) ? 'a calendar bucket' : `the group-level expression "${String(entry.$as)}"`
+        issues.push({ path: '$select', message: `$where applies to aggregates only, not to ${what}` })
+      }
       if (isBucketExpr(entry)) {
         sawBucket = true
         const res = validateBucketExpr(entry)
@@ -391,6 +478,7 @@ export function resolveBuckets(
         if (isRowOrderFn(entry.$fn)) sawRowFn = true
         const res = validateAggregateExpr(entry, { fns: opts.fns })
         if (!res.ok) issues.push({ path: '$select', message: res.message })
+        else if (Array.isArray(entry.$field)) listAliases.push(entryAlias)
         numericAliases.add(entryAlias)
       } else {
         // An expression: `$fn(<expr>)` over each row, or a group-level `$expr`.
@@ -406,6 +494,10 @@ export function resolveBuckets(
         }
         const problems = validateArith(entry.$expr)
         issues.push(...problems)
+        // `$as` is required on every expression already; only the `$where` shape is left to check.
+        const where = (entry as { $where?: unknown }).$where
+        const whereMessage = rowFn === undefined || where === undefined ? undefined : whereShapeProblem(where)
+        if (whereMessage) issues.push({ path: '$select', message: whereMessage })
         if (alias !== undefined) {
           numericAliases.add(alias)
           exprAliases.add(alias)
@@ -425,21 +517,29 @@ export function resolveBuckets(
       issues.push({ path: '$select', message: 'Expressions and first()/last() are only valid in grouped queries' })
     }
     const isField = opts.isField ?? ((name: string) => fields.has(name))
+    /** A computed alias must not shadow a field, nor (with `dupes`) be repeated. */
+    const checkAlias = (alias: string, repeated: boolean, hint = '') => {
+      if (isField(alias)) {
+        issues.push({ path: '$select', message: `Alias "${alias}" collides with field "${alias}"` })
+      } else if (dupes && repeated) {
+        issues.push({ path: '$select', message: `Duplicate alias "${alias}"${hint}` })
+      }
+    }
     const seen = new Set<string>()
     for (const b of buckets) {
-      if (isField(b.alias)) {
-        issues.push({ path: '$select', message: `Alias "${b.alias}" collides with field "${b.alias}"` })
-      } else if (seen.has(b.alias) || aggAliases.has(b.alias)) {
-        issues.push({ path: '$select', message: `Duplicate alias "${b.alias}"` })
-      }
+      checkAlias(b.alias, seen.has(b.alias) || aggAliases.has(b.alias))
       seen.add(b.alias)
       if (aggregateMode && !groupBy.includes(b.alias)) {
         issues.push({ path: '$select', message: `Bucket "${b.alias}" in $select must also appear in $groupBy` })
       }
     }
 
+    for (const alias of listAliases) {
+      checkAlias(alias, (aliasCount.get(alias) ?? 0) > 1, ' — name the countDistinct over several fields with $as')
+    }
+
     exprs = resolveSelectExprs(
-      { rowExprs, groupExprs, exprAliases, aliasCount, numericAliases, bucketAliases, groupBy, isField },
+      { rowExprs, groupExprs, exprAliases, aliasCount, numericAliases, bucketAliases, groupBy, checkAlias },
       issues,
     )
   }
@@ -470,7 +570,8 @@ interface SelectExprContext {
   numericAliases: ReadonlySet<string>
   bucketAliases: ReadonlySet<string>
   groupBy: readonly unknown[]
-  isField: (name: string) => boolean
+  /** Report an alias that shadows a field or (`repeated`, when duplicates are reported) repeats. */
+  checkAlias: (alias: string, repeated: boolean) => void
 }
 
 /**
@@ -483,13 +584,7 @@ function resolveSelectExprs(ctx: SelectExprContext, issues: QueryIssue[]): Resol
   const { rowExprs, groupExprs, exprAliases, aliasCount, numericAliases, bucketAliases, groupBy } = ctx
   if (!exprAliases.size) return []
 
-  for (const alias of exprAliases) {
-    if (ctx.isField(alias)) {
-      issues.push({ path: '$select', message: `Alias "${alias}" collides with field "${alias}"` })
-    } else if ((aliasCount.get(alias) ?? 0) > 1) {
-      issues.push({ path: '$select', message: `Duplicate alias "${alias}"` })
-    }
-  }
+  for (const alias of exprAliases) ctx.checkAlias(alias, (aliasCount.get(alias) ?? 0) > 1)
 
   // Group-level expressions: operands, then dependency order (cycle check).
   let ordered: ResolvedSelectExpr[] = []
@@ -660,4 +755,417 @@ function checkRowOrder(
     keys.push(key)
   }
   return keys
+}
+
+// ── Two-level aggregates (`controls.$from`) ─────────────────────────────────
+
+/** The controls allowed inside `$from`, the inner level of a two-level aggregate. */
+export const NESTED_STAGE_CONTROLS: readonly string[] = ['$groupBy', '$select', '$having', '$rowOrder', '$nulls']
+
+/** One column of the inner level: what the outer level of a two-level aggregate reads. */
+export interface InnerColumn {
+  name: string
+  /**
+   * `'key'`: a plain `$groupBy` field (its name is the field path); `'bucket'`: a calendar
+   * bucket label; `'aggregate'`: an aggregate; `'expr'`: an arithmetic entry.
+   */
+  kind: 'key' | 'bucket' | 'aggregate' | 'expr'
+  /**
+   * `true` when the column holds numbers, `false` when it does not (a bucket label),
+   * absent when that depends on the schema and no `isNumericField` was given.
+   */
+  numeric?: boolean
+}
+
+/** Options of {@link resolveNested}. */
+export interface ResolveNestedOptions {
+  /** Whether `name` is a field of the queried table — {@link ResolveBucketsOptions.isField} for the inner level. */
+  isField?: (name: string) => boolean
+  /** Allowed aggregate `$fn` names at both levels. Default: any name. */
+  fns?: readonly string[]
+  /**
+   * Whether a table field holds numbers. With it, inner `$groupBy` keys and inner
+   * `min` / `max` / `first` / `last` columns get a known {@link InnerColumn.numeric}, so the
+   * outer `sum` / `avg` / arithmetic checks cover them too. It must return `undefined` for a
+   * field the request may not see (the answer shows in the issues), and the inner level's
+   * capability gate must run before {@link resolveNested}.
+   */
+  isNumericField?: (field: string) => boolean | undefined
+}
+
+/** The normalized computed `$select` entries of one level (a successful {@link BucketResolution}). */
+export type ResolvedLevel = Omit<Extract<BucketResolution, { ok: true }>, 'ok'>
+
+/** The controls {@link resolveNested} reads (a `NestedAggregateControls`, or parsed URL controls). */
+export interface NestedControlsInput {
+  $from?: unknown
+  $select?: unknown
+  $groupBy?: unknown
+  $having?: unknown
+  $sort?: unknown
+  $rowOrder?: unknown
+  $nulls?: unknown
+  $with?: unknown
+}
+
+/** Result of {@link resolveNested}. */
+export type NestedResolution =
+  | {
+      ok: true
+      /** The inner columns: plain `$groupBy` keys, then the computed `$select` entries of `$from`, in order. */
+      columns: InnerColumn[]
+      /** The inner level (`$from`), resolved as {@link resolveBuckets} resolves a grouped query. */
+      inner: ResolvedLevel
+      /** The outer level, resolved against the inner columns. */
+      outer: ResolvedLevel
+    }
+  | { ok: false; issues: QueryIssue[] }
+
+const NUMERIC_AGGREGATES: readonly unknown[] = ['count', 'countDistinct', 'sum', 'avg']
+const ARITH_FNS: readonly unknown[] = ['sum', 'avg']
+
+/** Whether an aggregate's result is numeric: `true` / `false`, `undefined` when it depends on the schema. */
+function aggregateNumeric(entry: AggregateExpr, isNumericField?: (field: string) => boolean | undefined): boolean | undefined {
+  if (NUMERIC_AGGREGATES.includes(entry.$fn)) return true
+  if (isRowOrderFn(entry.$fn) || entry.$fn === 'min' || entry.$fn === 'max') {
+    return typeof entry.$field === 'string' ? isNumericField?.(entry.$field) : undefined
+  }
+  return undefined
+}
+
+/** The names a well-formed filter reads, with the relational-predicate keys flagged. Never throws. */
+function filterNames(filter: unknown): { names: string[]; relations: string[] } {
+  const names: string[] = []
+  const relations: string[] = []
+  forEachFilterField(filter, (field) => names.push(field), (field) => relations.push(field))
+  return { names, relations }
+}
+
+/**
+ * Validate the shape of a two-level aggregate (`controls.$from`) and resolve both levels —
+ * the rules knowable without a table schema. Issues carry a {@link NestedIssueCode}:
+ *
+ * - `$from` is an object holding only {@link NESTED_STAGE_CONTROLS} (`AGG_NESTED_CONTROL`;
+ *   a `$from` inside it is `AGG_NESTED_DEPTH`), with a non-empty `$groupBy`
+ *   (`AGG_NESTED_UNGROUPED`); the root has no `$with`, neither level has an object-form
+ *   `$select`, the outer `$groupBy` is a list, `$having` / `$sort` / `$rowOrder` / `$nulls`
+ *   are objects (a `$having` a well-formed filter), and every `$nulls` key is ordered by
+ *   (`AGG_NESTED_CONTROL`);
+ * - the inner level passes {@link resolveBuckets} as a grouped query (its issues keep their
+ *   messages, under a `$from.` path);
+ * - the inner columns — every `$groupBy` key plus every computed `$select` alias — have
+ *   distinct names (`AGG_NESTED_DUPLICATE_COLUMN`);
+ * - every name the outer level reads (`$groupBy` entries that are not outer bucket aliases,
+ *   plain `$select` entries, aggregate `$field`s and field lists, bucket sources, expression
+ *   operands, `$where` keys, `$rowOrder` keys) is an inner column; `$having` and `$sort` name
+ *   outer result columns (outer `$groupBy` keys and `$select` aliases), and a plain outer
+ *   `$select` entry is an outer `$groupBy` key. Anything else is `AGG_NESTED_UNKNOWN_COLUMN`,
+ *   with one message whether or not the name is a table field;
+ * - the outer result columns have distinct names: no `$select` alias equal to a `$groupBy`
+ *   key or to another alias (`AGG_NESTED_DUPLICATE_COLUMN`);
+ * - outer `sum` / `avg`, expression operands and bucket sources are not inner columns known
+ *   to hold no numbers (`AGG_NESTED_NOT_NUMERIC`; bucket labels, plus whatever
+ *   `isNumericField` rules out);
+ * - the outer level passes {@link resolveBuckets} with the inner columns as its fields.
+ *
+ * The inner level reads the table like a standalone grouped query: field capabilities,
+ * schema types and the like stay the caller's, as for {@link resolveBuckets}. Run that
+ * capability gate BEFORE `resolveNested`, and let `opts.isNumericField` answer `undefined`
+ * for a field the request may not see: a NOT_NUMERIC answer would reveal its type.
+ *
+ * Never throws on malformed controls: every problem is an issue.
+ */
+export function resolveNested(
+  controls: NestedControlsInput | undefined,
+  opts: ResolveNestedOptions = {},
+): NestedResolution {
+  const stage = controls?.$from
+  if (!isPlainObject(stage)) {
+    const message = `$from must be an object of ${orList(NESTED_STAGE_CONTROLS)}`
+    return { ok: false, issues: [{ path: '$from', message, code: 'AGG_NESTED_CONTROL' }] }
+  }
+  const root = controls!
+  const issues: QueryIssue[] = []
+  // A control that is not an object gets one coded issue; the level's own reports at its path are dropped.
+  const notObjects = checkNestedControls(stage, root, issues)
+  const addLevelIssues = (levelIssues: QueryIssue[], prefix: string) => {
+    for (const issue of levelIssues) {
+      const path = prefix + issue.path
+      if (!notObjects.has(path)) issues.push({ ...issue, path })
+    }
+  }
+
+  // Inner level: a standalone grouped query; duplicates are reported below as duplicate columns.
+  const inner = resolveComputed(stage, { aggregate: true, isField: opts.isField, fns: opts.fns }, false)
+  if (!inner.ok) addLevelIssues(inner.issues, '$from.')
+
+  const columns = innerColumns(stage, opts.isNumericField, issues)
+  const resultColumns = checkOuterReads(root, columns, issues)
+  checkResultRefs(root, resultColumns, issues)
+
+  // Outer duplicates are reported by checkOuterReads as duplicate result columns.
+  const outer = resolveComputed(root, { aggregate: true, isField: (name) => columns.has(name), fns: opts.fns }, false)
+  if (!outer.ok) addLevelIssues(outer.issues, '')
+
+  if (issues.length || !inner.ok || !outer.ok) return { ok: false, issues }
+  const { ok: _i, ...innerLevel } = inner
+  const { ok: _o, ...outerLevel } = outer
+  return { ok: true, columns: [...columns.values()], inner: innerLevel, outer: outerLevel }
+}
+
+/** An issue reporter for `issues` with a fixed {@link NestedIssueCode}. */
+function issueWith(issues: QueryIssue[], code: NestedIssueCode) {
+  return (path: string, message: string) => {
+    issues.push({ path, message, code })
+  }
+}
+
+/**
+ * Controls and control shapes of both levels, in report order: the controls `$from` holds
+ * ({@link NESTED_STAGE_CONTROLS}; a `$from` inside it is `AGG_NESTED_DEPTH`), no root `$with`,
+ * no object-form `$select`, the outer `$groupBy` is a list, `$having` / `$sort` / `$rowOrder` /
+ * `$nulls` are objects (a `$having` a well-formed filter), every `$nulls` key is ordered by
+ * (`$sort` / `$rowOrder` at the outer level, `$rowOrder` inside `$from`) and is `'first'` or
+ * `'last'`, and the inner `$groupBy` is non-empty (`AGG_NESTED_UNGROUPED`). Returns the paths
+ * of the controls reported as not being objects.
+ */
+function checkNestedControls(stage: Record<string, unknown>, root: NestedControlsInput, issues: QueryIssue[]): Set<string> {
+  const notObjects = new Set<string>()
+  const control = issueWith(issues, 'AGG_NESTED_CONTROL')
+  for (const key of Object.keys(stage)) {
+    if (stage[key] === undefined || NESTED_STAGE_CONTROLS.includes(key)) continue
+    if (key === '$from') {
+      const message = 'A $from cannot have its own $from — a query has two levels at most'
+      issues.push({ path: '$from.$from', message, code: 'AGG_NESTED_DEPTH' })
+    } else {
+      control(
+        `$from.${key}`,
+        `${key} is not valid inside $from — it takes ${orList(NESTED_STAGE_CONTROLS)}; the query filter applies to the rows it groups`,
+      )
+    }
+  }
+  if (root.$with !== undefined) control('$with', '$with is not valid in a two-level aggregate')
+  // The object form of `$select` (a projection) has no meaning at either level.
+  for (const [path, select] of [['$from.$select', stage.$select], ['$select', root.$select]] as const) {
+    if (select !== undefined && !Array.isArray(select)) {
+      control(path, `${path} of a two-level aggregate must be a list of columns and computed entries`)
+    }
+  }
+  if (root.$groupBy !== undefined && !Array.isArray(root.$groupBy)) {
+    control('$groupBy', '$groupBy must be a list of inner columns and outer bucket aliases')
+  }
+  const objects: { path: string; value: unknown; filter?: true }[] = [
+    { path: '$having', value: root.$having, filter: true },
+    { path: '$sort', value: root.$sort },
+    { path: '$rowOrder', value: root.$rowOrder },
+    { path: '$nulls', value: root.$nulls },
+    { path: '$from.$having', value: stage.$having, filter: true },
+    { path: '$from.$nulls', value: stage.$nulls },
+  ]
+  for (const { path, value, filter } of objects) {
+    if (value === undefined) continue
+    if (!isPlainObject(value)) {
+      notObjects.add(path)
+      control(path, `${path} must be an object`)
+    } else if (filter) {
+      const shape = filterShapeProblem(value)
+      if (shape) control(path, `Malformed ${path}: ${shape}`)
+    }
+  }
+  const levels = [
+    { path: '$nulls', nulls: root.$nulls, sort: root.$sort, rowOrder: root.$rowOrder, keyOf: '$sort or $rowOrder' },
+    { path: '$from.$nulls', nulls: stage.$nulls, sort: undefined, rowOrder: stage.$rowOrder, keyOf: '$rowOrder' },
+  ]
+  for (const { path, nulls, sort, rowOrder, keyOf } of levels) {
+    if (!isPlainObject(nulls)) continue
+    const inRowOrder = (key: string) => isPlainObject(rowOrder) && Object.hasOwn(rowOrder, key)
+    for (const [key, placement] of Object.entries(nulls)) {
+      if (placement === undefined) continue
+      if (!inRowOrder(key) && !(isPlainObject(sort) && Object.hasOwn(sort, key))) {
+        control(path, `${path} "${key}" names a key that is not ordered by — a $nulls key must be a ${keyOf} key`)
+      } else if (!isNullsPlacement(placement) && !inRowOrder(key)) {
+        // `$rowOrder` keys' placements are checked with `$rowOrder` itself.
+        control(path, `${path} "${key}" must be 'first' or 'last'`)
+      }
+    }
+  }
+  const stageGroupBy = stage.$groupBy
+  if (!Array.isArray(stageGroupBy) || stageGroupBy.length === 0) {
+    const message = 'The inner level ($from) needs a non-empty $groupBy'
+    issues.push({ path: '$from.$groupBy', message, code: 'AGG_NESTED_UNGROUPED' })
+  }
+  return notObjects
+}
+
+/**
+ * Check every name the outer level reads against the inner `columns` (unknown and not-numeric
+ * columns, duplicate result columns) and return the outer result columns: the `$groupBy` keys
+ * (a bucket alias among them is its bucket) and the computed `$select` aliases.
+ */
+function checkOuterReads(root: NestedControlsInput, columns: Map<string, InnerColumn>, issues: QueryIssue[]): Set<string> {
+  const unknownColumn = (path: string, name: string) =>
+    issues.push({
+      path,
+      message: `"${name}" is not a column of $from — the outer level reads only its columns (${[...columns.keys()].join(', ')})`,
+      code: 'AGG_NESTED_UNKNOWN_COLUMN',
+    })
+  const notNumeric = (path: string, name: string, what: string) =>
+    issues.push({
+      path,
+      message: `${what} needs a numeric column — "${name}" ${columns.get(name)?.kind === 'bucket' ? 'is a bucket label' : 'does not hold numbers'}`,
+      code: 'AGG_NESTED_NOT_NUMERIC',
+    })
+  /** Report `name` unless it is an inner column; with `what`, also when it is known not to be numeric. */
+  const readColumn = (path: string, name: string, what?: string) => {
+    const col = columns.get(name)
+    if (!col) unknownColumn(path, name)
+    else if (what && col.numeric === false) notNumeric(path, name, what)
+  }
+  const readWhere = (where: unknown) => {
+    // A malformed condition is reported by the level's own validation.
+    if (where === undefined || whereShapeProblem(where)) return
+    const { names, relations } = filterNames(where)
+    for (const name of names) readColumn('$select', name)
+    for (const name of relations) {
+      if (columns.has(name)) {
+        const message = `"${name}" is a column of $from — relational predicates do not apply at the outer level`
+        issues.push({ path: '$select', message, code: 'AGG_NESTED_UNKNOWN_COLUMN' })
+      } else unknownColumn('$select', name)
+    }
+  }
+
+  const select = Array.isArray(root.$select) ? root.$select : []
+  const groupBy = Array.isArray(root.$groupBy) ? root.$groupBy : []
+  const groupKeys = new Set(groupBy.filter((g): g is string => typeof g === 'string'))
+  const outerBuckets = computedAliases(select, isBucketExpr)
+  const outerAliases = new Set<string>()
+  const resultColumns = new Set<string>()
+  const duplicates = new Set<string>()
+  const addResult = (name: string) => {
+    if (!resultColumns.has(name)) resultColumns.add(name)
+    else if (!duplicates.has(name)) {
+      duplicates.add(name)
+      issues.push({
+        path: '$select',
+        message: `Result column "${name}" is defined twice — each outer $groupBy key and $select alias needs its own name`,
+        code: 'AGG_NESTED_DUPLICATE_COLUMN',
+      })
+    }
+  }
+  for (const g of groupKeys) {
+    if (!outerBuckets.has(g)) readColumn('$groupBy', g)
+    addResult(g)
+  }
+  for (const entry of select) {
+    if (typeof entry === 'string') {
+      if (!columns.has(entry)) unknownColumn('$select', entry)
+      else if (!groupKeys.has(entry)) {
+        const message = `"${entry}" is not an outer $groupBy key — the outer $select lists $groupBy keys and aggregates`
+        issues.push({ path: '$select', message, code: 'AGG_NESTED_UNKNOWN_COLUMN' })
+      }
+      continue
+    }
+    if (isBucketExpr(entry)) {
+      readColumn('$select', entry.$field, `Bucket over "${entry.$field}"`)
+    } else if (isAggregateExpr(entry)) {
+      const what = ARITH_FNS.includes(entry.$fn) ? `${entry.$fn}()` : undefined
+      for (const field of aggregateFields(entry.$field)) if (field !== '*') readColumn('$select', field, what)
+      readWhere(entry.$where)
+    } else if (isAggregateOfExpr(entry)) {
+      if (validateArith(entry.$expr).length === 0) {
+        for (const name of arithNames(entry.$expr)) readColumn('$select', name, `${entry.$fn}(<expression>)`)
+      }
+      readWhere(entry.$where)
+    }
+    if (isComputedExpr(entry)) {
+      const alias = resolveAlias(entry)
+      outerAliases.add(alias)
+      // A grouped bucket is already a result column through `$groupBy`.
+      if (!(isBucketExpr(entry) && groupKeys.has(alias))) addResult(alias)
+    }
+  }
+  // A group-level expression reads outer aliases (all of them known only now) and outer `$groupBy` keys (inner columns).
+  for (const entry of select) {
+    if (isSelectArithExpr(entry) && validateArith(entry.$expr).length === 0) {
+      for (const name of arithNames(entry.$expr)) {
+        if (!outerAliases.has(name) && columns.get(name)?.numeric === false) notNumeric('$select', name, `Expression "${String(entry.$as)}"`)
+      }
+    }
+  }
+  if (isPlainObject(root.$rowOrder)) {
+    for (const key of Object.keys(root.$rowOrder)) readColumn('$rowOrder', key)
+  }
+  return resultColumns
+}
+
+/** `$having` and `$sort` of the outer level name its result columns. */
+function checkResultRefs(root: NestedControlsInput, resultColumns: ReadonlySet<string>, issues: QueryIssue[]): void {
+  const resultColumn = (path: string, name: string) => {
+    if (!resultColumns.has(name)) {
+      const message = `"${name}" is not a column of the result — name an outer $groupBy key or $select alias`
+      issues.push({ path, message, code: 'AGG_NESTED_UNKNOWN_COLUMN' })
+    }
+  }
+  // A malformed `$having` is reported by checkNestedControls.
+  if (!filterShapeProblem(root.$having)) {
+    const { names, relations } = filterNames(root.$having)
+    for (const name of [...names, ...relations]) resultColumn('$having', name)
+  }
+  if (isPlainObject(root.$sort)) {
+    for (const key of Object.keys(root.$sort)) resultColumn('$sort', key)
+  }
+}
+
+/**
+ * The inner columns of a `$from` stage, by name: plain `$groupBy` keys (in order, repeats
+ * collapsed), then the computed `$select` entries. A name defined twice is reported.
+ */
+function innerColumns(
+  stage: Record<string, unknown>,
+  isNumericField: ((field: string) => boolean | undefined) | undefined,
+  issues: QueryIssue[],
+): Map<string, InnerColumn> {
+  const computed: InnerColumn[] = []
+  const bucketAliases = new Set<string>()
+  if (Array.isArray(stage.$select)) {
+    for (const entry of stage.$select) {
+      if (isBucketExpr(entry)) {
+        const name = resolveAlias(entry)
+        bucketAliases.add(name)
+        computed.push({ name, kind: 'bucket', numeric: false })
+      } else if (isAggregateExpr(entry)) {
+        const numeric = aggregateNumeric(entry, isNumericField)
+        const col: InnerColumn = { name: resolveAlias(entry), kind: 'aggregate' }
+        if (numeric !== undefined) col.numeric = numeric
+        computed.push(col)
+      } else if (isAggregateOfExpr(entry) || isSelectArithExpr(entry)) {
+        if (typeof entry.$as === 'string') computed.push({ name: entry.$as, kind: 'expr', numeric: true })
+      }
+    }
+  }
+  const columns = new Map<string, InnerColumn>()
+  const reported = new Set<string>()
+  const add = (col: InnerColumn) => {
+    if (!columns.has(col.name)) {
+      columns.set(col.name, col)
+    } else if (!reported.has(col.name)) {
+      reported.add(col.name)
+      issues.push({
+        path: '$from.$select',
+        message: `Inner column "${col.name}" is defined twice — each $groupBy key and $select alias of $from needs its own name`,
+        code: 'AGG_NESTED_DUPLICATE_COLUMN',
+      })
+    }
+  }
+  const keys = new Set<string>()
+  for (const g of Array.isArray(stage.$groupBy) ? stage.$groupBy : []) {
+    if (typeof g !== 'string' || keys.has(g) || bucketAliases.has(g)) continue
+    keys.add(g)
+    const col: InnerColumn = { name: g, kind: 'key' }
+    const numeric = isNumericField?.(g)
+    if (numeric !== undefined) col.numeric = numeric
+    add(col)
+  }
+  for (const col of computed) add(col)
+  return columns
 }

@@ -142,6 +142,27 @@ const { controls } = parseUrl(
 
 See [calendar buckets](./packages/core/README.md#calendar-buckets-bucketexpr) for units, week starts, validation and the date helpers.
 
+Count distinct combinations of several fields with `countDistinct(a,b)`, and aggregate only the rows matching a condition with `fn(field|<filter>):alias`:
+
+```ts
+const { controls } = parseUrl(
+  "$select=projectId,count(*):total,count(*|status=ESTIMATED):estimated,countDistinct(userId,day):userDays&$groupBy=projectId",
+);
+// controls.$select[2] → { $fn: 'count', $field: '*', $as: 'estimated', $where: { status: 'ESTIMATED' } }
+// controls.$select[3] → { $fn: 'countDistinct', $field: ['userId', 'day'], $as: 'userDays' }
+```
+
+Aggregate the result of another aggregate with `$from=( … )`, the inner level of a two-level aggregate. The root controls read its columns:
+
+```ts
+const { controls } = parseUrl(
+  "$from=($groupBy=userId,day&$select=bucket(createdAt,day):day,count(*):n)&$groupBy=userId&$select=userId,avg(n):avgPerDay",
+);
+// controls.$from → { $groupBy: ['userId', 'day'], $select: [{ $bucket: 'day', … }, { $fn: 'count', … $as: 'n' }] }
+```
+
+See [conditional aggregates](./packages/url/README.md#conditional-aggregates-fnfieldfilteralias) and [two-level aggregates](./packages/core/README.md#two-level-aggregates-from).
+
 ## URL Builder
 
 Build URL query strings from `Uniquery` objects — the inverse of `parseUrl`. Available as a separate entry point for optimal bundle size in UI apps:

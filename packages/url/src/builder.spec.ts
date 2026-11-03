@@ -1703,3 +1703,121 @@ describe('buildUrl – null placement', () => {
     expect(rel.controls).toEqual({ $sort: { date: -1 }, $nulls: { date: 'last' }, $limit: 5 })
   })
 })
+
+describe('buildUrl – countDistinct over several fields and conditional aggregates', () => {
+  it('emits countDistinct(a,b) and fn(field|<where>):alias', () => {
+    expect(
+      buildUrl({
+        controls: {
+          $groupBy: ['g'],
+          $select: [
+            'g',
+            { $fn: 'countDistinct', $field: ['a', 'b'] },
+            { $fn: 'countDistinct', $field: ['a.b', 'c'], $as: 'n' },
+            { $fn: 'count', $field: '*', $as: 'open', $where: { status: 'open', $or: [{ x: 1 }, { y: { $in: ['p', 'q r'] } }] } },
+            { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'rev', $where: { paid: true } },
+          ],
+        },
+      }),
+    ).toBe(
+      "$select=g,countDistinct(a,b),countDistinct(a.b,c):n,count(*|status=open&(x=1^y{p,'q r'})):open,sum(price*qty|paid=true):rev&$groupBy=g",
+    )
+  })
+
+  it('round-trips every new $select form, also through a real URL', () => {
+    const query: Uniquery = {
+      filter: { projectId: 7 },
+      controls: {
+        $groupBy: ['g'],
+        $select: [
+          'g',
+          { $fn: 'countDistinct', $field: ['a', 'b'], $as: 'countDistinct_a_b' },
+          { $fn: 'count', $field: '*', $as: 'c1', $where: { $not: { s: { $in: ['a|b', "it's (x)", '50%', 'a&b', 'h#1'] } } } },
+          { $fn: 'countDistinct', $field: ['u', 'v'], $as: 'c2', $where: { $or: [{ a: { $gte: 1, $lt: 5 } }, { b: { $exists: false } }] } },
+          { $fn: 'first', $field: 't', $as: 'c3', $where: { t: { $regex: '/^x|y$/i' } } },
+          { $fn: 'avg', $expr: { $op: '+', $args: ['a', { $op: '-', $args: ['b'] }] }, $as: 'c4', $where: { z: null } },
+        ],
+        $rowOrder: { t: 1 },
+      },
+    }
+    for (const r of [roundTrip(query), roundTripViaUrl(query)]) {
+      expect(r.filter).toEqual(query.filter)
+      expect(r.controls.$select).toEqual(query.controls!.$select)
+    }
+  })
+
+  it('an always-true $where is dropped; one matching no row cannot be expressed', () => {
+    expect(buildUrl({ controls: { $select: [{ $fn: 'count', $field: '*', $where: {} }] } })).toBe('$select=count(*)')
+    expect(() => buildUrl({ controls: { $select: [{ $fn: 'count', $field: '*', $as: 'n', $where: { $or: [] } }] } })).toThrow(
+      'The $where of "n" matches no row; it cannot be expressed in a URL',
+    )
+  })
+
+  it('a conditional aggregate needs a $as alias', () => {
+    expect(() => buildUrl({ controls: { $select: [{ $fn: 'count', $field: '*', $where: { a: 1 } }] } })).toThrow(
+      /needs a \$as alias/,
+    )
+  })
+})
+
+describe('buildUrl – two-level aggregates ($from)', () => {
+  const nested: Uniquery = {
+    filter: { projectId: 7, status: { $ne: 'deleted' } },
+    controls: {
+      $from: {
+        $groupBy: ['userId', 'day'],
+        $select: [
+          { $bucket: 'day', $field: 'createdAt', $tz: 'Europe/Berlin', $as: 'day' },
+          { $fn: 'count', $field: '*', $as: 'n' },
+          { $fn: 'count', $field: '*', $as: 'est', $where: { status: 'ESTIMATED', note: '50% & (more)' } },
+          { $fn: 'countDistinct', $field: ['ticketId', 'kind'], $as: 'pairs' },
+          { $fn: 'last', $field: 'title', $as: 'lastTitle' },
+        ],
+        $rowOrder: { createdAt: -1, id: 1 },
+        $nulls: { createdAt: 'last' },
+        $having: { n: { $gt: 0 }, est: { $lt: 100 } },
+      },
+      $groupBy: ['userId'],
+      $select: ['userId', { $fn: 'avg', $field: 'n', $as: 'avgDaily' }, { $fn: 'count', $field: '*', $as: 'busy', $where: { n: { $gt: 3 } } }],
+      $having: { avgDaily: { $gt: 1 }, busy: { $gte: 2 } },
+      $sort: { avgDaily: -1 },
+      $limit: 10,
+      $count: true,
+    },
+  }
+
+  it('emits $from=( … ) first, its body built like a $with body', () => {
+    expect(buildUrl(nested)).toBe(
+      'projectId=7&status!=deleted' +
+        "&$from=($select=bucket(createdAt,day,'Europe/Berlin'):day,count(*):n,count(*|status=ESTIMATED&note='50%2525 %2526 %2528more%2529'):est,countDistinct(ticketId,kind):pairs,last(title):lastTitle" +
+        '&$groupBy=userId,day&$having=(n>0&est<100)&$rowOrder=-createdAt:last,id)' +
+        '&$select=userId,avg(n):avgDaily,count(*|n>3):busy&$groupBy=userId&$having=(avgDaily>1&busy>=2)&$sort=-avgDaily&$limit=10&$count',
+    )
+  })
+
+  it('round-trips, also through a real URL', () => {
+    for (const r of [roundTrip(nested), roundTripViaUrl(nested)]) {
+      expect(r.filter).toEqual(nested.filter)
+      expect(r.controls).toEqual(nested.controls)
+    }
+  })
+
+  it('refuses a $from inside a $with relation (only valid at the top level)', () => {
+    const query: Uniquery = {
+      controls: {
+        $with: [{ name: 'tickets', filter: {}, controls: { $from: { $groupBy: ['u'] }, $select: [{ $fn: 'max', $field: 'n', $as: 'm' }] } }],
+      },
+    }
+    expect(() => buildUrl(query)).toThrow('$with relation "tickets" has a $from; $from is only valid at the top level of a query')
+  })
+
+  it('refuses a $from that a URL cannot carry', () => {
+    expect(() => buildUrl({ controls: { $from: 'x' } })).toThrow('$from must be an object of $groupBy, $select, $having, $rowOrder and $nulls')
+    expect(() => buildUrl({ controls: { $from: { $groupBy: ['a'], $sort: { a: 1 } } } })).toThrow(
+      '$sort cannot be expressed inside $from in a URL — $from takes $groupBy, $select, $having, $rowOrder and $nulls',
+    )
+    expect(() => buildUrl({ controls: { $from: { $groupBy: ['a'], $from: { $groupBy: ['b'] } } } })).toThrow(
+      /\$from cannot be expressed inside \$from/,
+    )
+  })
+})

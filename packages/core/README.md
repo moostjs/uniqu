@@ -206,13 +206,14 @@ const query: Uniquery = {
 }
 ```
 
-`AggregateExpr` has three fields:
+`AggregateExpr` has these fields:
 
 ```ts
 interface AggregateExpr {
   $fn: AggregateFn | (string & {})  // 'sum' | 'count' | 'countDistinct' | 'avg' | 'min' | 'max' | 'first' | 'last' | custom
-  $field: string                     // field name, or '*' for count(*)
-  $as?: string                       // optional alias for the result
+  $field: string | readonly string[] // field name, '*' for count(*), or a list of fields (countDistinct only)
+  $as?: string                       // alias for the result; required with $where
+  $where?: FilterExpr                // conditional aggregate: only matching rows are aggregated
 }
 ```
 
@@ -220,9 +221,33 @@ Known functions are `sum`, `count`, `countDistinct`, `avg`, `min`, `max`, `first
 
 `countDistinct` counts the distinct non-null values of `$field`; the result is a number. In `AggregateControls` it may target a dimension or a measure field (other aggregates take measures only). Only `count` accepts `'*'` (`STAR_AGGREGATE_FNS`): `countDistinct(*)` is not valid.
 
+**`countDistinct` over several fields.** `$field` may be a list of fields for `countDistinct` only (every other function takes one field). It counts distinct combinations, and a row where any listed field is NULL is not counted, as SQL's `COUNT(DISTINCT a, b)` does. The list must be non-empty, with distinct field names and no `'*'`; a one-field list is the same as the field.
+
+```ts
+{ $fn: 'countDistinct', $field: ['userId', 'day'], $as: 'userDays' }
+```
+
+Its default alias joins the fields with `_`: `countDistinct_userId_day`. That can equal the default alias of a single field named `userId_day`, so `resolveBuckets` rejects a field-list alias that duplicates another computed alias or names a field. Give it a `$as` when it shares a query with such a field.
+
+**Conditional aggregates (`$where`).** Any aggregate, including `count` over `'*'`, `countDistinct`, `first` / `last` and the expression aggregates below, may carry `$where`: a `FilterExpr` in the same language as the query `filter`. Only the rows matching it are counted or summed, while the group still holds every row the query filter keeps. A conditional aggregate needs an explicit `$as`, because its default alias would equal the unconditional one. `$where` is not valid on a calendar bucket or a group-level expression.
+
+```ts
+{
+  $groupBy: ['projectId'],
+  $select: [
+    'projectId',
+    { $fn: 'count', $field: '*', $as: 'total' },
+    { $fn: 'count', $field: '*', $as: 'estimated', $where: { status: 'ESTIMATED' } },
+    { $fn: 'sum', $field: 'hours', $as: 'billable', $where: { $or: [{ billable: true }, { kind: 'support' }] } },
+  ],
+}
+```
+
+In `AggregateControls<T>` the condition is typed as `FilterExpr<T>`. `computeInsights` reports its fields exactly like `filter` fields (comparison operators, relational predicates), so a gate that checks which fields may be filtered covers conditional aggregates too: a condition cannot probe a field the filter could not. Validation checks the condition's whole structure (`$and` / `$or` are lists of filter objects, `$not` is a filter object, a field holds a value or an operator object, recursively).
+
 Aliases starting with `__as_` (`RESERVED_ALIAS_PREFIX`) are reserved for the engine's internal column names and rejected. A `$select` expression may refer to other aliases, but a chain of more than 1024 expressions referring to each other (`MAX_EXPR_CHAIN`) is rejected as too deep.
 
-Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`, `countDistinct(customerId)` → `countDistinct_customerId`). `resolveAlias(expr)` applies that rule for aggregates and buckets alike — use it instead of re-deriving aliases.
+Without `$as`, an entry's alias is `${fn}_${field}` (`count(*)` → `count_star`, `countDistinct(customerId)` → `countDistinct_customerId`, `countDistinct` over `['a', 'b']` → `countDistinct_a_b`). `resolveAlias(expr)` applies that rule for aggregates and buckets alike — use it instead of re-deriving aliases.
 
 #### Arithmetic expressions (`ArithExpr`)
 
@@ -244,7 +269,7 @@ Two `$select` entry kinds use it; both require `$as`:
 { $expr: { $op: '/', $args: ['est', 'open'] }, $as: 'avgEst' }                  // SelectArithExpr: group-level
 ```
 
-A row-level expression's names are fields of the row. A group-level expression's names are the aliases of other numeric entries (aggregates, `first` / `last`, other expressions, in any order, without cycles) or plain `$groupBy` fields; it is evaluated after grouping, and an inline aggregate call (`sum(a)/count(*)`) is not part of the grammar. Both entry kinds are valid in grouped queries only, and an expression alias cannot be a `$groupBy` entry. Results are typed `number | null` in `AggregateResult`. `isAggregateOfExpr` and `isSelectArithExpr` tell the kinds apart (`isAggregateExpr` stays strict: it needs a string `$field`). `NumericKeys<T>` lists the number-valued keys of `T`.
+A row-level expression's names are fields of the row. A group-level expression's names are the aliases of other numeric entries (aggregates, `first` / `last`, other expressions, in any order, without cycles) or plain `$groupBy` fields; it is evaluated after grouping, and an inline aggregate call (`sum(a)/count(*)`) is not part of the grammar. Both entry kinds are valid in grouped queries only, and an expression alias cannot be a `$groupBy` entry. Results are typed `number | null` in `AggregateResult`. `isAggregateOfExpr` and `isSelectArithExpr` tell the kinds apart (`isAggregateExpr` stays strict: it needs a `$field` that is a string or a list of strings). `NumericKeys<T>` lists the number-valued keys of `T`.
 
 One grammar serves JSON users and the URL:
 
@@ -313,7 +338,7 @@ const query: Uniquery = {
 
 Validation that needs no schema lives here, so every consumer rejects the same inputs with the same wording. `resolveBuckets(controls)` returns `{ ok: true, buckets, exprs, rowOrder? }` or `{ ok: false, issues: [{ path, message }] }` — it rejects unknown units, zones and week starts, a `$weekStart` on a non-week unit, a bucket outside a grouped query or missing from `$groupBy`, duplicate aliases, `$select` entries that are neither a field, an aggregate nor a bucket, and aggregates that fail `validateAggregateExpr`. Pass `{ isField: (name) => boolean }` to also reject an alias that collides with a real field of your schema (by default only fields selected in `$select` are checked), `{ aggregate: true }` when the query is grouped by other means, and `{ fns: AGGREGATE_FNS }` (or your own list) to reject unknown aggregate functions. `checkTimeZone(tz)` validates a zone and returns its canonical spelling (an alias such as `'US/Eastern'` is rejected with a hint naming `'America/New_York'`). Which fields may be bucketed (for example only timestamp-typed ones) is up to the consumer.
 
-`validateAggregateExpr(expr, { fns? })` checks one aggregate: its `$fn` is in `fns` (only when given — by default any name passes, so custom functions work), and a known function other than `count` is not applied to `'*'`. It returns `{ ok: true }` or `{ ok: false, message }`.
+`validateAggregateExpr(expr, { fns? })` checks one aggregate: its `$fn` is in `fns` (only when given — by default any name passes, so custom functions work), a known function other than `count` is not applied to `'*'`, a field list is used only by `countDistinct` (non-empty, distinct names, no `'*'`), and a `$where` is a filter object on an entry with a `$as`. It returns `{ ok: true }` or `{ ok: false, message }`.
 
 `resolveBuckets` also validates the arithmetic entries and `first` / `last` (rules above): `exprs` lists the arithmetic entries as `{ alias, expr, names, level: 'row' | 'group', fn? }`, row-level first, then group-level in dependency order (a cycle is reported as `Expression cycle: a → b → a`); `rowOrder` is `[{ field, desc, nulls? }]` when `first` / `last` is used, with `nulls` taken from the query's `$nulls`. Pass `$rowOrder` (and `$nulls`) in the controls; a `$nulls` that is not an object, or an entry for a `$rowOrder` key that is not `'first'` / `'last'`, is reported under `$nulls` (entries for other keys are not checked). It reports an expression alias that collides with a field or another alias, an operand that is not an alias or `$groupBy` field, a bucket alias used as an operand, grouping by an expression alias, and a missing or superfluous `$rowOrder`. Whether an operand is numeric is the caller's rule. Issue paths are `$select`, `$groupBy`, `$rowOrder` or `$nulls`.
 
@@ -374,6 +399,76 @@ Insights record **source fields**, never aliases: an alias used in `$having`, `$
 ```
 
 Up to 0.1.8 an alias used in `$having` was recorded as if it were a field (`'total' => Set { '$having' }`).
+
+A field list records each field under `countDistinct` (and an alias reference to it records each field). The fields of a `$where` condition are recorded with their comparison operators, exactly as `filter` fields are, so a filter gate covers them:
+
+```ts
+// { $fn: 'count', $field: '*', $as: 'estimated', $where: { status: 'ESTIMATED' } }
+// '*'      => Set { 'count' }
+// 'status' => Set { '$eq' }
+```
+
+#### Two-level aggregates (`$from`)
+
+An aggregate over the result of another aggregate: "the average number of tickets per user per day", "how many users had more than three open tickets", "users by the month of their first ticket". `controls.$from` holds the **inner level**, a grouped aggregate over the table's rows. The root controls are the **outer level**: they aggregate the inner rows.
+
+```ts
+import type { NestedAggregateQuery } from '@uniqu/core'
+
+const query: NestedAggregateQuery<Ticket> = {
+  filter: { projectId: 7 },                                  // narrows the rows the inner level groups
+  controls: {
+    $from: {
+      $groupBy: ['userId', 'day'],
+      $select: [
+        { $bucket: 'day', $field: 'createdAt', $as: 'day' },
+        { $fn: 'count', $field: '*', $as: 'n' },
+        { $fn: 'count', $field: '*', $as: 'open', $where: { status: 'open' } },
+      ],
+    },
+    $groupBy: ['userId'],
+    $select: [
+      'userId',
+      { $fn: 'avg', $field: 'n', $as: 'avgPerDay' },
+      { $fn: 'count', $field: '*', $as: 'busyDays', $where: { open: { $gt: 3 } } },
+    ],
+    $sort: { avgPerDay: -1 },
+    $limit: 10,
+  },
+}
+// → rows like { userId: 'u1', avgPerDay: 2.5, busyDays: 1 }
+```
+
+- **Inner level (`$from`)**: `$groupBy` (required and non-empty), `$select` (aggregates, field lists, conditions, buckets, expressions), `$having`, `$rowOrder` / `$nulls` for `first` / `last`. Nothing else: no `$sort`, `$limit`, `$skip`, `$count`, `$with` or `$search`, and no `$from` (the depth is fixed at two). The query's `filter` (and `$search`) apply to the rows it groups. It reads the table like a standalone grouped query, so every check a grouped query passes applies to it.
+- **Inner columns**: every inner `$groupBy` key (selected or not) plus every computed inner `$select` alias. These are the only names the outer level can read.
+- **Outer level (root controls)**: `$groupBy`, `$select`, `$having`, `$rowOrder` / `$nulls`, `$sort`, `$skip`, `$limit`, `$count`. Every name it reads is an inner column: `$groupBy` entries, plain `$select` entries, aggregate `$field`s and field lists, expression operands, bucket sources, `$where` keys and `$rowOrder` keys. It may group by an inner alias (`$groupBy: ['n']`: users per daily count) and bucket an inner timestamp column (`{ $bucket: 'month', $field: 'firstAt' }` over an inner `min(createdAt):firstAt`). `count` over `'*'` counts inner rows. Without `$groupBy` (or with an empty one) the outer level returns one row over all inner rows. A plain outer `$select` entry must be an outer `$groupBy` key. `$having` and `$sort` name the outer result: outer `$groupBy` keys and outer `$select` aliases, all with distinct names.
+- Field lists and `$where` work at both levels. At the outer level, `$where` keys and `$field` names are inner columns.
+- `$from` is valid at the top level of a query only, never inside a `$with` relation.
+
+> **Server contract.** A server MUST run `resolveNested` whenever `controls.$from !== undefined`, and MUST reject `$from` wherever it does not support it: on an engine without two-level aggregates, and inside every `$with` relation. An engine that ignores `$from` runs the root controls against the table.
+
+`resolveNested(controls, opts?)` validates the shape without a schema and resolves both levels. It returns `{ ok: true, columns, inner, outer }` or `{ ok: false, issues }`. `columns` lists the inner columns as `{ name, kind: 'key' | 'bucket' | 'aggregate' | 'expr', numeric? }`. `inner` and `outer` are what `resolveBuckets` returns for each level (`buckets`, `exprs`, `rowOrder?`). The shape issues carry a machine-readable `code` (`NestedIssueCode`):
+
+| Code | When |
+|------|------|
+| `AGG_NESTED_CONTROL` | `$from` is not an object; a control other than those listed in `NESTED_STAGE_CONTROLS` sits inside it; the root has `$with`; a control has the wrong type (an object-form `$select`, a `$groupBy` that is not a list, a `$having` / `$sort` / `$rowOrder` / `$nulls` that is not an object, a malformed `$having` filter); or a `$nulls` key is not ordered by (`$sort` / `$rowOrder` outside, `$rowOrder` inside `$from`) |
+| `AGG_NESTED_DEPTH` | a `$from` inside `$from` |
+| `AGG_NESTED_UNGROUPED` | the inner `$groupBy` is missing or empty |
+| `AGG_NESTED_DUPLICATE_COLUMN` | two inner columns share a name: an alias equal to a `$groupBy` key, or two equal aliases (`count(*)` twice defaults to `count_star` twice). Likewise for the outer result columns |
+| `AGG_NESTED_UNKNOWN_COLUMN` | the outer level reads a name that is not an inner column, a plain outer `$select` entry is not an outer `$groupBy` key, or its `$having` / `$sort` names something that is not an outer column. The message is the same whether or not the name is a table field, so it cannot be used to probe the schema |
+| `AGG_NESTED_NOT_NUMERIC` | outer `sum` / `avg`, an expression operand or a bucket source is an inner column known not to hold numbers: a bucket label, or a key / `min` / `max` / `first` / `last` column over a field that `isNumericField` rules out |
+
+The inner level's own issues (an unknown unit, a missing `$rowOrder`, …) keep their `resolveBuckets` messages under a `$from.` path (`$from.$select`). Outer issues use the plain control path. Options: `isField` (the table's fields, for inner alias collisions, as in `resolveBuckets`), `fns` (allowed functions at both levels), and `isNumericField(field)` so the numeric check also covers keys and `min` / `max` / `first` / `last` columns. Field capabilities and schema types stay the caller's rules, as for single-level queries: run the inner level's capability gate **before** `resolveNested`, and have `isNumericField` return `undefined` for a field the request may not see (a `true` / `false` answer shows in the issues and would reveal the field's type). `resolveNested` never throws on malformed controls; every problem is an issue.
+
+`computeInsights` follows the levels and fails closed. For a query with `$from` at the top level, it reports the `filter`, the inner level's fields, and every root name that is not a computed alias of either level, with its usual operator. Inner `$groupBy` keys are table fields anyway, and an engine that ignored `$from` would read any other root name from the table. Inner and outer aliases are not reported. A gate that checks insights against the table is therefore safe even for a consumer that never calls `resolveNested`. A `$from` inside a `$with` relation (or a `$from` that is not an object) is not treated as a level: everything is reported, plus the marker `'$from' => { '$from' }`.
+
+Types: `NestedAggregateQuery<T, D, M>` / `NestedAggregateControls<T, D, M>` (`$from: AggregateStage<T, D, M>`, outer names typed `string`), and `AggregateControls.$from?: never`, so a two-level query never matches a single-level signature. `StageRow<T, Stage>` is the inner row type (its `$groupBy` dimensions plus its `$select` entries) and `NestedAggregateResult<T, Q>` the outer row. `ValidNested<T, Q>` is the `ValidGroupBy` of a two-level query: it rejects an inner `$groupBy` entry that is neither a dimension nor an inner bucket alias, outer names that are not inner columns (including `$where` keys and field lists), and `sum` / `avg` / expression operands over non-numeric inner columns:
+
+```ts
+declare function aggregate<const Q extends NestedAggregateQuery<Ticket>>(
+  q: Q & ValidNested<Ticket, Q>,
+): NestedAggregateResult<Ticket, Q>[]
+```
 
 ## Type-Safe Filters
 
@@ -553,6 +648,8 @@ computeInsights({ ticket: { $some: { status: 'open', team: { $none: { name: 'x' 
 
 Use cases: field whitelisting, operator auditing, index planning, relation validation.
 
+`computeInsights` never throws. A part of the query it cannot read is reported under the control's own name, with that name as the operator: `'$where' => { '$where' }` for a `$where` that is not a filter object, and likewise `$filter`, `$having`, `$select`, `$groupBy`, `$sort`, `$rowOrder`, `$with` and `$from`. A field name never starts with `$`, so a gate that checks insight keys against the table's fields rejects such a query. A string `$groupBy` is reported as one field.
+
 ### `getInsights`
 
 `getInsights` returns pre-computed insights when present on the query, or computes them lazily:
@@ -586,19 +683,23 @@ const insights = getInsights(query)
 | `AggregateOfExpr` | `{ $fn: 'sum' \| 'avg' \| 'min' \| 'max', $expr, $as }`: aggregate over a per-row expression |
 | `SelectArithExpr` | `{ $expr, $as }`: group-level arithmetic over aliases / `$groupBy` fields |
 | `NumericKeys<T>` | Keys of `T` whose value is a number (optionally null / undefined) |
-| `AggregateExpr<Fn, Field, Alias>` | `{ $fn, $field, $as? }` — aggregate function call in `$select`. Generic params preserve literal types for result inference |
+| `AggregateExpr<Fn, Field, Alias, Where>` | `{ $fn, $field, $as?, $where? }` — aggregate function call in `$select`; `$field` is a field, `'*'`, or (for `countDistinct`) a list of fields. Generic params preserve literal types for result inference |
 | `SelectExpr<T>` | `((keyof T & string) \| AggregateExpr)[] \| Record<keyof T & string, 0 \| 1>` |
 | `UniqueryControls<T>` | Pagination, sorting, projection, grouping, `$having` — `$select`/`$sort`/`$nulls`/`$groupBy` constrained to `keyof T` when typed |
 | `NullsPlacement` | `'first' \| 'last'` — a `$nulls` entry |
 | `Uniquery<T>` | `{ name?, filter, controls, insights? }` — root query (no name) or nested relation (with name) |
 | `TypedWithRelation<Nav>` | Typed `$with` entry — `keyof Nav & string` or object with typed filter/controls |
 | `WithRelation` | Untyped `$with` relation with `{ name: string, filter?, controls?, insights? }` |
-| `AggregateSelectExpr<D, M>` | Aggregate allowed in a typed `$select` — `count` over a measure or `'*'`, `countDistinct` over a dimension or measure, the rest over a measure |
-| `AggregateControls<T, D, M>` | Typed aggregate controls — `$groupBy` required, `$with` forbidden, `$select` constrained to dimensions, `AggregateSelectExpr<D, M>` and buckets |
+| `AggregateSelectExpr<D, M, W>` | Aggregate allowed in a typed `$select` — `count` over a measure or `'*'`, `countDistinct` over dimensions or measures (one or a list), the rest over a measure; `W` types `$where` |
+| `AggregateControls<T, D, M>` | Typed aggregate controls — `$groupBy` required, `$with` and `$from` forbidden, `$select` constrained to dimensions, `AggregateSelectExpr<D, M, FilterExpr<T>>` and buckets |
+| `AggregateStage<T, D, M>` | The inner level of a two-level aggregate (`$from`): `$groupBy`, `$select`, `$having`, `$rowOrder`, `$nulls` |
+| `NestedAggregateControls<T, D, M>` / `NestedAggregateQuery<T, D, M>` | Two-level aggregate: `$from` plus the outer controls over inner columns |
+| `StageRow<T, Stage>` / `NestedAggregateResult<T, Q>` | Inner row type / outer result row type of a two-level aggregate |
+| `ValidNested<T, Q>` | Signature check for two-level aggregates: inner `$groupBy`, outer names against inner columns, numeric operands |
 | `AggregateQuery<T, D, M>` | Typed aggregate query — `{ filter?, controls, insights? }` with dimension/measure constraints |
 | `AggregateResult<T, Select>` | Infer result row type from `$select` — dimensions preserve original types, aggregates → `number` (min/max/first/last preserve field type), expressions → `number \| null` |
-| `ResolveAlias<A>` | Resolve the output alias of an `AggregateExpr` — uses `$as` if provided, otherwise `{fn}_{field}` |
-| `InsightOp` | `ComparisonOp \| RelationOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| '$having' \| AggregateFn \| string` |
+| `ResolveAlias<A>` | Resolve the output alias of an `AggregateExpr` — uses `$as` if provided, otherwise `{fn}_{field}` (a field list joined with `_`) |
+| `InsightOp` | `ComparisonOp \| RelationOp \| '$select' \| '$order' \| '$with' \| '$groupBy' \| '$having' \| AggregateFn \| string` (plus the unreadable-control markers, see [Lazy Insights](#lazy-insights)) |
 | `UniqueryInsights` | `Map<string, Set<InsightOp>>` |
 
 ### Functions
@@ -621,7 +722,9 @@ const insights = getInsights(query)
 | `arithNames` / `arithNullable` / `validateArith` | see [Arithmetic expressions](#arithmetic-expressions-arithexpr) | Names, nullability and schema-free validation (limits `ARITH_MAX_NODES` 64, `ARITH_MAX_DEPTH` 16) |
 | `isAggregateOfExpr` / `isSelectArithExpr` | `(v: unknown) => v is …` | Type guards for the expression `$select` entries |
 | `STAR_AGGREGATE_FNS` | `readonly AggregateFn[]` | Known functions that accept `'*'` as `$field` (`count`) |
-| `validateAggregateExpr` | `(expr: AggregateExpr, opts?: { fns?: readonly string[] }) => AggregateExprCheck` | Schema-free aggregate check — `$fn` allow-list (when `fns` given) and the `'*'` rule; returns `{ ok: true }` or `{ ok: false, message }` |
+| `validateAggregateExpr` | `(expr: AggregateExpr, opts?: { fns?: readonly string[] }) => AggregateExprCheck` | Schema-free aggregate check — `$fn` allow-list (when `fns` given), the `'*'` rule, the field-list rule and the `$where` rule; returns `{ ok: true }` or `{ ok: false, message }` |
+| `resolveNested` | `(controls, opts?: ResolveNestedOptions) => NestedResolution` | Schema-free validation and resolution of a two-level aggregate (`$from`); issues carry a `NestedIssueCode` — see [Two-level aggregates](#two-level-aggregates-from) |
+| `NESTED_STAGE_CONTROLS` | `readonly string[]` | The controls a `$from` holds: `$groupBy`, `$select`, `$having`, `$rowOrder`, `$nulls` |
 
 ## License
 

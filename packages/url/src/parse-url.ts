@@ -1,5 +1,6 @@
 import {
   EXPR_AGGREGATE_FNS,
+  NESTED_STAGE_CONTROLS,
   TIME_ZONE_NAME_RE,
   computeInsights,
   isNullsPlacement,
@@ -60,16 +61,11 @@ function parseQuery(raw: string, nested: boolean): UrlQuery {
 
   for (const _p of parts) {
     const p = nested ? decodeLenient(_p) : decodeURIComponent(_p)
-    if (
-      /^\$[A-Za-z0-9_!]+/.test(p) &&
-      !p.startsWith('$exists=') &&
-      !p.startsWith('$!exists=')
-    )
-      controlParts.push(p)
+    if (isControlPart(p)) controlParts.push(p)
     else if (p.length) exprParts.push(p)
   }
 
-  const controls = handleControls(controlParts)
+  const controls = handleControls(controlParts, nested)
 
   const filter: FilterExpr = exprParts.length ? parseFilterExpr(exprParts.join('&')) : {}
 
@@ -78,6 +74,11 @@ function parseQuery(raw: string, nested: boolean): UrlQuery {
     controls,
     insights: computeInsights(filter, controls),
   }
+}
+
+/** Whether a decoded segment is a control (`$select=…`) rather than a filter term (`$exists=…` is a filter term). */
+function isControlPart(p: string): boolean {
+  return /^\$[A-Za-z0-9_!]+/.test(p) && !p.startsWith('$exists=') && !p.startsWith('$!exists=')
 }
 
 function decodeLenient(s: string): string {
@@ -91,26 +92,68 @@ function decodeLenient(s: string): string {
 /**
  * Split a raw query string into its top-level `&` segments, exactly as
  * {@link parseUrl} does: an `&` inside a parenthesized group
- * (`(a=1&b=2)^c=3`) does not separate. Segments are returned raw (not
- * percent-decoded); empty ones (from a leading, trailing or doubled `&`) are
- * kept. Use it to address the individual keys of a URL the parser reads, e.g.
- * to replace a query's own segments while keeping foreign ones.
+ * (`(a=1&b=2)^c=3`) does not separate, and neither does an `&`, `(` or `)`
+ * inside a quoted value (`name=')'&x=1`, `count(*|n='(a&b'):c`). A `'` opens a
+ * quoted value only at the start of a token — the string start, or after `=`,
+ * an operator, `(`, `,`, `|`, `^`, `&`, `{`, a space, tab or `+`, or after
+ * the percent-encoded form of one — and only when it is closed, so an apostrophe inside a word (`$search=it's`) is an ordinary
+ * character. Segments are returned raw (not percent-decoded); empty ones (from
+ * a leading, trailing or doubled `&`) are kept. Use it to address the
+ * individual keys of a URL the parser reads, e.g. to replace a query's own
+ * segments while keeping foreign ones.
  */
 export function splitUrlSegments(raw: string): string[] {
   return splitTopLevel(raw, '&')
 }
 
+/** Characters after which a `'` starts a quoted value (a token start, as the lexer sees it). */
+const QUOTE_OPENERS = new Set(['=', '<', '>', '~', '!', '(', ',', '|', '^', '&', '{', ' ', '\t', '+'])
 /**
- * Split a string by `sep` at the top level (ignoring separators inside balanced
- * parentheses and, with `quoteAware`, inside single-quoted strings).
+ * The same characters percent-encoded (`%3D'x'` from `encodeURIComponent`, which leaves `'` raw).
+ * Not listed: `+` (`%2B`) and tab (`%09`).
  */
-function splitTopLevel(str: string, sep: string, quoteAware = false): string[] {
+const ENCODED_OPENER_RE = /^%(?:3D|3C|3E|7E|21|28|2C|7C|5E|26|7B|20)$/iu
+
+/** Whether `str[i]` starts a token: the string start, or after a raw or percent-encoded opener. */
+function atTokenStart(str: string, i: number): boolean {
+  return (
+    i === 0 ||
+    QUOTE_OPENERS.has(str[i - 1]!) ||
+    (str.charCodeAt(i - 3) === 37 /* % */ && ENCODED_OPENER_RE.test(str.slice(i - 3, i)))
+  )
+}
+
+/**
+ * The one quote scanner of the URL splitters, for one `str`. Called at a `'`, `skipQuote(i)`
+ * returns the index of the `'` closing the quoted value that opens at `i`, or `i` itself when
+ * the quote opens none (not at a token start, or never closed). Once a quote never closes no
+ * later one can (the failed scan passed over each as escaped), so later scans are skipped: a
+ * run of quotes stays linear.
+ */
+function quoteScanner(str: string): (i: number) => number {
+  let unclosed = false
+  return (i) => {
+    if (unclosed || !atTokenStart(str, i)) return i
+    const close = closingQuote(str, i)
+    if (close < str.length) return close
+    unclosed = true
+    return i
+  }
+}
+
+/**
+ * Split a string by `sep` at the top level, ignoring separators inside balanced
+ * parentheses and inside quoted values (see {@link splitUrlSegments}).
+ */
+function splitTopLevel(str: string, sep: string): string[] {
   const parts: string[] = []
+  const skipQuote = quoteScanner(str)
   let depth = 0
   let start = 0
 
   for (let i = 0; i < str.length; i++) {
-    if (quoteAware && str[i] === "'") i = closingQuote(str, i)
+    // A skipped quoted value ends on its closing `'`, which matches none of the branches below.
+    if (str[i] === "'") i = skipQuote(i)
     else if (str[i] === '(') depth++
     else if (str[i] === ')') depth--
     else if (str[i] === sep && depth === 0) {
@@ -135,8 +178,8 @@ function closingQuote(str: string, open: number): number {
 const ALIAS_SRC = '[\\w.]+'
 /** `:alias` — the whole text after a `$select` call. */
 const ALIAS_RE = new RegExp(`^:(${ALIAS_SRC})$`, 'u')
-/** `fn(field)[:alias]` / `fn(*)[:alias]` — a plain aggregate item. */
-const AGG_RE = new RegExp(`^(\\w+)\\((\\*|[\\w.]+)\\)(?::(${ALIAS_SRC}))?$`)
+/** `*`, `field` or `a,b,…` — the argument of a plain aggregate item (`fn(field)[:alias]`). */
+const FIELD_LIST_RE = /^(?:\*|[\w.]+)(?:,(?:\*|[\w.]+))*$/u
 
 /** The `alias` of `:alias`, or `undefined` when `rest` is not exactly that. */
 function parseAlias(rest: string): string | undefined {
@@ -148,14 +191,15 @@ const UNBALANCED = -1
 const NESTED_PAREN = -2
 
 /**
- * Index of the `)` closing the `(` at `open`, skipping single-quoted strings.
+ * Index of the `)` closing the `(` at `open`, skipping quoted values (see {@link splitUrlSegments}).
  * With `nested` an inner `(…)` is balanced (`coalesce(a,0)`); without it an inner
  * `(` gives {@link NESTED_PAREN}. {@link UNBALANCED} when never closed.
  */
 function findCloseParen(str: string, open: number, nested: boolean): number {
+  const skipQuote = quoteScanner(str)
   let depth = 0
   for (let i = open; i < str.length; i++) {
-    if (str[i] === "'") i = closingQuote(str, i)
+    if (str[i] === "'") i = skipQuote(i)
     else if (str[i] === '(') {
       if (!nested && depth > 0) return NESTED_PAREN
       depth++
@@ -185,9 +229,12 @@ function fail(item: string, why: string): never {
 function parseBucket(item: string): BucketExpr {
   const open = item.indexOf('(')
   const close = findCloseParen(item, open, false)
+  if (close > 0 && item.slice(open, close).includes('|')) {
+    throw new SyntaxError(`Malformed $select item "${item}": a condition applies to aggregates only`)
+  }
   if (close === NESTED_PAREN) fail(item, 'unexpected "("')
   if (close === UNBALANCED) fail(item, 'missing ")"')
-  const args = splitTopLevel(item.slice(open + 1, close), ',', true)
+  const args = splitTopLevel(item.slice(open + 1, close), ',')
   if (args.length < 2) fail(item, 'expected bucket(field,unit[,tz][,weekStart])')
   if (args.length > 4) fail(item, 'too many arguments')
   const [field, unit, tz, weekStart] = args
@@ -239,9 +286,13 @@ function splitCall(item: string): SelectCall | undefined {
  * downstream. A raw `+` and a decoded `%2B` both read as plus. `expr` is a reserved
  * name, like `bucket`.
  */
-function parseExprItem(item: string, call: SelectCall | undefined): SelectArithExpr | AggregateOfExpr {
-  if (!call) throw new SyntaxError(`Malformed $select item "${item}": missing ")"`)
+function parseExprItem(item: string, call: SelectCall, where?: FilterExpr): SelectArithExpr | AggregateOfExpr {
   const fn = EXPR_AGGREGATE_FNS.find((f) => f === call.name)
+  if (where && !fn) {
+    throw new SyntaxError(
+      `Malformed $select item "${item}": a condition applies to aggregates only — put it on the aggregates the expression reads`,
+    )
+  }
   if (call.name !== 'expr' && !fn) {
     throw new SyntaxError(
       `Malformed $select item "${item}": unknown function "${call.name}" — use ${EXPR_AGGREGATE_FNS.join('/')} or expr(<arith>)`,
@@ -257,7 +308,57 @@ function parseExprItem(item: string, call: SelectCall | undefined): SelectArithE
   } catch (e) {
     throw new SyntaxError(`Malformed $select item "${item}": ${(e as Error).message}`)
   }
-  return fn ? { $fn: fn, $expr: expr, $as: alias } : { $expr: expr, $as: alias }
+  if (!fn) return { $expr: expr, $as: alias }
+  return where ? { $fn: fn, $expr: expr, $as: alias, $where: where } : { $fn: fn, $expr: expr, $as: alias }
+}
+
+/**
+ * Parse a `$select` call item other than `bucket(…)`:
+ *
+ *   fn(field)[:alias]   fn(*)[:alias]   fn(a,b,…)[:alias]  → `{ $fn, $field, $as }`
+ *   fn(<arith>):alias   expr(<arith>):alias                → {@link parseExprItem}
+ *
+ * A field list is `countDistinct`'s only (several fields → `$field: [a, b]`; one field stays a
+ * string); `fn(*)` is passed through for core to validate. The default
+ * alias is `{fn}_{field}`, the fields of a list joined with `_` (`countDistinct_a_b`).
+ *
+ * Conditional aggregate: the text after the first `|` inside the call is a filter, the
+ * aggregate's `$where` (`count(*|status=open):openCount`, `sum(amount|status{a,b}&qty>1):s`,
+ * `sum(price*qty|paid=true):revenue`). It is parsed like `$having` (`&`, `^`, `!(…)`,
+ * groups, quoted values); the alias is required. A field list and an arithmetic argument
+ * never contain `|`, so the first one always starts the condition.
+ */
+function parseCallItem(item: string, call: SelectCall | undefined): AggregateExpr | SelectArithExpr | AggregateOfExpr {
+  if (!call) throw new SyntaxError(`Malformed $select item "${item}": missing ")"`)
+  const bar = call.arg.indexOf('|')
+  const head = bar === -1 ? call.arg : call.arg.slice(0, bar)
+  const where = bar === -1 ? undefined : parseWhere(item, call.arg.slice(bar + 1))
+  if (call.name === 'expr' || !FIELD_LIST_RE.test(head)) return parseExprItem(item, { ...call, arg: head }, where)
+  let alias: string | undefined
+  if (call.rest) {
+    alias = parseAlias(call.rest)
+    if (alias === undefined) throw new SyntaxError(`Malformed $select item "${item}": invalid alias`)
+  } else if (where) {
+    throw new SyntaxError(`Malformed $select item "${item}": a conditional aggregate needs an :alias`)
+  }
+  const fields = head.split(',')
+  if (fields.length > 1 && call.name !== 'countDistinct') {
+    throw new SyntaxError(`Malformed $select item "${item}": only countDistinct takes several fields`)
+  }
+  const field = fields.length === 1 ? fields[0] : fields
+  const expr: AggregateExpr = { $fn: call.name, $field: field, $as: alias ?? resolveAlias({ $fn: call.name, $field: field }) }
+  if (where) expr.$where = where
+  return expr
+}
+
+/** The `$where` filter of a conditional `$select` item: the text after its `|`. */
+function parseWhere(item: string, text: string): FilterExpr {
+  if (!text) throw new SyntaxError(`Malformed $select item "${item}": empty condition after "|"`)
+  try {
+    return parseFilterExpr(text)
+  } catch (e) {
+    throw new SyntaxError(`Malformed $select item "${item}": condition: ${(e as Error).message}`)
+  }
 }
 
 /** Lex + parse a raw filter expression string. */
@@ -267,6 +368,38 @@ function parseFilterExpr(raw: string) {
   const expr = parser.parseExpression()
   parser.expectEof()
   return expr
+}
+
+/**
+ * Parse the body of `$from=( … )`, the inner level of a two-level aggregate:
+ * `$groupBy`, `$select`, `$rowOrder` (with `:first` / `:last`) and `$having`, joined by `&`,
+ * read like a `$with` body (each segment decoded once more). A filter term inside is
+ * rejected — the query's filter applies to the rows the inner level groups — and so are
+ * other controls and a second level.
+ */
+function parseFromBody(value: string): UniqueryControls {
+  if (value[0] !== '(' || findCloseParen(value, 0, true) !== value.length - 1) {
+    throw new SyntaxError('Malformed $from: expected $from=( $groupBy=…&$select=… )')
+  }
+  const parts: string[] = []
+  for (const raw of splitUrlSegments(value.slice(1, -1))) {
+    const p = decodeLenient(raw)
+    if (!p) continue
+    if (!isControlPart(p)) {
+      throw new SyntaxError(
+        `Filter terms are not allowed inside $from ("${p}") — put the filter on the query itself; it applies to the rows $from groups`,
+      )
+    }
+    const eq = p.indexOf('=')
+    const key = eq === -1 ? p : p.slice(0, eq)
+    if (key === '$from') throw new SyntaxError('A $from cannot have its own $from — a query has two levels at most')
+    // `$nulls` passes on to handleControls, which explains the `:first` / `:last` suffix.
+    if (!NESTED_STAGE_CONTROLS.includes(key)) {
+      throw new SyntaxError(`${key} is not allowed inside $from — use $groupBy, $select, $rowOrder, $having or $nulls`)
+    }
+    parts.push(p)
+  }
+  return handleControls(parts)
 }
 
 /** Parse a single `$with` segment like `posts` or `posts($sort=-createdAt&status=active)`. */
@@ -309,7 +442,8 @@ function setNulls(controls: UniqueryControls, key: string, item: string, field: 
   nulls[field] = placement
 }
 
-function handleControls(parts: string[]): UniqueryControls {
+/** `nested`: the controls of a `$with` relation body, where `$from` is not valid. */
+function handleControls(parts: string[], nested = false): UniqueryControls {
   const controls = {} as UniqueryControls
 
   for (const raw of parts) {
@@ -318,6 +452,17 @@ function handleControls(parts: string[]): UniqueryControls {
     const value = eqIdx === -1 ? '' : raw.slice(eqIdx + 1)
 
     switch (key) {
+      case '$from': {
+        if (nested) {
+          throw new SyntaxError('$from is only valid at the top level of a query, not inside a $with relation')
+        }
+        if (controls.$from !== undefined) {
+          throw new SyntaxError('Duplicate $from: a two-level aggregate has one inner level')
+        }
+        controls.$from = parseFromBody(value)
+        break
+      }
+
       case '$with': {
         if (!value) break
         controls.$with ??= []
@@ -334,7 +479,7 @@ function handleControls(parts: string[]): UniqueryControls {
 
       case '$select': {
         // Top-level, quote-aware split: a bucket's argument list and quoted zone stay whole
-        const items = splitTopLevel(value, ',', true)
+        const items = splitTopLevel(value, ',')
         // Quick scan: determine form (array vs object)
         let hasExclusion = false
         let hasComputed = false
@@ -359,15 +504,7 @@ function handleControls(parts: string[]): UniqueryControls {
               arr.push(f)
               continue
             }
-            // `expr(<arith>):alias` and `fn(<arith>):alias`; a plain `fn(field)` is an aggregate.
-            const aggMatch = f.startsWith('expr(') ? null : AGG_RE.exec(f)
-            if (!aggMatch) {
-              arr.push(parseExprItem(f, splitCall(f)))
-              continue
-            }
-            const fn = aggMatch[1]
-            const field = aggMatch[2]
-            arr.push({ $fn: fn, $field: field, $as: aggMatch[3] ?? resolveAlias({ $fn: fn, $field: field }) })
+            arr.push(parseCallItem(f, splitCall(f)))
           }
           controls.$select = arr
         } else {

@@ -131,6 +131,16 @@ describe('splitUrlSegments', () => {
   it('keeps empty segments and does not decode', () => {
     expect(splitUrlSegments('&a=%20&')).toEqual(['', 'a=%20', ''])
   })
+
+  it('stays linear on a long run of quotes that never close', () => {
+    const body = `(${"\\'".repeat(200_000)})`
+    const started = performance.now()
+    expect(splitUrlSegments(`${body}&b=2`)).toEqual([body, 'b=2'])
+    // the same run opened by a quote at a token start, which scans to the end once
+    const opened = `(a='${"\\'".repeat(200_000)})`
+    expect(splitUrlSegments(`${opened}&b=2`)).toEqual([opened, 'b=2'])
+    expect(performance.now() - started).toBeLessThan(1000)
+  })
 })
 
 describe('parseUrl – projection / options keywords', () => {
@@ -1537,5 +1547,274 @@ describe('parseUrl – null placement suffix', () => {
   it('rejects $nulls as a URL control', () => {
     expect(() => parseUrl('$nulls=a:first')).toThrow('$nulls is not a URL control')
     expect(() => parseUrl('$with=posts($nulls=a)')).toThrow(SyntaxError)
+  })
+})
+
+describe('parseUrl – countDistinct over several fields', () => {
+  it('countDistinct(a,b) → a field list, default alias joined with _', () => {
+    const r = parseUrl('$select=region,countDistinct(customerId,day),countDistinct(a.b,c):pairs&$groupBy=region')
+    expect(r.controls.$select).toEqual([
+      'region',
+      { $fn: 'countDistinct', $field: ['customerId', 'day'], $as: 'countDistinct_customerId_day' },
+      { $fn: 'countDistinct', $field: ['a.b', 'c'], $as: 'pairs' },
+    ])
+    expect(r.insights.get('customerId')).toEqual(new Set(['countDistinct']))
+    expect(r.insights.get('day')).toEqual(new Set(['countDistinct']))
+    expect(r.insights.get('a.b')).toEqual(new Set(['countDistinct']))
+  })
+
+  it('a one-field list stays a string', () => {
+    expect(parseUrl('$select=countDistinct(a)').controls.$select).toEqual([
+      { $fn: 'countDistinct', $field: 'a', $as: 'countDistinct_a' },
+    ])
+  })
+
+  it('only countDistinct takes several fields', () => {
+    for (const bad of ['sum(a,b)', 'count(a,b):n', 'stddev(a,b):s', 'min(a,b)']) {
+      expect(() => parseUrl(`$select=${bad}`), bad).toThrow(/only countDistinct takes several fields/)
+    }
+  })
+
+  it('passes * inside a list through for core to reject (like fn(*))', () => {
+    expect(parseUrl('$select=countDistinct(a,*):n').controls.$select).toEqual([
+      { $fn: 'countDistinct', $field: ['a', '*'], $as: 'n' },
+    ])
+  })
+
+  it('rejects an invalid alias after a field list', () => {
+    expect(() => parseUrl('$select=countDistinct(a,b)x')).toThrow(/Malformed \$select item "countDistinct\(a,b\)x": invalid alias/)
+  })
+})
+
+describe('parseUrl – conditional aggregates (`fn(field|<filter>):alias`)', () => {
+  const sel = (qs: string) => parseUrl(qs).controls.$select
+
+  it('count(*|status=ESTIMATED):estimated', () => {
+    const r = parseUrl('$select=projectId,count(*|status=ESTIMATED):estimated&$groupBy=projectId')
+    expect(r.controls.$select).toEqual([
+      'projectId',
+      { $fn: 'count', $field: '*', $as: 'estimated', $where: { status: 'ESTIMATED' } },
+    ])
+    // $where fields are reported as filter usage
+    expect(r.insights.get('status')).toEqual(new Set(['$eq']))
+  })
+
+  it('every aggregate kind takes a condition: field, field list, expression', () => {
+    expect(
+      sel("$select=sum(amount|status{paid,refunded}&amount>0):s,countDistinct(a,b|x!=null):n,avg(price*qty|$exists=paidAt):r,first(title|title~=/^A/i):f"),
+    ).toEqual([
+      { $fn: 'sum', $field: 'amount', $as: 's', $where: { status: { $in: ['paid', 'refunded'] }, amount: { $gt: 0 } } },
+      { $fn: 'countDistinct', $field: ['a', 'b'], $as: 'n', $where: { x: { $ne: null } } },
+      { $fn: 'avg', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'r', $where: { paidAt: { $exists: true } } },
+      { $fn: 'first', $field: 'title', $as: 'f', $where: { title: { $regex: '/^A/i' } } },
+    ])
+  })
+
+  it('the condition takes the full filter grammar: OR, NOT, nested parentheses', () => {
+    expect(sel('$select=count(*|(a=1^b=2)&!(c=3^(d=4&e=5))):n')).toEqual([
+      {
+        $fn: 'count',
+        $field: '*',
+        $as: 'n',
+        $where: {
+          $and: [{ $or: [{ a: 1 }, { b: 2 }] }, { $not: { $or: [{ c: 3 }, { d: 4, e: 5 }] } }],
+        },
+      },
+    ])
+  })
+
+  it('escaped characters: quotes, a | and parentheses inside quoted values, percent-encoding', () => {
+    expect(sel("$select=count(*|name='it\\'s a|b (x)'):n,count(*|code='50%25'):m")).toEqual([
+      { $fn: 'count', $field: '*', $as: 'n', $where: { name: "it's a|b (x)" } },
+      { $fn: 'count', $field: '*', $as: 'm', $where: { code: '50%' } },
+    ])
+    // the whole item percent-encoded
+    expect(sel('$select=' + encodeURIComponent("count(*|s='a&b'):n"))).toEqual([
+      { $fn: 'count', $field: '*', $as: 'n', $where: { s: 'a&b' } },
+    ])
+  })
+
+  it('an & inside the condition does not split the query', () => {
+    const r = parseUrl('$select=count(*|a=1&b=2):n&c=3')
+    expect(r.controls.$select).toEqual([{ $fn: 'count', $field: '*', $as: 'n', $where: { a: 1, b: 2 } }])
+    expect(r.filter).toEqual({ c: 3 })
+  })
+
+  it('a condition needs an alias, a non-empty filter, and an aggregate', () => {
+    expect(() => parseUrl('$select=count(*|a=1)')).toThrow(/a conditional aggregate needs an :alias/)
+    expect(() => parseUrl('$select=count(*|):n')).toThrow(/empty condition after "\|"/)
+    expect(() => parseUrl('$select=count(*|a=):n')).toThrow(/Malformed \$select item "count\(\*\|a=\):n": condition: /)
+    expect(() => parseUrl('$select=expr(a/b|x=1):r')).toThrow(/a condition applies to aggregates only/)
+  })
+})
+
+describe('parseUrl – two-level aggregates ($from)', () => {
+  it('parses the inner level into controls.$from', () => {
+    const r = parseUrl(
+      'projectId=7&$from=($groupBy=userId,day&$select=bucket(createdAt,day):day,count(*):n&$having=n>0)&$groupBy=userId&$select=userId,avg(n):avgDaily&$sort=-avgDaily&$limit=5',
+    )
+    expect(r.filter).toEqual({ projectId: 7 })
+    expect(r.controls.$from).toEqual({
+      $groupBy: ['userId', 'day'],
+      $select: [
+        { $bucket: 'day', $field: 'createdAt', $as: 'day' },
+        { $fn: 'count', $field: '*', $as: 'n' },
+      ],
+      $having: { n: { $gt: 0 } },
+    })
+    expect(r.controls.$groupBy).toEqual(['userId'])
+    expect(r.controls.$select).toEqual(['userId', { $fn: 'avg', $field: 'n', $as: 'avgDaily' }])
+    expect(r.controls.$sort).toEqual({ avgDaily: -1 })
+    expect(r.controls.$limit).toBe(5)
+  })
+
+  it('reports the filter, the inner level, and root names that are not aliases (fail closed)', () => {
+    const r = parseUrl('projectId=7&$from=($groupBy=userId&$select=count(*|status=open):open)&$select=avg(open):a,count(*|secret>1):s&$sort=-a,cost')
+    expect([...r.insights.keys()].sort()).toEqual(['*', 'cost', 'projectId', 'secret', 'status', 'userId'])
+    expect(r.insights.get('secret')).toEqual(new Set(['$gt']))
+    expect(r.insights.get('cost')).toEqual(new Set(['$order']))
+  })
+
+  it('rejects $from inside a $with relation body', () => {
+    for (const qs of ['$with=rel($from=($groupBy=secret))', '$with=a($with=b($from=($groupBy=x)))']) {
+      expect(() => parseUrl(qs), qs).toThrow('$from is only valid at the top level of a query, not inside a $with relation')
+    }
+  })
+
+  it('$rowOrder with :first / :last inside $from', () => {
+    const r = parseUrl('$from=($groupBy=userId&$select=first(title):t&$rowOrder=-createdAt:last,id)&$select=count(*):n')
+    expect(r.controls.$from).toEqual({
+      $groupBy: ['userId'],
+      $select: [{ $fn: 'first', $field: 'title', $as: 't' }],
+      $rowOrder: { createdAt: -1, id: 1 },
+      $nulls: { createdAt: 'last' },
+    })
+    expect(r.controls.$nulls).toBeUndefined()
+  })
+
+  it('a grouped $having with & inside $from', () => {
+    const r = parseUrl('$from=($groupBy=g&$select=count(*):n&$having=(n>1&n<9))&$select=count(*):groups')
+    expect((r.controls.$from as Record<string, unknown>).$having).toEqual({ n: { $gt: 1, $lt: 9 } })
+  })
+
+  it('field lists and conditions inside $from', () => {
+    const r = parseUrl("$from=($groupBy=u&$select=countDistinct(a,b):p,count(*|s='x%2529'&t{1,2}):c)&$select=sum(c|p>1):total")
+    expect(r.controls.$from).toEqual({
+      $groupBy: ['u'],
+      $select: [
+        { $fn: 'countDistinct', $field: ['a', 'b'], $as: 'p' },
+        { $fn: 'count', $field: '*', $as: 'c', $where: { s: 'x)', t: { $in: [1, 2] } } },
+      ],
+    })
+    expect(r.controls.$select).toEqual([{ $fn: 'sum', $field: 'c', $as: 'total', $where: { p: { $gt: 1 } } }])
+  })
+
+  it('decodes the body once more than its segment, like a $with body', () => {
+    expect(parseUrl("$from=($groupBy=g&$select=count(*|s='%2541'):n)").controls.$from).toEqual({
+      $groupBy: ['g'],
+      $select: [{ $fn: 'count', $field: '*', $as: 'n', $where: { s: 'A' } }],
+    })
+    // the whole value encoded by URLSearchParams
+    const qs = new URLSearchParams({ $from: "($groupBy=g&$select=count(*|s='50%25'):n)" }).toString()
+    expect(parseUrl(qs).controls.$from).toEqual({
+      $groupBy: ['g'],
+      $select: [{ $fn: 'count', $field: '*', $as: 'n', $where: { s: '50%' } }],
+    })
+  })
+
+  it('rejects filter terms inside $from', () => {
+    expect(() => parseUrl('$from=($groupBy=g&status=open)')).toThrow(
+      'Filter terms are not allowed inside $from ("status=open") — put the filter on the query itself; it applies to the rows $from groups',
+    )
+    expect(() => parseUrl('$from=($groupBy=g&$exists=x)')).toThrow(/Filter terms are not allowed inside \$from/)
+    expect(() => parseUrl('$from=((a=1^b=2)&$groupBy=g)')).toThrow(/Filter terms are not allowed inside \$from/)
+  })
+
+  it('rejects a second $from, a $from inside $from and other controls inside', () => {
+    expect(() => parseUrl('$from=($groupBy=a)&$from=($groupBy=b)')).toThrow(
+      'Duplicate $from: a two-level aggregate has one inner level',
+    )
+    expect(() => parseUrl('$from=($groupBy=a&$from=($groupBy=b))')).toThrow(
+      'A $from cannot have its own $from — a query has two levels at most',
+    )
+    for (const ctl of ['$sort=a', '$limit=1', '$skip=1', '$count', '$with=rel', '$search=x']) {
+      expect(() => parseUrl(`$from=($groupBy=a&${ctl})`), ctl).toThrow(
+        /is not allowed inside \$from — use \$groupBy, \$select, \$rowOrder, \$having or \$nulls$/,
+      )
+    }
+    expect(() => parseUrl('$from=($groupBy=a&$nulls=x)')).toThrow(/\$nulls is not a URL control/)
+  })
+
+  it('rejects a body without parentheses or with text after them', () => {
+    for (const bad of ['$from=$groupBy=a', '$from=($groupBy=a', '$from=($groupBy=a)x', '$from=']) {
+      expect(() => parseUrl(bad), bad).toThrow(/Malformed \$from: expected \$from=\( \$groupBy=…&\$select=… \)/)
+    }
+  })
+
+  it('an empty body is an empty inner level (validation reports it)', () => {
+    expect(parseUrl('$from=()&$select=count(*):n').controls.$from).toEqual({})
+  })
+})
+
+describe('parseUrl – review follow-ups', () => {
+  it('raw parentheses and & inside a quoted condition value do not unbalance the query', () => {
+    const r = parseUrl("$select=count(*|name=')'):n,count(*|name='(a&b'):m&$groupBy=g&x=1")
+    expect(r.controls.$select).toEqual([
+      { $fn: 'count', $field: '*', $as: 'n', $where: { name: ')' } },
+      { $fn: 'count', $field: '*', $as: 'm', $where: { name: '(a&b' } },
+    ])
+    expect(r.controls.$groupBy).toEqual(['g'])
+    expect(r.filter).toEqual({ x: 1 })
+    const f = parseUrl("$from=($groupBy=g&$select=count(*|s='a)'):c)&$select=sum(c):t")
+    expect(f.controls.$from).toEqual({ $groupBy: ['g'], $select: [{ $fn: 'count', $field: '*', $as: 'c', $where: { s: 'a)' } }] })
+    expect(parseUrl("(name='x)'^a=1)&b=2").filter).toEqual({ $and: [{ $or: [{ name: 'x)' }, { a: 1 }] }, { b: 2 }] })
+    // a body is inside parentheses as a whole: a quoted $having value there may hold raw parens too
+    expect(parseUrl("$from=($groupBy=a&$having=n=')'&$select=count(*):n)&$select=sum(n):t").controls.$from).toEqual({
+      $groupBy: ['a'],
+      $having: { n: ')' },
+      $select: [{ $fn: 'count', $field: '*', $as: 'n' }],
+    })
+    expect((parseUrl("$with=posts(name='a)'&$limit=2)").controls.$with as { filter: unknown }[])[0].filter).toEqual({ name: 'a)' })
+  })
+
+  it('a quote at the top level stays an ordinary character (bare control values)', () => {
+    const r = parseUrl("$search=it's&$limit=5&$with=posts($search=o'neil)")
+    expect(r.controls.$search).toBe("it's")
+    expect(r.controls.$limit).toBe(5)
+    expect((r.controls.$with as { controls: Record<string, unknown> }[])[0].controls.$search).toBe("o'neil")
+  })
+
+  it('an apostrophe inside a word never pairs with a later quote', () => {
+    type Rel = { filter: unknown; controls: Record<string, unknown> }
+    const a = parseUrl("$with=posts($search=it's)&status='y'")
+    expect(a.filter).toEqual({ status: 'y' })
+    expect((a.controls.$with as Rel[])[0].controls.$search).toBe("it's")
+    const b = parseUrl("$with=posts($search=it's&status='x')")
+    expect((b.controls.$with as Rel[])[0]).toMatchObject({ filter: { status: 'x' }, controls: { $search: "it's" } })
+    const c = parseUrl("$search=o'neil&name='a)'&x=1")
+    expect(c.controls.$search).toBe("o'neil")
+    expect(c.filter).toEqual({ name: 'a)', x: 1 })
+    const d = parseUrl("$from=($groupBy=g&$select=count(*|s='x'):n)&$search=it's&$select=sum(n):t")
+    expect(d.controls.$search).toBe("it's")
+    expect(d.controls.$select).toEqual([{ $fn: 'sum', $field: 'n', $as: 't' }])
+  })
+
+  it('a quoted value with raw parentheses works at the top level too ($having=n=\')\')', () => {
+    const r = parseUrl("$groupBy=a&$having=n=')'&$select=count(*):n")
+    expect(r.controls.$having).toEqual({ n: ')' })
+    expect(r.controls.$select).toEqual([{ $fn: 'count', $field: '*', $as: 'n' }])
+    expect(parseUrl("name='(a&b'&x=1").filter).toEqual({ name: '(a&b', x: 1 })
+  })
+
+  it('a quote opened by a percent-encoded operator (encodeURIComponent leaves the quote raw)', () => {
+    const r = parseUrl('$with=' + encodeURIComponent("posts(name='a)')") + '&x=1')
+    expect((r.controls.$with as { filter: unknown }[])[0].filter).toEqual({ name: 'a)' })
+    expect(r.filter).toEqual({ x: 1 })
+  })
+
+  it('a condition on a bucket says conditions apply to aggregates only', () => {
+    expect(() => parseUrl('$select=bucket(ts,month|x=1):m')).toThrow(
+      'Malformed $select item "bucket(ts,month|x=1):m": a condition applies to aggregates only',
+    )
   })
 })

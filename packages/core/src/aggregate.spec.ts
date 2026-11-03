@@ -726,3 +726,178 @@ describe('resolveBuckets — malformed entries', () => {
     }
   })
 })
+
+describe('countDistinct over several fields', () => {
+  it('isAggregateExpr accepts a field list (shape only)', () => {
+    expect(isAggregateExpr({ $fn: 'countDistinct', $field: ['a', 'b'] })).toBe(true)
+    expect(isAggregateExpr({ $fn: 'countDistinct', $field: [] })).toBe(true) // validation rejects it
+    expect(isAggregateExpr({ $fn: 'countDistinct', $field: ['a', 1] })).toBe(false)
+    expect(isAggregateExpr({ $fn: 'countDistinct', $field: 1 })).toBe(false)
+  })
+
+  it('default alias joins the fields with _ (countDistinct_a_b)', () => {
+    expect(resolveAlias({ $fn: 'countDistinct', $field: ['customerId', 'day'] })).toBe('countDistinct_customerId_day')
+    expect(resolveAlias({ $fn: 'countDistinct', $field: ['a.b', 'c'] })).toBe('countDistinct_a.b_c')
+    expect(resolveAlias({ $fn: 'countDistinct', $field: ['a', 'b'], $as: 'n' })).toBe('n')
+  })
+
+  it('validateAggregateExpr: a list only for countDistinct, non-empty, distinct names, no *', () => {
+    expect(validateAggregateExpr({ $fn: 'countDistinct', $field: ['a', 'b'] })).toEqual({ ok: true })
+    expect(validateAggregateExpr({ $fn: 'countDistinct', $field: ['a'] })).toEqual({ ok: true })
+    expect(validateAggregateExpr({ $fn: 'sum', $field: ['a', 'b'] } as never)).toEqual({
+      ok: false,
+      message: 'Aggregate "sum" takes one field — only countDistinct takes a list of fields',
+    })
+    expect(validateAggregateExpr({ $fn: 'stddev', $field: ['a', 'b'] })).toEqual({
+      ok: false,
+      message: 'Aggregate "stddev" takes one field — only countDistinct takes a list of fields',
+    })
+    expect(validateAggregateExpr({ $fn: 'countDistinct', $field: [] })).toEqual({
+      ok: false,
+      message: 'countDistinct needs at least one field',
+    })
+    expect(validateAggregateExpr({ $fn: 'countDistinct', $field: ['a', '*'] })).toEqual({
+      ok: false,
+      message: 'countDistinct field list entries must be field names, not "*"',
+    })
+    expect(validateAggregateExpr({ $fn: 'countDistinct', $field: ['a', ''] })).toEqual({
+      ok: false,
+      message: 'countDistinct field list entries must be field names, not ""',
+    })
+    expect(validateAggregateExpr({ $fn: 'countDistinct', $field: ['a', 'a'] })).toEqual({
+      ok: false,
+      message: 'countDistinct lists "a" twice',
+    })
+  })
+
+  it('resolveBuckets reports the invalid list', () => {
+    const res = resolveBuckets({ $select: [{ $fn: 'max', $field: ['a', 'b'] } as never], $groupBy: ['g'] })
+    expect(res).toEqual({
+      ok: false,
+      issues: [{ path: '$select', message: 'Aggregate "max" takes one field — only countDistinct takes a list of fields' }],
+    })
+  })
+
+  it('a default list alias cannot meet a single field default alias, or a field', () => {
+    // countDistinct(a_b) and countDistinct(a,b) both default to countDistinct_a_b
+    const clash = resolveBuckets({
+      $select: [
+        { $fn: 'countDistinct', $field: 'a_b' },
+        { $fn: 'countDistinct', $field: ['a', 'b'] },
+      ],
+      $groupBy: ['g'],
+    })
+    expect(clash).toEqual({
+      ok: false,
+      issues: [
+        {
+          path: '$select',
+          message: 'Duplicate alias "countDistinct_a_b" — name the countDistinct over several fields with $as',
+        },
+      ],
+    })
+    const named = resolveBuckets({
+      $select: [
+        { $fn: 'countDistinct', $field: 'a_b' },
+        { $fn: 'countDistinct', $field: ['a', 'b'], $as: 'pairs' },
+      ],
+      $groupBy: ['g'],
+    })
+    expect(named.ok).toBe(true)
+    const field = resolveBuckets(
+      { $select: [{ $fn: 'countDistinct', $field: ['a', 'b'] }], $groupBy: ['g'] },
+      { isField: (n) => n === 'countDistinct_a_b' },
+    )
+    expect(field).toEqual({
+      ok: false,
+      issues: [{ path: '$select', message: 'Alias "countDistinct_a_b" collides with field "countDistinct_a_b"' }],
+    })
+  })
+
+  it('leaves single-field aggregate aliases as they were (no new duplicate rule)', () => {
+    const res = resolveBuckets({
+      $select: [
+        { $fn: 'count', $field: '*' },
+        { $fn: 'count', $field: '*' },
+      ],
+      $groupBy: ['g'],
+    })
+    expect(res.ok).toBe(true)
+  })
+})
+
+describe('conditional aggregates ($where)', () => {
+  it('validateAggregateExpr: $where is a filter object and needs $as', () => {
+    expect(validateAggregateExpr({ $fn: 'count', $field: '*', $as: 'open', $where: { status: 'open' } })).toEqual({ ok: true })
+    expect(
+      validateAggregateExpr({ $fn: 'countDistinct', $field: ['a', 'b'], $as: 'n', $where: { $or: [{ x: 1 }, { y: 2 }] } }),
+    ).toEqual({ ok: true })
+    expect(validateAggregateExpr({ $fn: 'count', $field: '*', $where: { status: 'open' } })).toEqual({
+      ok: false,
+      message: 'A conditional aggregate ($where) needs an explicit $as',
+    })
+    expect(validateAggregateExpr({ $fn: 'sum', $field: 'a', $as: 's', $where: 'status=open' as never })).toEqual({
+      ok: false,
+      message: '$where must be a filter object',
+    })
+    expect(validateAggregateExpr({ $fn: 'sum', $field: 'a', $as: 's', $where: [] as never })).toEqual({
+      ok: false,
+      message: '$where must be a filter object',
+    })
+  })
+
+  it('resolveBuckets accepts $where on every aggregate kind', () => {
+    const res = resolveBuckets({
+      $select: [
+        'g',
+        { $fn: 'count', $field: '*', $as: 'open', $where: { status: 'open' } },
+        { $fn: 'countDistinct', $field: 'customer', $as: 'buyers', $where: { paid: true } },
+        { $fn: 'sum', $expr: { $op: '*', $args: ['price', 'qty'] }, $as: 'revenue', $where: { paid: true } },
+        { $fn: 'first', $field: 'status', $as: 'firstOpen', $where: { status: { $ne: 'closed' } } },
+      ],
+      $groupBy: ['g'],
+      $rowOrder: { at: 1 },
+    })
+    expect(res.ok).toBe(true)
+  })
+
+  it('resolveBuckets rejects $where on a bucket or a group-level expression, and a malformed one', () => {
+    const res = resolveBuckets({
+      $select: [
+        { $fn: 'count', $field: '*', $as: 'n' },
+        { $bucket: 'day', $field: 'at', $as: 'd', $where: { a: 1 } } as never,
+        { $expr: 'n', $as: 'x', $where: { a: 1 } } as never,
+        { $fn: 'sum', $expr: 'a', $as: 's', $where: 'a=1' } as never,
+        { $fn: 'count', $field: '*', $where: { a: 1 } },
+      ],
+      $groupBy: ['d'],
+    })
+    expect(res.ok).toBe(false)
+    if (!res.ok) {
+      expect(res.issues.map((i) => i.message)).toEqual([
+        '$where applies to aggregates only, not to a calendar bucket',
+        '$where applies to aggregates only, not to the group-level expression "x"',
+        '$where must be a filter object',
+        'A conditional aggregate ($where) needs an explicit $as',
+      ])
+    }
+  })
+})
+
+describe('conditional aggregates — malformed $where structure', () => {
+  it('validateAggregateExpr checks the whole filter structure, recursively', () => {
+    const check = ($where: unknown) => validateAggregateExpr({ $fn: 'count', $field: '*', $as: 'n', $where: $where as never })
+    expect(check({ $and: 'x' })).toEqual({ ok: false, message: 'Malformed $where: $and must be a list of filter objects' })
+    expect(check({ $or: [{ a: 1 }, 2] })).toEqual({ ok: false, message: 'Malformed $where: $or must be a list of filter objects' })
+    expect(check({ $and: [{ $not: [] }] })).toEqual({ ok: false, message: 'Malformed $where: $not must be a filter object' })
+    expect(check({ a: [1, 2] })).toEqual({ ok: false, message: 'Malformed $where: "a" must be a value or an operator object, not a list' })
+    expect(check({ tags: { $some: 'x' } })).toEqual({ ok: false, message: 'Malformed $where: $some on "tags" needs a filter object' })
+    expect(check({ tags: { $some: { $or: 1 } } })).toEqual({ ok: false, message: 'Malformed $where: $or must be a list of filter objects' })
+    expect(check({ $or: [{ a: { $in: [1, 2] } }, { $not: { b: null } }], at: new Date(0), re: /x/ })).toEqual({ ok: true })
+  })
+
+  it('resolveBuckets reports a malformed expression-aggregate $where', () => {
+    const res = resolveBuckets({ $select: [{ $fn: 'sum', $expr: 'a', $as: 's', $where: { $and: 'x' } as never }], $groupBy: ['g'] })
+    expect(res).toEqual({ ok: false, issues: [{ path: '$select', message: 'Malformed $where: $and must be a list of filter objects' }] })
+  })
+})

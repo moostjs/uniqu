@@ -17,6 +17,13 @@ import type {
   NullsPlacement,
   UniqueryControls,
   ValidGroupBy,
+  AggregateExpr,
+  AggregateStage,
+  NestedAggregateControls,
+  NestedAggregateQuery,
+  NestedAggregateResult,
+  StageRow,
+  ValidNested,
 } from './types'
 
 interface Ticket {
@@ -439,5 +446,268 @@ describe('$nulls', () => {
     void badKey
     void badValue
     expectTypeOf<NonNullable<AggregateControls['$nulls']>>().toEqualTypeOf<Record<string, NullsPlacement>>()
+  })
+})
+
+describe('countDistinct over several fields (FW-41)', () => {
+  it('a field list only for countDistinct', () => {
+    expectTypeOf<AggregateExpr<'countDistinct', 'a' | 'b'>['$field']>().toEqualTypeOf<'a' | 'b' | readonly ('a' | 'b')[]>()
+    expectTypeOf<AggregateExpr<'sum', 'a'>['$field']>().toEqualTypeOf<'a'>()
+    // untyped: any function name, so a list is admitted by shape (validation is core's)
+    expectTypeOf<AggregateExpr['$field']>().toEqualTypeOf<string | readonly string[]>()
+    const ok: AggregateControls<Ticket, 'status', 'points'> = {
+      $groupBy: ['status'],
+      $select: [{ $fn: 'countDistinct', $field: ['status', 'points'], $as: 'n' }],
+    }
+    expectTypeOf(ok).toExtend<object>()
+    const notCd: AggregateControls<Ticket, 'status', 'points'> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — only countDistinct takes a field list
+      $select: [{ $fn: 'sum', $field: ['points'] }],
+    }
+    expectTypeOf(notCd).toExtend<object>()
+    const notField: AggregateControls<Ticket, 'status', 'points'> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — 'openedAt' is neither a dimension nor a measure here
+      $select: [{ $fn: 'countDistinct', $field: ['status', 'openedAt'] }],
+    }
+    expectTypeOf(notField).toExtend<object>()
+  })
+
+  it('default alias joins the fields with _', () => {
+    expectTypeOf<ResolveAlias<{ $fn: 'countDistinct'; $field: readonly ['status', 'points'] }>>().toEqualTypeOf<'countDistinct_status_points'>()
+    expectTypeOf<ResolveAlias<{ $fn: 'countDistinct'; $field: ['a', 'b', 'c'] }>>().toEqualTypeOf<'countDistinct_a_b_c'>()
+    expectTypeOf<ResolveAlias<{ $fn: 'countDistinct'; $field: string[] }>>().toEqualTypeOf<`countDistinct_${string}`>()
+  })
+
+  it('infers a number under the default alias through aggregate()', () => {
+    const rows = aggregate({
+      controls: {
+        $select: ['status', { $fn: 'countDistinct', $field: ['openedAt', 'points'] }],
+        $groupBy: ['status'],
+      },
+    })
+    expectTypeOf(rows[0].countDistinct_openedAt_points).toEqualTypeOf<number>()
+  })
+})
+
+describe('conditional aggregates (FW-43)', () => {
+  it('$where is typed against the table in AggregateControls', () => {
+    const ok: AggregateControls<Ticket> = {
+      $groupBy: ['status'],
+      $select: [
+        { $fn: 'count', $field: '*', $as: 'open', $where: { status: 'open', points: { $gt: 1 } } },
+        { $fn: 'countDistinct', $field: ['status', 'points'], $as: 'n', $where: { $or: [{ points: 1 }, { closedAt: { $exists: true } }] } },
+        { $fn: 'sum', $expr: { $op: '*', $args: ['points', 2] }, $as: 's', $where: { status: { $ne: 'x' } } },
+      ],
+    }
+    expectTypeOf(ok).toExtend<object>()
+    const badValue: AggregateControls<Ticket> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — points is a number
+      $select: [{ $fn: 'count', $field: '*', $as: 'c', $where: { points: 'many' } }],
+    }
+    expectTypeOf(badValue).toExtend<object>()
+    const badField: AggregateControls<Ticket> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — not a field of Ticket
+      $select: [{ $fn: 'count', $field: '*', $as: 'c', $where: { nope: 1 } }],
+    }
+    expectTypeOf(badField).toExtend<object>()
+  })
+
+  it('a conditional aggregate is still typed as a number under its alias', () => {
+    const rows = aggregate({
+      controls: {
+        $select: ['status', { $fn: 'count', $field: '*', $as: 'open', $where: { status: 'open' } }],
+        $groupBy: ['status'],
+      },
+    })
+    expectTypeOf(rows[0].open).toEqualTypeOf<number>()
+  })
+})
+
+declare function nested<const Q extends NestedAggregateQuery<Ticket>>(
+  q: Q & ValidNested<Ticket, Q>,
+): NestedAggregateResult<Ticket, Q>[]
+
+describe('two-level aggregates (FW-42)', () => {
+  it('AggregateControls.$from is never: a nested query does not fit the single-level signature', () => {
+    const single: AggregateControls<Ticket> = {
+      $groupBy: [],
+      // @ts-expect-error — $from belongs to NestedAggregateControls
+      $from: { $groupBy: ['status'] },
+    }
+    expectTypeOf(single).toExtend<object>()
+    expectTypeOf<NestedAggregateQuery<Ticket>>().not.toExtend<AggregateQuery<Ticket>>()
+    expectTypeOf<AggregateQuery<Ticket>>().not.toExtend<NestedAggregateQuery<Ticket>>()
+  })
+
+  it('StageRow: $groupBy keys (selected or not) plus the computed entries', () => {
+    type S = {
+      $groupBy: ['status', 'day']
+      $select: [
+        { $bucket: 'day'; $field: 'openedAt'; $as: 'day' },
+        { $fn: 'count'; $field: '*'; $as: 'n' },
+        { $fn: 'max'; $field: 'closedAt'; $as: 'lastClosed' },
+        { $fn: 'countDistinct'; $field: ['points', 'status'] },
+      ]
+    }
+    expectTypeOf<StageRow<Ticket, S>>().toEqualTypeOf<{
+      status: string
+      day: string
+      n: number
+      lastClosed: number | undefined
+      countDistinct_points_status: number
+    }>()
+  })
+
+  it('infers the outer row through the inner columns', () => {
+    const rows = nested({
+      filter: { status: { $ne: 'closed' } },
+      controls: {
+        $from: {
+          $groupBy: ['status', 'day'],
+          $select: [
+            { $bucket: 'day', $field: 'openedAt', $as: 'day' },
+            { $fn: 'count', $field: '*', $as: 'n' },
+            { $fn: 'count', $field: '*', $as: 'big', $where: { points: { $gt: 5 } } },
+            { $fn: 'min', $field: 'openedAt', $as: 'firstAt' },
+          ],
+        },
+        $groupBy: ['status', 'month'],
+        $select: [
+          'status',
+          { $bucket: 'month', $field: 'firstAt', $as: 'month' },
+          { $fn: 'avg', $field: 'n', $as: 'avgDaily' },
+          { $fn: 'max', $field: 'day', $as: 'lastDay' },
+          { $fn: 'count', $field: '*', $as: 'busyDays', $where: { big: { $gt: 0 } } },
+          { $fn: 'countDistinct', $field: ['status', 'day'], $as: 'pairs' },
+          { $fn: 'sum', $expr: { $op: '*', $args: ['n', 2] }, $as: 'twice', $where: { n: { $gt: 1 } } },
+        ],
+        $rowOrder: { day: 1 },
+        $sort: { avgDaily: -1 },
+        $limit: 10,
+      },
+    })
+    expectTypeOf(rows[0].status).toEqualTypeOf<string>()
+    expectTypeOf(rows[0].month).toEqualTypeOf<string>()
+    expectTypeOf(rows[0].avgDaily).toEqualTypeOf<number>()
+    expectTypeOf(rows[0].lastDay).toEqualTypeOf<string>()
+    expectTypeOf(rows[0].busyDays).toEqualTypeOf<number>()
+    expectTypeOf(rows[0].pairs).toEqualTypeOf<number>()
+    expectTypeOf(rows[0].twice).toEqualTypeOf<number | null>()
+  })
+
+  it('ValidNested: an inner $groupBy entry must be a dimension or an inner bucket alias', () => {
+    nested({
+      controls: {
+        $from: {
+          // @ts-expect-error — 'stauts' is neither a dimension nor a bucket alias
+          $groupBy: ['stauts'],
+          $select: [{ $fn: 'count', $field: '*', $as: 'n' }],
+        },
+        $select: [{ $fn: 'avg', $field: 'n', $as: 'a' }],
+      },
+    })
+  })
+
+  it('ValidNested: outer names are inner columns only', () => {
+    nested({
+      controls: {
+        $from: { $groupBy: ['status'], $select: [{ $fn: 'count', $field: '*', $as: 'n' }] },
+        // @ts-expect-error — 'points' is a table field, not an inner column
+        $groupBy: ['points'],
+        $select: [{ $fn: 'avg', $field: 'n', $as: 'a' }],
+      },
+    })
+    nested({
+      controls: {
+        $from: { $groupBy: ['status'], $select: [{ $fn: 'count', $field: '*', $as: 'n' }] },
+        // @ts-expect-error — a plain outer entry must be an inner column
+        $select: ['points'],
+      },
+    })
+    nested({
+      controls: {
+        $from: { $groupBy: ['status'], $select: [{ $fn: 'count', $field: '*', $as: 'n' }] },
+        // @ts-expect-error — the aggregate's field must be an inner column
+        $select: [{ $fn: 'max', $field: 'openedAt', $as: 'm' }],
+      },
+    })
+    nested({
+      controls: {
+        $from: { $groupBy: ['status'], $select: [{ $fn: 'count', $field: '*', $as: 'n' }] },
+        // @ts-expect-error — every field of a list must be an inner column
+        $select: [{ $fn: 'countDistinct', $field: ['status', 'points'], $as: 'm' }],
+      },
+    })
+    nested({
+      controls: {
+        $from: { $groupBy: ['status'], $select: [{ $fn: 'count', $field: '*', $as: 'n' }] },
+        // @ts-expect-error — $where keys are inner columns at the outer level
+        $select: [{ $fn: 'count', $field: '*', $as: 'c', $where: { $or: [{ n: 1 }, { points: 2 }] } }],
+      },
+    })
+    nested({
+      controls: {
+        $from: { $groupBy: ['status'], $select: [{ $fn: 'count', $field: '*', $as: 'n' }] },
+        $select: [{ $fn: 'count', $field: '*', $as: 'c' }],
+        // @ts-expect-error — $rowOrder keys are inner columns
+        $rowOrder: { openedAt: 1 },
+      },
+    })
+  })
+
+  it('ValidNested: sum / avg / expression operands must be numeric inner columns', () => {
+    nested({
+      controls: {
+        $from: { $groupBy: ['status', 'day'], $select: [{ $bucket: 'day', $field: 'openedAt', $as: 'day' }, { $fn: 'count', $field: '*', $as: 'n' }] },
+        // @ts-expect-error — 'status' is a string column
+        $select: [{ $fn: 'sum', $field: 'status', $as: 's' }],
+      },
+    })
+    nested({
+      controls: {
+        $from: { $groupBy: ['status', 'day'], $select: [{ $bucket: 'day', $field: 'openedAt', $as: 'day' }, { $fn: 'count', $field: '*', $as: 'n' }] },
+        // @ts-expect-error — 'day' is a bucket label
+        $select: [{ $fn: 'avg', $expr: { $op: '+', $args: ['n', 'day'] }, $as: 's' }],
+      },
+    })
+    nested({ controls: { $from: { $groupBy: ['status', 'day'], $select: [{ $bucket: 'day', $field: 'openedAt', $as: 'day' }, { $fn: 'count', $field: '*', $as: 'n' }] }, $select: [{ $fn: 'sum', $field: 'n', $as: 's' }, { $fn: 'min', $field: 'day', $as: 'd' }] } })
+  })
+
+  it('AggregateStage rejects controls that are not valid inside $from, and a second level', () => {
+    const sorted: AggregateStage<Ticket> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — no $sort inside $from
+      $sort: { status: 1 },
+    }
+    const deeper: AggregateStage<Ticket> = {
+      $groupBy: ['status'],
+      // @ts-expect-error — depth is fixed at two
+      $from: { $groupBy: ['status'] },
+    }
+    expectTypeOf(sorted).toExtend<object>()
+    expectTypeOf(deeper).toExtend<object>()
+    nested({
+      controls: {
+        // @ts-expect-error — depth is fixed at two (also through the generic signature)
+        $from: { $groupBy: ['status'], $from: { $groupBy: ['points'] } },
+        $select: [{ $fn: 'count', $field: '*', $as: 'c' }],
+      },
+    })
+  })
+
+  it('NestedAggregateControls: $from required, outer $groupBy optional, pass-through controls kept', () => {
+    const c: NestedAggregateControls<Ticket> = {
+      $from: { $groupBy: ['status'], $select: [{ $fn: 'count', $field: '*', $as: 'n' }] },
+      $select: [{ $fn: 'avg', $field: 'n', $as: 'a' }],
+      $search: 'text',
+    }
+    expectTypeOf(c).toExtend<object>()
+    // @ts-expect-error — $from is required
+    const noFrom: NestedAggregateControls<Ticket> = { $select: [] }
+    expectTypeOf(noFrom).toExtend<object>()
   })
 })

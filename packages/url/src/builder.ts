@@ -9,6 +9,7 @@ import type {
   WithRelation,
 } from '@uniqu/core'
 import {
+  NESTED_STAGE_CONTROLS,
   formatArith,
   isAggregateOfExpr,
   isBucketExpr,
@@ -121,11 +122,11 @@ const urlVisitor: FilterVisitor<TUrlPart> = {
  * mixed in the same object (Mongo semantics), e.g.
  * `{ id: 101, $or: [...] }` → `id=101&(…^…)`.
  */
-function serializeFilter(expr: FilterExpr): string {
+function serializeFilter(expr: FilterExpr, subject = 'The filter'): string {
   const part = walkFilter(expr, urlVisitor)
   // An empty query string means "every row" — refuse rather than widen a filter that matches none.
   if (part?.never) {
-    throw new TypeError('The filter matches no row; it cannot be expressed in a URL')
+    throw new TypeError(`${subject} matches no row; it cannot be expressed in a URL`)
   }
   return part?.s ?? ''
 }
@@ -173,8 +174,9 @@ const NUMBER_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/u
 // Chars percent-encoded in every emitted value (parseUrl decodes each segment once):
 //   `%`         — a stray `%` makes parseUrl's `decodeURIComponent` throw; `%XX` would be decoded.
 //   `&`         — the top-level segment separator: the value would be cut there.
-//   `( )`       — the top-level split tracks paren depth, not quotes: an unbalanced paren
-//                 swallows (or detaches) every following segment.
+//   `( )`       — the split tracks paren depth, and a `'` shields them only when it opens at a
+//                 token start and closes: an unbalanced paren swallows (or detaches) every
+//                 following segment.
 //   `#`         — the URL fragment delimiter: everything after it never reaches the server.
 //   `\t \n \r`  — stripped from a URL by the WHATWG parser.
 // Single pass, so the `%` introduced here is never re-encoded.
@@ -258,9 +260,53 @@ function serializeBucket(b: BucketExpr): string {
   return `bucket(${args}):${resolveAlias(b)}`
 }
 
-/** `name(<arith>):alias` — the text form of an expression `$select` item (`expr` or an aggregate name). */
-function serializeExprItem(name: string, entry: { $expr: ArithExpr; $as?: unknown }): string {
-  return `${name}(${formatArith(entry.$expr, { encodePlus: true })}):${exprAlias(entry.$as)}`
+/** `name(<arith>[|<where>]):alias` — the text form of an expression `$select` item (`expr` or an aggregate name). */
+function serializeExprItem(name: string, entry: { $expr: ArithExpr; $as?: unknown; $where?: FilterExpr }): string {
+  const alias = exprAlias(entry.$as)
+  const where = entry.$where === undefined ? '' : serializeWhere(entry.$where, alias)
+  return `${name}(${formatArith(entry.$expr, { encodePlus: true })}${where && '|' + where}):${alias}`
+}
+
+/**
+ * `fn(field)[:alias]`, `fn(a,b)[:alias]` for a field list, and `fn(field|<where>):alias` for a
+ * conditional aggregate (the alias is required with a condition).
+ */
+function serializeAggregate(agg: AggregateExpr): string {
+  const field = typeof agg.$field === 'string' ? agg.$field : agg.$field.join(',')
+  const where = agg.$where === undefined ? '' : serializeWhere(agg.$where, agg.$as)
+  if (where && !agg.$as) {
+    throw new TypeError('A conditional aggregate ($where) in $select needs a $as alias; it cannot be expressed in a URL without one')
+  }
+  const arg = where ? `${field}|${where}` : field
+  return agg.$as ? `${agg.$fn}(${arg}):${agg.$as}` : `${agg.$fn}(${arg})`
+}
+
+/**
+ * The `$where` of a `$select` item, spelled like `$having`; empty for a condition that
+ * matches every row. It sits inside the item's parentheses, so its `&` and `,` need no grouping.
+ */
+function serializeWhere(where: FilterExpr, alias: unknown): string {
+  return serializeFilter(where, `The $where of "${String(alias)}"`)
+}
+
+/**
+ * `$from=( <controls> )` — the inner level, its body built like a `$with` body (`%` escaped
+ * once more, since parseUrl decodes the body's segments a second time). Only the controls
+ * a `$from` holds can be expressed.
+ */
+/** `$groupBy, $select, $having, $rowOrder and $nulls` */
+const FROM_CONTROL_LIST = `${NESTED_STAGE_CONTROLS.slice(0, -1).join(', ')} and ${NESTED_STAGE_CONTROLS.at(-1)}`
+
+function serializeFrom(stage: unknown): string {
+  if (!isPlainObject(stage)) {
+    throw new TypeError(`$from must be an object of ${FROM_CONTROL_LIST}`)
+  }
+  for (const [key, value] of Object.entries(stage)) {
+    if (value !== undefined && !NESTED_STAGE_CONTROLS.includes(key)) {
+      throw new TypeError(`${key} cannot be expressed inside $from in a URL — $from takes ${FROM_CONTROL_LIST}`)
+    }
+  }
+  return `$from=(${escapeBody(serializeControls(stage as UniqueryControls))})`
 }
 
 /** The alias of an expression item; the URL form has no spelling without one. */
@@ -298,10 +344,22 @@ function serializeOrder(
   return seg && `${name}=${seg}`
 }
 
-const KNOWN_CONTROL_KEYS = new Set(['$select', '$groupBy', '$having', '$sort', '$rowOrder', '$nulls', '$limit', '$skip', '$count', '$with'])
+const KNOWN_CONTROL_KEYS = new Set(['$from', '$select', '$groupBy', '$having', '$sort', '$rowOrder', '$nulls', '$limit', '$skip', '$count', '$with'])
+
+/**
+ * A body embedded in parentheses (`$with` relation, `$from`) is itself a query string inside
+ * this one, so parseUrl decodes it once per nesting level (the enclosing segment, then each
+ * segment of the body). Escaping the body's `%` keeps every `%XX` the nested builder
+ * emitted intact through the outer decode.
+ */
+function escapeBody(body: string): string {
+  return body.replace(/%/g, '%25')
+}
 
 function serializeControls(controls: UniqueryControls): string {
   let result = ''
+
+  if (controls.$from !== undefined) result = serializeFrom(controls.$from)
 
   if (controls.$select) {
     let seg = ''
@@ -317,8 +375,7 @@ function serializeControls(controls: UniqueryControls): string {
         } else if (isSelectArithExpr(entry)) {
           s = serializeExprItem('expr', entry)
         } else {
-          const agg = entry as AggregateExpr
-          s = agg.$as ? `${agg.$fn}(${agg.$field}):${agg.$as}` : `${agg.$fn}(${agg.$field})`
+          s = serializeAggregate(entry as AggregateExpr)
         }
         seg = seg ? seg + ',' + s : s
       }
@@ -328,7 +385,7 @@ function serializeControls(controls: UniqueryControls): string {
         seg = seg ? seg + ',' + s : s
       }
     }
-    if (seg) result = `$select=${seg}`
+    if (seg) result = result ? `${result}&$select=${seg}` : `$select=${seg}`
   }
 
   if (controls.$groupBy?.length) {
@@ -347,7 +404,7 @@ function serializeControls(controls: UniqueryControls): string {
       // stops the $having value at the first `&` and reads the rest as filter.
       // This is deliberately a textual check, not a structural one, because
       // the parser boundary is textual too — `splitTopLevel` in parse-url.ts
-      // splits on `&` outside parentheses. Values percent-encode `&` (see
+      // splits on `&` outside parentheses and quoted values. Values percent-encode `&` (see
       // `quote`), so any `&` left here is a structural AND.
       const needsParens = havingStr.includes('&')
       const part = needsParens
@@ -387,12 +444,11 @@ function serializeControls(controls: UniqueryControls): string {
         s = entry
       } else {
         const rel = entry as WithRelation
+        if (rel.controls?.$from !== undefined) {
+          throw new TypeError(`$with relation "${rel.name}" has a $from; $from is only valid at the top level of a query`)
+        }
         const inner = buildUrl({ filter: rel.filter, controls: rel.controls })
-        // A relation body is itself a query string embedded in this one, so
-        // parseUrl decodes it once per nesting level (the `$with=…` segment,
-        // then each segment of the body). Escaping the body's `%` keeps every
-        // `%XX` the nested builder emitted intact through the outer decode.
-        s = inner ? `${rel.name}(${inner.replace(/%/g, '%25')})` : rel.name
+        s = inner ? `${rel.name}(${escapeBody(inner)})` : rel.name
       }
       seg = seg ? seg + ',' + s : s
     }

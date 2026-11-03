@@ -37,6 +37,12 @@ export type {
   AggregateResult,
   ResolveAlias,
   ValidGroupBy,
+  AggregateStage,
+  NestedAggregateControls,
+  NestedAggregateQuery,
+  StageRow,
+  NestedAggregateResult,
+  ValidNested,
 } from './types'
 
 export {
@@ -67,7 +73,15 @@ export {
   resolveAlias,
   groupByFields,
   resolveBuckets,
+  resolveNested,
+  NESTED_STAGE_CONTROLS,
   type QueryIssue,
+  type NestedIssueCode,
+  type InnerColumn,
+  type ResolveNestedOptions,
+  type ResolvedLevel,
+  type NestedResolution,
+  type NestedControlsInput,
   type AggregateExprCheck,
   type ValidateAggregateOptions,
   type ResolvedBucket,

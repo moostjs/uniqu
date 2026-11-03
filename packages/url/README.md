@@ -130,7 +130,7 @@ ticket=$some(a=1)&ticket=$none(b=2)
 - Nesting is capped at 32 levels (`SyntaxError` beyond); an unterminated body (`ticket=$some(`) is a `SyntaxError`.
 - `buildUrl` throws a `TypeError` for an operand that is not a filter object (`null`, an array, a string) and for one that matches no row (`{ $or: [] }`, `{ $not: {} }`): such an operand would serialize to the empty body, which means "any related row".
 - The same holds for the whole filter: a filter that matches no row (`{ $or: [] }`, or any AND with such a member, e.g. `{ status: 'open', $or: [] }`) throws, because an empty query string means "every row". An empty member is never dropped when that would change the result: a never-matching member makes its AND match nothing, an every-row member (`{}`) makes its OR match everything.
-- Hand-written URLs: the top-level `&` split counts parentheses but ignores quotes, so a literal `(`, `)` or `&` inside a quoted value must be percent-encoded (`title='a%29b'`) — `buildUrl` always does this.
+- Hand-written URLs: a quoted value may hold a raw `(`, `)` or `&` (`title='a)b'`, see [Percent Encoding](#percent-encoding)); an unquoted one must percent-encode it (`title=a%29b`). `buildUrl` always encodes them.
 
 ### Logical Operators
 
@@ -186,6 +186,8 @@ $search=Maison%20%26%20O%27Brien%20%231  → $search: "Maison & O'Brien #1"
 
 A `$with` relation body is itself a query string, so it is decoded once more when parsed: a value inside a body needs one more level of encoding than at the top (`$with=posts(name='50%2525')` → `'50%'`). Building a `$with` value with `URLSearchParams` or `encodeURIComponent` produces exactly that. A body segment that is not valid percent-encoding at that second decode is kept as written, so a hand-written `$with=posts(name='50%25')` also yields `'50%'`.
 
+A single-quoted value is kept whole when the query string is split, at every level, so it may hold raw `(`, `)` and `&` (`name=')'&x=1`, `$having=n=')'`, `count(*|name='(a&b'):n`). A `'` starts a quoted value only at the start of a token (after `=`, an operator, `(`, `,`, `|`, `^`, `&`, `{`, a space, tab or `+`, or the percent-encoded form of one, as `encodeURIComponent` leaves `'` raw) and only when it is closed, so an apostrophe inside a word stays an ordinary character (`$search=it's`, `$with=posts($search=o'neil)`). `buildUrl` percent-encodes these characters anyway.
+
 ## Control Keywords
 
 Control keywords start with `$` and are separated from filter expressions:
@@ -200,6 +202,7 @@ Control keywords start with `$` and are separated from filter expressions:
 | `$groupBy` | — | `$groupBy=currency,region` | `{ $groupBy: ['currency', 'region'] }` |
 | `$having` | — | `$having=total>1000` | `{ $having: { total: { $gt: 1000 } } }` |
 | `$with` | — | `$with=posts,author` | `{ $with: [{ name: 'posts', filter: {}, controls: {} }, ...] }` |
+| `$from` | — | `$from=($groupBy=userId&$select=count(*):n)` | `{ $from: { $groupBy: ['userId'], $select: [...] } }` (two-level aggregate) |
 | `$<custom>` | — | `$search=term` | `{ $search: 'term' }` |
 
 Prefix a field with `-` in `$select` to exclude it. When any exclusion is present, `$select` produces an object (`{ name: 1, password: 0 }`); otherwise it produces an array (`['name', 'email']`). Prefix with `-` in `$order` for descending sort.
@@ -231,7 +234,35 @@ $select=countDistinct(customerId):n → [{ $fn: 'countDistinct', $field: 'custom
 $select=sum(amount),currency       → [{ $fn: 'sum', $field: 'amount', $as: 'sum_amount' }, 'currency']
 ```
 
-When no alias is given, one is auto-generated as `{fn}_{field}` (with `*` becoming `star`).
+When no alias is given, one is auto-generated as `{fn}_{field}` (with `*` becoming `star`, and a field list joined with `_`).
+
+#### `countDistinct` over several fields
+
+```
+$select=countDistinct(userId,day)       → [{ $fn: 'countDistinct', $field: ['userId', 'day'], $as: 'countDistinct_userId_day' }]
+$select=countDistinct(userId,day):n     → [{ $fn: 'countDistinct', $field: ['userId', 'day'], $as: 'n' }]
+$select=countDistinct(userId)           → [{ $fn: 'countDistinct', $field: 'userId', $as: 'countDistinct_userId' }]
+```
+
+It counts distinct combinations; a row where any listed field is NULL is not counted. Only `countDistinct` takes several fields: `sum(a,b)` or any other function with a list is a `SyntaxError`.
+
+#### Conditional aggregates: `fn(field|<filter>):alias`
+
+Text after a `|` inside the call parentheses is a filter: the aggregate's `$where`. Only rows matching it are counted or summed. The filter uses the full query grammar (`&`, `^`, `!(…)`, groups, lists, quoted values, `$exists=`), the same way `$having` does, and the alias is required:
+
+```
+count(*|status=ESTIMATED):estimated          → { $fn: 'count', $field: '*', $as: 'estimated', $where: { status: 'ESTIMATED' } }
+sum(hours|billable=true^kind=support):bill   → { $fn: 'sum', $field: 'hours', $as: 'bill', $where: { $or: [...] } }
+countDistinct(userId,day|status{open,new}):n → { $fn: 'countDistinct', $field: ['userId', 'day'], $as: 'n', $where: { status: { $in: [...] } } }
+sum(price*qty|paid=true):revenue             → { $fn: 'sum', $expr: …, $as: 'revenue', $where: { paid: true } }
+count(*|(a=1^b=2)&!(c=3)):x                  → nested groups work as in a filter
+```
+
+- The condition starts at the **first** `|`. A field list and an expression never contain one, so a `|` inside a quoted value of the condition (`name='a|b'`) needs no escaping.
+- An `&` inside the parentheses does not split the query string, and `,` inside `{…}` lists does not split `$select`. Values follow the usual quoting and percent-encoding rules (`buildUrl` encodes `% & ( ) #` inside quoted values).
+- **Throws `SyntaxError`:** a condition without an `:alias` (`count(*|a=1)`), an empty condition (`count(*|):n`), a malformed one (the message names the item), and a condition on `expr(…)` or `bucket(…)` ("a condition applies to aggregates only").
+- A quoted value inside the condition may hold raw `(`, `)`, `&` or `|` (`count(*|name=')'):n`): the query string is split with quoted values kept whole (see [Percent Encoding](#percent-encoding)).
+- The fields of a condition are reported in insights like filter fields (`status` → `$eq`), so a server that gates filterable fields gates conditions too.
 
 Supported functions: `sum`, `count`, `countDistinct`, `avg`, `min`, `max`, `first`, `last`, plus any custom function name — consumers validate supported functions. See the [core README](../core/README.md#aggregation-groupby--select) for their semantics and for `validateAggregateExpr`. The parser checks syntax only: any `fn(*)` parses, although only `count(*)` is valid.
 
@@ -350,6 +381,43 @@ $with=orders($select=sum(total):revenue&$groupBy=status&$having=revenue>500)
 ```
 
 Insights track `$having` fields with the `'$having'` op.
+
+### Two-level aggregates (`$from`)
+
+`$from=( … )` is the inner level of a two-level aggregate (see the [core README](../core/README.md#two-level-aggregates-from) for the rules). The root controls aggregate its rows: every name they read is an inner column (an inner `$groupBy` key or `$select` alias), and the query filter applies to the rows the inner level groups.
+
+```
+projectId=7
+  &$from=($groupBy=userId,day&$select=bucket(createdAt,day):day,count(*):n,count(*|status=open):open&$having=n>0)
+  &$groupBy=userId&$select=userId,avg(n):avgPerDay,count(*|open>3):busyDays&$sort=-avgPerDay&$limit=10
+```
+
+```ts
+{
+  filter: { projectId: 7 },
+  controls: {
+    $from: {
+      $groupBy: ['userId', 'day'],
+      $select: [
+        { $bucket: 'day', $field: 'createdAt', $as: 'day' },
+        { $fn: 'count', $field: '*', $as: 'n' },
+        { $fn: 'count', $field: '*', $as: 'open', $where: { status: 'open' } },
+      ],
+      $having: { n: { $gt: 0 } },
+    },
+    $groupBy: ['userId'],
+    $select: ['userId', { $fn: 'avg', $field: 'n', $as: 'avgPerDay' }, { $fn: 'count', $field: '*', $as: 'busyDays', $where: { open: { $gt: 3 } } }],
+    $sort: { avgPerDay: -1 },
+    $limit: 10,
+  },
+}
+```
+
+- The body holds `$groupBy`, `$select`, `$rowOrder` (with `:first` / `:last`, which land in the inner `$nulls`) and `$having`, joined by `&`. Write a `$having` with `&` in parentheses, as at the top level: `$having=(n>1&n<9)`.
+- The body is read like a `$with` body: each of its segments is percent-decoded once more than the `$from=…` segment, so `buildUrl` escapes its `%` once more. A whole value encoded by `URLSearchParams` or `encodeURIComponent` parses too.
+- **Throws `SyntaxError`:** a filter term inside the body (`$from=($groupBy=g&status=open)`: put the filter on the query itself), any other control inside (`$sort`, `$limit`, `$skip`, `$count`, `$with`, `$search`, …), a `$from` inside `$from` (depth is fixed at two), a second `$from` in the query, a `$from` inside a `$with` relation body (top level only), and a value that is not one parenthesized body (`$from=$groupBy=a`, `$from=(…)x`).
+- Insights report the filter, the inner level, and every root name that is not an inner or outer alias (fail closed, see the [core README](../core/README.md#two-level-aggregates-from)).
+- Shape validation (inner `$groupBy` required, outer names resolve against inner columns, …) is `resolveNested` in `@uniqu/core`. A server MUST run it whenever `controls.$from !== undefined`, and MUST reject `$from` where it does not support it.
 
 ### Relation Loading (`$with`)
 
@@ -586,7 +654,8 @@ All features are supported:
 - Strings that look like numbers, booleans, or `null` are automatically quoted (`'25'`, `'true'`, `'null'`)
 - Strings with special characters (`&`, `^`, `=`, spaces, quotes) are quoted and escaped; inside quotes `%`, `&`, `(`, `)`, `#`, tab and line breaks are percent-encoded, so no value can end a segment or unbalance a paren group
 - Custom control values (`$search`, `$relevance`, any `$<custom>`) are percent-encoded for the same characters plus `'` — `"Maison & O'Brien #1"` becomes `$search=Maison %26 O%27Brien %231`. Up to 0.1.8 they were written raw, so a search term containing `&`, `%` or `'` broke the URL
-- A `$with` body gets one extra level of `%` encoding, matching the extra decode on parse
+- A `$with` body gets one extra level of `%` encoding, matching the extra decode on parse; so does a `$from` body, which is written first among the controls (`$from=( … )`). A `$from` holding a control the URL cannot carry inside it (`$sort`, `$limit`, a nested `$from`, …), and a `$from` inside a `$with` relation, throw a `TypeError`
+- A `countDistinct` field list is written `countDistinct(a,b)`. A `$where` is written inside the call after a `|` (`count(*|status=open):open`, `sum(price*qty|paid=true):rev`). A condition needs a `$as` (without one it throws a `TypeError`), an always-true condition (`{}`) is dropped, and one that matches no row (`{ $or: [] }`) throws a `TypeError`
 - Numbers are written as plain decimals: a finite number whose `String(n)` is in exponent form (`1e21`, `1.5e-7`) is expanded digit by digit (`1000000000000000000000`, `0.00000015`), so it parses back as the same number. `NaN`, `Infinity` and `-Infinity` throw a `TypeError` (`Filter value for "price" is not a finite number (NaN); it cannot be expressed in a URL`) instead of turning into the strings `"NaN"` / `"Infinity"`
 - An empty `$in` / `$nin` is written `field{}` / `field!{}`
 - Arithmetic is written `fn(<arith>):alias` and `expr(<arith>):alias` (alias required: an expression without `$as` throws a `TypeError`; `+` is written `%2B`, see above); `$rowOrder` is written like `$sort`

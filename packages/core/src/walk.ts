@@ -48,6 +48,85 @@ export function hasRelationOp(value: unknown): boolean {
 }
 
 /**
+ * @internal The first structural problem of a filter, or `undefined` when it is
+ * well-formed: every node is a plain object, `$and` / `$or` are lists of filter
+ * objects, `$not` is a filter object, a field holds a value or an operator object
+ * (not a list), and a `$some` / `$none` operand is itself a well-formed filter.
+ * Iterative, so a hostile nesting depth cannot overflow the stack.
+ */
+export function filterShapeProblem(expr: unknown): string | undefined {
+  const stack: unknown[] = [expr]
+  while (stack.length > 0) {
+    const node = stack.pop()
+    if (!isPlainObject(node)) return 'a filter must be an object'
+    for (const key of Object.keys(node)) {
+      const value = node[key]
+      if (value === undefined) continue
+      if (key === '$and' || key === '$or') {
+        if (!Array.isArray(value) || !value.every(isPlainObject)) return `${key} must be a list of filter objects`
+        for (const child of value) stack.push(child)
+      } else if (key === '$not') {
+        if (!isPlainObject(value)) return '$not must be a filter object'
+        stack.push(value)
+      } else if (Array.isArray(value)) {
+        return `"${key}" must be a value or an operator object, not a list`
+      } else if (!isPrimitive(value)) {
+        for (const op of Object.keys(value)) {
+          const operand = (value as Record<string, unknown>)[op]
+          if (!isRelationOp(op) || operand === undefined) continue
+          if (!isPlainObject(operand)) return `${op} on "${key}" needs a filter object`
+          stack.push(operand)
+        }
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * @internal Visit every field key a filter reads, in the order {@link walkFilter} reaches
+ * them: `onComparison` once per comparison operator of a field (a bare value is `$eq`),
+ * `onRelation` once per `$some` / `$none` key (its operand is not entered). Iterative, so a
+ * hostile nesting depth cannot overflow the stack; a non-object node is skipped. Meant for a
+ * filter that passed {@link filterShapeProblem}.
+ */
+export function forEachFilterField(
+  expr: unknown,
+  onComparison: (field: string, op: string) => void,
+  onRelation: (field: string, op: RelationOp) => void,
+): void {
+  // Pre-order with explicit frames: a node's later keys wait until an earlier logical key's children are done.
+  const frames: { node: Record<string, unknown>; keys: string[]; i: number }[] = []
+  const enter = (node: unknown) => {
+    if (node !== null && typeof node === 'object') {
+      frames.push({ node: node as Record<string, unknown>, keys: Object.keys(node), i: 0 })
+    }
+  }
+  enter(expr)
+  while (frames.length > 0) {
+    const frame = frames[frames.length - 1]
+    if (frame.i === frame.keys.length) {
+      frames.pop()
+      continue
+    }
+    const key = frame.keys[frame.i++]
+    const value = frame.node[key]
+    if (isLogicalKey(key)) {
+      if (key === '$not') enter(value)
+      // Children go on the stack last-first, so the first child is visited first.
+      else if (Array.isArray(value)) for (let j = value.length - 1; j >= 0; j--) enter(value[j])
+    } else if (isPrimitive(value)) {
+      onComparison(key, '$eq')
+    } else {
+      for (const op of Object.keys(value as object)) {
+        if (isRelationOp(op)) onRelation(key, op)
+        else onComparison(key, op)
+      }
+    }
+  }
+}
+
+/**
  * Visitor callbacks for controlling how filter nodes are processed.
  * Generic parameter `R` is the return type — `string` for SQL rendering,
  * `boolean` for validation, `FilterExpr` for AST transforms, `void` for
