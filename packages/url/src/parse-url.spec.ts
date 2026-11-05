@@ -1812,6 +1812,58 @@ describe('parseUrl – review follow-ups', () => {
     expect(r.filter).toEqual({ x: 1 })
   })
 
+  it('a percent-encoded backslash escapes inside a quoted value, as the parser reads it', () => {
+    for (const bs of ['%5C', '%5c']) {
+      const raw = `name='a${bs}'&$limit=5&y='&x=1`
+      expect(splitUrlSegments(raw), bs).toEqual([`name='a${bs}'&$limit=5&y='`, 'x=1'])
+      const r = parseUrl(raw)
+      expect(r.controls.$limit, bs).toBeUndefined()
+      expect(r.filter, bs).toEqual({ name: "a'&$limit=5&y=", x: 1 })
+    }
+    // an escaped backslash before the closing quote: the quote closes
+    expect(parseUrl("name='a%5C%5C'&$limit=5").filter).toEqual({ name: 'a\\' })
+    expect(parseUrl("name='a%5C%5C'&$limit=5").controls.$limit).toBe(5)
+  })
+
+  describe('a quote after whitespace opens a quoted value, whichever whitespace it is', () => {
+    // every character the lexer skips as whitespace, ASCII and not
+    const whitespace = [' ', '\t', '\n', '\v', '\f', '\r', ' ', ' ', '　', '﻿']
+    const label = (ws: string) => `U+${ws.charCodeAt(0).toString(16).padStart(4, '0')}`
+
+    it('raw or percent-encoded, at the top level', () => {
+      for (const ws of whitespace) {
+        for (const sep of [ws, encodeURIComponent(ws)]) {
+          const raw = `name=${sep}'a&b)'&x=1`
+          expect(splitUrlSegments(raw), `${label(ws)} as ${JSON.stringify(sep)}`).toEqual([`name=${sep}'a&b)'`, 'x=1'])
+          expect(parseUrl(raw).filter, `${label(ws)} as ${JSON.stringify(sep)}`).toEqual({ name: 'a&b)', x: 1 })
+        }
+      }
+    })
+
+    it('inside a $with body encoded with encodeURIComponent', () => {
+      for (const ws of whitespace) {
+        const r = parseUrl('$with=' + encodeURIComponent(`posts(name=${ws}'a)'&$limit=2)`) + '&x=1')
+        expect((r.controls.$with as { filter: unknown }[])[0].filter, label(ws)).toEqual({ name: 'a)' })
+        expect(r.filter, label(ws)).toEqual({ x: 1 })
+      }
+    })
+
+    it('a malformed or non-whitespace encoding before a quote opens nothing (and never throws)', () => {
+      for (const enc of ['%C2', '%E3%80', '%', '%2', '%C0%A0', '%E0%80%A0', '%ZZ', '%80', '%2B', '%E2%80%8B', '%41']) {
+        const raw = `a=${enc}'b&c'`
+        expect(() => splitUrlSegments(raw), enc).not.toThrow()
+        expect(splitUrlSegments(raw), enc).toEqual([`a=${enc}'b`, "c'"])
+      }
+      // `%2B` and U+200B (not whitespace to the lexer) leave the quote inside a word
+      expect(parseUrl("a=x%2B'b&c=1").filter).toEqual({ a: "x+'b", c: 1 })
+    })
+
+    it('an unpaired quote after whitespace stays an ordinary character', () => {
+      expect(parseUrl("$search=it%09's&x=1").controls.$search).toBe("it\t's")
+      expect(parseUrl("$search=it%09's&x=1").filter).toEqual({ x: 1 })
+    })
+  })
+
   it('a condition on a bucket says conditions apply to aggregates only', () => {
     expect(() => parseUrl('$select=bucket(ts,month|x=1):m')).toThrow(
       'Malformed $select item "bucket(ts,month|x=1):m": a condition applies to aggregates only',

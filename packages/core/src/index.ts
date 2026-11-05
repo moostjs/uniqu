@@ -77,6 +77,7 @@ export {
   NESTED_STAGE_CONTROLS,
   type QueryIssue,
   type NestedIssueCode,
+  type AggregateIssueCode,
   type InnerColumn,
   type ResolveNestedOptions,
   type ResolvedLevel,

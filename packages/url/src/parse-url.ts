@@ -95,8 +95,9 @@ function decodeLenient(s: string): string {
  * (`(a=1&b=2)^c=3`) does not separate, and neither does an `&`, `(` or `)`
  * inside a quoted value (`name=')'&x=1`, `count(*|n='(a&b'):c`). A `'` opens a
  * quoted value only at the start of a token — the string start, or after `=`,
- * an operator, `(`, `,`, `|`, `^`, `&`, `{`, a space, tab or `+`, or after
- * the percent-encoded form of one — and only when it is closed, so an apostrophe inside a word (`$search=it's`) is an ordinary
+ * an operator, `(`, `,`, `|`, `^`, `&`, `{`, `+` or any whitespace (`\s`), or
+ * after the percent-encoded form of one (`%3D`, `%20`, `%C2%A0`, …; not `%2B`) — and only when it is
+ * closed, so an apostrophe inside a word (`$search=it's`) is an ordinary
  * character. Segments are returned raw (not percent-decoded); empty ones (from
  * a leading, trailing or doubled `&`) are kept. Use it to address the
  * individual keys of a URL the parser reads, e.g. to replace a query's own
@@ -106,21 +107,27 @@ export function splitUrlSegments(raw: string): string[] {
   return splitTopLevel(raw, '&')
 }
 
-/** Characters after which a `'` starts a quoted value (a token start, as the lexer sees it). */
-const QUOTE_OPENERS = new Set(['=', '<', '>', '~', '!', '(', ',', '|', '^', '&', '{', ' ', '\t', '+'])
-/**
- * The same characters percent-encoded (`%3D'x'` from `encodeURIComponent`, which leaves `'` raw).
- * Not listed: `+` (`%2B`) and tab (`%09`).
- */
-const ENCODED_OPENER_RE = /^%(?:3D|3C|3E|7E|21|28|2C|7C|5E|26|7B|20)$/iu
+/** Characters after which a `'` starts a quoted value (a token start, as the lexer sees it), besides whitespace. */
+const QUOTE_OPENERS = new Set(['=', '<', '>', '~', '!', '(', ',', '|', '^', '&', '{'])
 
-/** Whether `str[i]` starts a token: the string start, or after a raw or percent-encoded opener. */
+/**
+ * Whether `str[i]` starts a token: the string start, a raw `+`, or after an opener or any whitespace
+ * (`\s`, as the lexer skips it), raw or percent-encoded (`%3D`, `%09`, `%C2%A0`, …; `%2B` is a literal plus).
+ */
 function atTokenStart(str: string, i: number): boolean {
-  return (
-    i === 0 ||
-    QUOTE_OPENERS.has(str[i - 1]!) ||
-    (str.charCodeAt(i - 3) === 37 /* % */ && ENCODED_OPENER_RE.test(str.slice(i - 3, i)))
-  )
+  if (i === 0 || str[i - 1] === '+') return true
+  const ch = charBefore(str, i)
+  return QUOTE_OPENERS.has(ch) || /^\s$/u.test(ch)
+}
+
+/** The character ending at `i`, decoded when it is percent-encoded (one to three `%XX`, as `decodeURIComponent` reads them). */
+function charBefore(str: string, i: number): string {
+  for (let at = i - 3; at >= Math.max(0, i - 9) && str[at] === '%'; at -= 3) {
+    try {
+      return decodeURIComponent(str.slice(at, i))
+    } catch {}
+  }
+  return str[i - 1]!
 }
 
 /**
@@ -166,10 +173,15 @@ function splitTopLevel(str: string, sep: string): string[] {
   return parts
 }
 
-/** Index of the `'` closing the quoted string opened at `open` (`\\` escapes), or `str.length`. */
+/**
+ * Index of the `'` closing the quoted string opened at `open`, or `str.length`. A `\\` escapes
+ * the next character, and so does its percent-encoded form `%5C`: the parser reads the value
+ * decoded, so both are the same escape there.
+ */
 function closingQuote(str: string, open: number): number {
   for (let i = open + 1; i < str.length; i++) {
     if (str[i] === '\\') i++
+    else if (str[i] === '%' && str[i + 1] === '5' && (str[i + 2] === 'C' || str[i + 2] === 'c')) i += 3
     else if (str[i] === "'") return i
   }
   return str.length

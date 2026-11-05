@@ -12,6 +12,7 @@ import {
   ROW_ORDER_FNS,
   resolveAlias,
   resolveBuckets,
+  resolveNested,
   validateAggregateExpr,
 } from './aggregate'
 import { MAX_EXPR_CHAIN } from './aggregate'
@@ -337,20 +338,20 @@ describe('resolveBuckets', () => {
       ],
       $groupBy: ['d'],
     })
-    expect(!dup.ok && dup.issues).toEqual([{ path: '$select', message: 'Duplicate alias "d"' }])
+    expect(!dup.ok && dup.issues).toEqual([{ path: '$select', message: 'Duplicate alias "d"', code: 'AGG_ALIAS_COLLISION' }])
 
     const vsAggregate = resolveBuckets({
       $select: [{ $fn: 'count', $field: '*', $as: 'n' }, { $bucket: 'day', $field: 'openedAt', $as: 'n' }],
       $groupBy: ['n'],
     })
-    expect(!vsAggregate.ok && vsAggregate.issues).toEqual([{ path: '$select', message: 'Duplicate alias "n"' }])
+    expect(!vsAggregate.ok && vsAggregate.issues).toEqual([{ path: '$select', message: 'Duplicate alias "n"', code: 'AGG_ALIAS_COLLISION' }])
 
     const vsDefaultAggregate = resolveBuckets({
       $select: [{ $fn: 'count', $field: '*' }, { $bucket: 'day', $field: 'x', $as: 'count_star' }],
       $groupBy: ['count_star'],
     })
     expect(!vsDefaultAggregate.ok && vsDefaultAggregate.issues).toEqual([
-      { path: '$select', message: 'Duplicate alias "count_star"' },
+      { path: '$select', message: 'Duplicate alias "count_star" — name one with $as', code: 'AGG_ALIAS_COLLISION' },
     ])
 
     const vsField = resolveBuckets({
@@ -358,7 +359,7 @@ describe('resolveBuckets', () => {
       $groupBy: ['status'],
     })
     expect(!vsField.ok && vsField.issues).toEqual([
-      { path: '$select', message: 'Alias "status" collides with field "status"' },
+      { path: '$select', message: 'Alias "status" collides with field "status"', code: 'AGG_ALIAS_COLLISION' },
     ])
   })
 
@@ -388,13 +389,22 @@ describe('resolveBuckets', () => {
     expect(resolveBuckets(controls).ok).toBe(true)
     const tableFields = new Set(['id', 'status', 'openedAt', 'createdAt'])
     const res = resolveBuckets(controls, { isField: name => tableFields.has(name) })
-    expect(!res.ok && res.issues).toEqual([{ path: '$select', message: 'Alias "createdAt" collides with field "createdAt"' }])
-    // isField replaces the default: a selected field it does not know is not a collision
+    expect(!res.ok && res.issues).toEqual([{ path: '$select', message: 'Alias "createdAt" collides with field "createdAt"', code: 'AGG_ALIAS_COLLISION' }])
+    // isField adds to the selected fields: a selected field it does not know is still a collision
     const vsSelected = resolveBuckets(
       { $select: ['status', { $bucket: 'day', $field: 'openedAt', $as: 'status' }], $groupBy: ['status'] },
       { isField: () => false },
     )
-    expect(vsSelected.ok).toBe(true)
+    expect(!vsSelected.ok && vsSelected.issues).toEqual([
+      { path: '$select', message: 'Alias "status" collides with field "status"', code: 'AGG_ALIAS_COLLISION' },
+    ])
+    const exprVsSelected = resolveBuckets(
+      { $select: ['status', { $fn: 'sum', $expr: 'a', $as: 'status' }], $groupBy: ['g'] },
+      { isField: () => false },
+    )
+    expect(!exprVsSelected.ok && exprVsSelected.issues).toEqual([
+      { path: '$select', message: 'Alias "status" collides with field "status"', code: 'AGG_ALIAS_COLLISION' },
+    ])
     // combines with the aggregate option
     const outsideAggregate = resolveBuckets(controls, { aggregate: false, isField: name => tableFields.has(name) })
     expect(!outsideAggregate.ok && outsideAggregate.issues.map(i => i.message)).toEqual([
@@ -403,13 +413,119 @@ describe('resolveBuckets', () => {
     ])
   })
 
-  it('leaves duplicate aggregate-only aliases alone (pre-existing behaviour)', () => {
-    expect(
-      resolveBuckets({
-        $select: [{ $fn: 'sum', $field: 'a', $as: 'x' }, { $fn: 'max', $field: 'a', $as: 'x' }],
+  describe('aggregate alias collisions (one result row, one value per name)', () => {
+    const collision = (message: string) => ({ path: '$select', message, code: 'AGG_ALIAS_COLLISION' })
+
+    it('two aggregates with one alias — explicit or default — are reported once', () => {
+      const explicit = resolveBuckets({
+        $select: [{ $fn: 'sum', $field: 'a', $as: 'x' }, { $fn: 'max', $field: 'a', $as: 'x' }, { $fn: 'min', $field: 'a', $as: 'x' }],
         $groupBy: ['g'],
-      }).ok,
-    ).toBe(true)
+      })
+      expect(explicit).toEqual({ ok: false, issues: [collision('Duplicate alias "x"')] })
+      const byDefault = resolveBuckets({
+        $select: [{ $fn: 'count', $field: '*' }, { $fn: 'count', $field: '*' }],
+        $groupBy: ['g'],
+      })
+      expect(byDefault).toEqual({ ok: false, issues: [collision('Duplicate alias "count_star" — name one with $as')] })
+      const firstLast = resolveBuckets({
+        $select: [{ $fn: 'first', $field: 't' }, { $fn: 'first', $field: 't' }, { $fn: 'last', $field: 't' }, { $fn: 'last', $field: 't', $as: 'last_t' }],
+        $groupBy: ['g'],
+        $rowOrder: { t: 1 },
+      })
+      expect(firstLast).toEqual({
+        ok: false,
+        issues: [collision('Duplicate alias "first_t" — name one with $as'), collision('Duplicate alias "last_t" — name one with $as')],
+      })
+      // an ungrouped aggregate query has one row too
+      const ungrouped = resolveBuckets({ $select: [{ $fn: 'sum', $field: 'a', $as: 't' }, { $fn: 'avg', $field: 'b', $as: 't' }] })
+      expect(ungrouped).toEqual({ ok: false, issues: [collision('Duplicate alias "t"')] })
+    })
+
+    it('an aggregate alias equal to a selected field or a $groupBy key', () => {
+      const vsSelected = resolveBuckets({
+        $select: ['status', { $fn: 'count', $field: '*', $as: 'status' }],
+        $groupBy: ['status'],
+      })
+      expect(vsSelected).toEqual({ ok: false, issues: [collision('Alias "status" collides with field "status"')] })
+      const vsGroupKey = resolveBuckets({
+        $select: [{ $fn: 'count', $field: '*', $as: 'region' }],
+        $groupBy: ['region'],
+      })
+      const groupByAlias = (alias: string) => ({
+        path: '$groupBy',
+        message: `Cannot group by an aggregate alias "${alias}" — a $groupBy key and a $select alias need their own names`,
+        code: 'AGG_ALIAS_COLLISION',
+      })
+      expect(vsGroupKey).toEqual({ ok: false, issues: [groupByAlias('region')] })
+      // the same for a countDistinct over a field list
+      const listVsGroupKey = resolveBuckets({
+        $select: [{ $fn: 'countDistinct', $field: ['a', 'b'] }],
+        $groupBy: ['countDistinct_a_b'],
+      })
+      expect(!listVsGroupKey.ok && listVsGroupKey.issues).toEqual([groupByAlias('countDistinct_a_b')])
+    })
+
+    it('grouping by an expression alias carries the code too', () => {
+      const res = resolveBuckets({
+        $select: [{ $fn: 'count', $field: '*', $as: 'n' }, { $expr: { $op: '+', $args: ['n', 1] }, $as: 'e' }],
+        $groupBy: ['g', 'e'],
+      })
+      expect(!res.ok && res.issues).toEqual([
+        { path: '$groupBy', message: 'Cannot group by a computed expression "e"', code: 'AGG_ALIAS_COLLISION' },
+      ])
+    })
+
+    it('a bucket alias in $groupBy is the bucket, not a colliding key', () => {
+      const res = resolveBuckets({
+        $select: [{ $bucket: 'day', $field: 'at', $as: 'd' }, { $fn: 'count', $field: '*', $as: 'n' }],
+        $groupBy: ['d'],
+      })
+      expect(res.ok).toBe(true)
+    })
+
+    it('an aggregate alias may still name a table field that is not a result column', () => {
+      // isField lists the table: only bucket and expression aliases are kept off all its names
+      const res = resolveBuckets(
+        { $select: ['status', { $fn: 'count', $field: '*', $as: 'amount' }], $groupBy: ['status'] },
+        { isField: (n) => n === 'status' || n === 'amount' },
+      )
+      expect(res.ok).toBe(true)
+    })
+
+    it('every alias collision carries the code', () => {
+      const res = resolveBuckets({
+        $select: [
+          'status',
+          { $bucket: 'day', $field: 'at', $as: 'status' },
+          { $bucket: 'day', $field: 'at', $as: 'd' },
+          { $bucket: 'week', $field: 'at', $as: 'd' },
+          { $fn: 'sum', $field: 'a', $as: 'e' },
+          { $expr: { $op: '+', $args: ['d2', 1] }, $as: 'e' },
+          { $fn: 'count', $field: '*', $as: 'd2' },
+        ],
+        $groupBy: ['status', 'd'],
+      })
+      expect(!res.ok && res.issues.filter((i) => i.code === 'AGG_ALIAS_COLLISION').map((i) => i.message)).toEqual([
+        'Alias "status" collides with field "status"',
+        'Duplicate alias "d"',
+        'Duplicate alias "e"',
+      ])
+    })
+
+    it('a two-level aggregate keeps its own column codes (no second report)', () => {
+      const res = resolveNested({
+        $from: {
+          $groupBy: ['g'],
+          $select: [{ $fn: 'count', $field: '*', $as: 'g' }, { $fn: 'sum', $field: 'a', $as: 's' }, { $fn: 'max', $field: 'a', $as: 's' }],
+        },
+        $groupBy: ['g'],
+        $select: ['g', { $fn: 'sum', $field: 's', $as: 'g' }],
+      })
+      expect(res.ok).toBe(false)
+      const codes = !res.ok ? res.issues.map((i) => i.code) : []
+      expect(codes).not.toContain('AGG_ALIAS_COLLISION')
+      expect(codes.filter((c) => c === 'AGG_NESTED_DUPLICATE_COLUMN')).toHaveLength(3)
+    })
   })
 
   it('rejects non-string $groupBy entries', () => {
@@ -793,6 +909,7 @@ describe('countDistinct over several fields', () => {
         {
           path: '$select',
           message: 'Duplicate alias "countDistinct_a_b" — name the countDistinct over several fields with $as',
+          code: 'AGG_ALIAS_COLLISION',
         },
       ],
     })
@@ -810,20 +927,12 @@ describe('countDistinct over several fields', () => {
     )
     expect(field).toEqual({
       ok: false,
-      issues: [{ path: '$select', message: 'Alias "countDistinct_a_b" collides with field "countDistinct_a_b"' }],
+      issues: [
+        { path: '$select', message: 'Alias "countDistinct_a_b" collides with field "countDistinct_a_b"', code: 'AGG_ALIAS_COLLISION' },
+      ],
     })
   })
 
-  it('leaves single-field aggregate aliases as they were (no new duplicate rule)', () => {
-    const res = resolveBuckets({
-      $select: [
-        { $fn: 'count', $field: '*' },
-        { $fn: 'count', $field: '*' },
-      ],
-      $groupBy: ['g'],
-    })
-    expect(res.ok).toBe(true)
-  })
 })
 
 describe('conditional aggregates ($where)', () => {

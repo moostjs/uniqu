@@ -975,6 +975,16 @@ describe('buildUrl – round-trip through a real URL parser', () => {
       expect((r.filter as Record<string, unknown>).v, `char ${JSON.stringify(ch)} (0x${code.toString(16)})`).toBe(v)
     }
   })
+
+  it('a hand-written URL with whitespace before a quoted value round-trips like one with a space', () => {
+    for (const ws of ['%20', '%09', '%0A', '%0D', '%C2%A0']) {
+      const parsed = parseUrl(`name=${ws}'a&b (c)'&$with=posts(title=${ws}'x)')&n=1`)
+      const expected = { filter: { name: 'a&b (c)', n: 1 }, controls: { $with: [{ name: 'posts', filter: { title: 'x)' } }] } }
+      expect(parsed, ws).toMatchObject(expected)
+      const rebuilt = parseUrl(viaRealUrl(buildUrl(parsed)))
+      expect(stripInsights(rebuilt), ws).toEqual(stripInsights(parsed))
+    }
+  })
 })
 
 // Control values (`$search`, `$search:<index>`, any pass-through `$`-control)

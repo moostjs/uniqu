@@ -365,7 +365,7 @@ describe('resolveNested — shape errors', () => {
     expect(issues.map((i) => [i.path, i.message, i.code])).toEqual([
       ['$from.$select', 'Unknown bucket unit "fortnight" — use hour, day, week, month, quarter or year', undefined],
       ['$from.$rowOrder', '$rowOrder is required when first() or last() is used', undefined],
-      ['$select', 'Alias "g" collides with field "g"', undefined],
+      ['$select', 'Alias "g" collides with field "g"', 'AGG_ALIAS_COLLISION'],
     ])
   })
 
@@ -574,5 +574,24 @@ describe('resolveNested — one coded issue per malformed control', () => {
       { path: '$rowOrder', message: '$rowOrder must be an object', code: 'AGG_NESTED_CONTROL' },
       { path: '$nulls', message: '$nulls must be an object', code: 'AGG_NESTED_CONTROL' },
     ])
+  })
+
+  it('a non-object inner $rowOrder is reported once, with its code (with or without first()/last())', () => {
+    const select = [{ $fn: 'count', $field: '*', $as: 'c' }]
+    for (const [rowOrder, fn] of [
+      ['t', 'first'],
+      [['t'], 'last'],
+      [1, 'first'],
+      [null, 'first'],
+      ['t', 'count'],
+    ] as const) {
+      const field = fn === 'count' ? '*' : 't'
+      const issues = issuesOf(
+        resolveNested({ $from: { $groupBy: ['g'], $select: [{ $fn: fn, $field: field, $as: 'f' }], $rowOrder: rowOrder }, $select: select }),
+      )
+      expect(issues, JSON.stringify(rowOrder)).toEqual([
+        { path: '$from.$rowOrder', message: '$from.$rowOrder must be an object', code: 'AGG_NESTED_CONTROL' },
+      ])
+    }
   })
 })

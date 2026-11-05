@@ -176,12 +176,20 @@ export type NestedIssueCode =
   /** `sum` / `avg` / arithmetic / a bucket at the outer level over an inner column known not to hold numbers. */
   | 'AGG_NESTED_NOT_NUMERIC'
 
+/** Machine-readable reasons of the one-level `$select` rules (see {@link resolveBuckets}). */
+export type AggregateIssueCode =
+  /**
+   * A computed `$select` alias repeats another column name of the result (another alias, a plain
+   * `$select` field, a `$groupBy` key), or a bucket or expression alias names an `isField` field.
+   */
+  'AGG_ALIAS_COLLISION'
+
 /** One validation failure: the control it concerns and a user-facing message. */
 export interface QueryIssue {
   path: string
   message: string
-  /** Machine-readable reason, on the issues that have one ({@link NestedIssueCode}). */
-  code?: NestedIssueCode
+  /** Machine-readable reason, on the issues that have one ({@link AggregateIssueCode}, {@link NestedIssueCode}). */
+  code?: AggregateIssueCode | NestedIssueCode
 }
 
 /** A validated, normalized calendar bucket. */
@@ -363,8 +371,10 @@ export interface ResolveBucketsOptions {
   /** Whether the query is an aggregate query. Default: `$groupBy` is non-empty. */
   aggregate?: boolean
   /**
-   * Whether `name` is a field of the queried table — a bucket alias must not
-   * shadow one. Default: the plain fields listed in `$select`.
+   * Whether `name` is a field of the queried table — a bucket or expression alias must
+   * not shadow one. Checked in addition to the plain fields listed in `$select` (the
+   * default). Aliases of aggregates over one field are not checked against it: they only
+   * must not equal a selected field, a `$groupBy` key or another alias.
    */
   isField?: (name: string) => boolean
   /** Allowed aggregate `$fn` names, checked by {@link validateAggregateExpr}. Default: any name. */
@@ -390,9 +400,13 @@ export interface ResolveBucketsOptions {
  *   (`aggregate` when given, else a non-empty `$groupBy`);
  * - `first`/`last` need a non-empty `$rowOrder` (`1 | -1` values), and `$rowOrder`
  *   is rejected without them; the `$nulls` entry of a `$rowOrder` key is `'first'` / `'last'`;
- * - each bucket alias is listed in `$groupBy`; no `$groupBy` entry is an expression alias;
- * - a bucket or expression alias is unique among `$select` aliases and is not a
- *   field name (`isField`; pass the table's field set to check this fully here);
+ * - each bucket alias is listed in `$groupBy`;
+ * - every computed alias names one column of the result: it is unique among
+ *   `$select` aliases (default ones included), is not a plain `$select` field, and
+ *   no `$groupBy` entry is an aggregate or expression alias; a bucket or expression
+ *   alias is not a field name either (`isField`; pass the table's field set to
+ *   check this fully here). These issues carry the code `AGG_ALIAS_COLLISION`
+ *   ({@link AggregateIssueCode});
  * - `$groupBy` entries are strings.
  *
  * Schema-dependent rules (numeric operand types, timestamp-typed bucket source,
@@ -425,16 +439,21 @@ function resolveComputed(
 
   if (Array.isArray(select)) {
     const fields = new Set<string>()
-    const aggAliases = computedAliases(select, isAggregateExpr)
-    // Every alias of a computed entry, with its count: an expression alias must be unique among all of them.
+    // Every alias of a computed entry (valid or not), with its count: a column alias must be unique among all of them.
     const aliasCount = new Map<string, number>()
     const bucketAliases = new Set<string>()
     const numericAliases = new Set<string>()
     const exprAliases = new Set<string>()
     const rowExprs: ResolvedSelectExpr[] = []
     const groupExprs: { alias: string; expr: ArithExpr }[] = []
-    // Default aliases of `countDistinct` over a field list (`countDistinct_a_b`) can meet a single field's.
-    const listAliases: string[] = []
+    // Every valid computed column by alias: whether a table field (`isField`) may not share it — an
+    // aggregate over one field may name a field the result does not hold.
+    const columns = new Map<string, boolean>()
+    const addColumn = (alias: string, shadows: boolean) => columns.set(alias, shadows || columns.get(alias) === true)
+    // Aliases of `countDistinct` over a field list: `countDistinct_a_b` can meet a single field's default.
+    const listAliases = new Set<string>()
+    // Aliases some entry gets by default (no `$as`).
+    const defaultAliases = new Set<string>()
     let sawBucket = false
     let sawExpr = false
     for (let i = 0; i < select.length; i++) {
@@ -463,6 +482,7 @@ function resolveComputed(
         continue
       }
       aliasCount.set(entryAlias, (aliasCount.get(entryAlias) ?? 0) + 1)
+      if (!(entry as { $as?: unknown }).$as) defaultAliases.add(entryAlias)
       if ((isBucketExpr(entry) || isSelectArithExpr(entry)) && (entry as { $where?: unknown }).$where !== undefined) {
         const what = isBucketExpr(entry) ? 'a calendar bucket' : `the group-level expression "${String(entry.$as)}"`
         issues.push({ path: '$select', message: `$where applies to aggregates only, not to ${what}` })
@@ -473,12 +493,17 @@ function resolveComputed(
         if (res.ok) {
           buckets.push(res.bucket)
           bucketAliases.add(res.bucket.alias)
+          addColumn(res.bucket.alias, true)
         } else issues.push({ path: '$select', message: res.message })
       } else if (isAggregateExpr(entry)) {
         if (isRowOrderFn(entry.$fn)) sawRowFn = true
         const res = validateAggregateExpr(entry, { fns: opts.fns })
         if (!res.ok) issues.push({ path: '$select', message: res.message })
-        else if (Array.isArray(entry.$field)) listAliases.push(entryAlias)
+        else {
+          const list = Array.isArray(entry.$field)
+          if (list) listAliases.add(entryAlias)
+          addColumn(entryAlias, list)
+        }
         numericAliases.add(entryAlias)
       } else {
         // An expression: `$fn(<expr>)` over each row, or a group-level `$expr`.
@@ -501,6 +526,7 @@ function resolveComputed(
         if (alias !== undefined) {
           numericAliases.add(alias)
           exprAliases.add(alias)
+          addColumn(alias, true)
           if (!problems.length && fnOk) {
             if (rowFn !== undefined && isExprAggregateFn(rowFn)) {
               rowExprs.push({ alias, expr: entry.$expr, names: arithNames(entry.$expr), level: 'row', fn: rowFn })
@@ -517,31 +543,32 @@ function resolveComputed(
       issues.push({ path: '$select', message: 'Expressions and first()/last() are only valid in grouped queries' })
     }
     const isField = opts.isField ?? ((name: string) => fields.has(name))
-    /** A computed alias must not shadow a field, nor (with `dupes`) be repeated. */
-    const checkAlias = (alias: string, repeated: boolean, hint = '') => {
-      if (isField(alias)) {
-        issues.push({ path: '$select', message: `Alias "${alias}" collides with field "${alias}"` })
-      } else if (dupes && repeated) {
-        issues.push({ path: '$select', message: `Duplicate alias "${alias}"${hint}` })
-      }
+    // One value per name in the result row: a computed alias may not shadow a field, nor (with `dupes`)
+    // be a selected field, an aggregate's `$groupBy` key or repeated. Reported once per alias.
+    for (const [alias, shadows] of columns) {
+      let path = '$select'
+      let message: string
+      if ((shadows && isField(alias)) || (dupes && fields.has(alias))) message = `Alias "${alias}" collides with field "${alias}"`
+      else if (!dupes) continue
+      else if (groupBy.includes(alias) && !bucketAliases.has(alias) && !exprAliases.has(alias)) {
+        // a bucket alias in `$groupBy` is the bucket; an expression alias there is reported by resolveSelectExprs
+        path = '$groupBy'
+        message = `Cannot group by an aggregate alias "${alias}" — a $groupBy key and a $select alias need their own names`
+      } else if ((aliasCount.get(alias) ?? 0) > 1) {
+        const hint = listAliases.has(alias)
+          ? ' — name the countDistinct over several fields with $as'
+          : defaultAliases.has(alias) ? ' — name one with $as' : ''
+        message = `Duplicate alias "${alias}"${hint}`
+      } else continue
+      issues.push({ path, message, code: 'AGG_ALIAS_COLLISION' })
     }
-    const seen = new Set<string>()
     for (const b of buckets) {
-      checkAlias(b.alias, seen.has(b.alias) || aggAliases.has(b.alias))
-      seen.add(b.alias)
       if (aggregateMode && !groupBy.includes(b.alias)) {
         issues.push({ path: '$select', message: `Bucket "${b.alias}" in $select must also appear in $groupBy` })
       }
     }
 
-    for (const alias of listAliases) {
-      checkAlias(alias, (aliasCount.get(alias) ?? 0) > 1, ' — name the countDistinct over several fields with $as')
-    }
-
-    exprs = resolveSelectExprs(
-      { rowExprs, groupExprs, exprAliases, aliasCount, numericAliases, bucketAliases, groupBy, checkAlias },
-      issues,
-    )
+    exprs = resolveSelectExprs({ rowExprs, groupExprs, exprAliases, numericAliases, bucketAliases, groupBy }, issues)
   }
 
   for (let i = 0; i < groupBy.length; i++) {
@@ -564,27 +591,21 @@ interface SelectExprContext {
   groupExprs: { alias: string; expr: ArithExpr }[]
   /** Every usable expression alias (row-level and group-level). */
   exprAliases: ReadonlySet<string>
-  /** Occurrences of each computed alias in `$select`. */
-  aliasCount: ReadonlyMap<string, number>
   /** Aliases of numeric entries (aggregates and expressions): valid operands. */
   numericAliases: ReadonlySet<string>
   bucketAliases: ReadonlySet<string>
   groupBy: readonly unknown[]
-  /** Report an alias that shadows a field or (`repeated`, when duplicates are reported) repeats. */
-  checkAlias: (alias: string, repeated: boolean) => void
 }
 
 /**
- * Expression rules that need the whole `$select`: alias uniqueness, operand
+ * Expression rules that need the whole `$select`: operand
  * resolution and dependency order of group-level entries (cycle check), and
  * "no `$groupBy` on an expression". Returns row-level entries first, then
  * group-level in dependency order.
  */
 function resolveSelectExprs(ctx: SelectExprContext, issues: QueryIssue[]): ResolvedSelectExpr[] {
-  const { rowExprs, groupExprs, exprAliases, aliasCount, numericAliases, bucketAliases, groupBy } = ctx
+  const { rowExprs, groupExprs, exprAliases, numericAliases, bucketAliases, groupBy } = ctx
   if (!exprAliases.size) return []
-
-  for (const alias of exprAliases) ctx.checkAlias(alias, (aliasCount.get(alias) ?? 0) > 1)
 
   // Group-level expressions: operands, then dependency order (cycle check).
   let ordered: ResolvedSelectExpr[] = []
@@ -618,7 +639,7 @@ function resolveSelectExprs(ctx: SelectExprContext, issues: QueryIssue[]): Resol
 
   for (const g of groupBy) {
     if (typeof g === 'string' && exprAliases.has(g)) {
-      issues.push({ path: '$groupBy', message: `Cannot group by a computed expression "${g}"` })
+      issues.push({ path: '$groupBy', message: `Cannot group by a computed expression "${g}"`, code: 'AGG_ALIAS_COLLISION' })
     }
   }
   return [...rowExprs, ...ordered]
@@ -852,7 +873,7 @@ function filterNames(filter: unknown): { names: string[]; relations: string[] } 
  *   are objects (a `$having` a well-formed filter), and every `$nulls` key is ordered by
  *   (`AGG_NESTED_CONTROL`);
  * - the inner level passes {@link resolveBuckets} as a grouped query (its issues keep their
- *   messages, under a `$from.` path);
+ *   messages and codes, under a `$from.` path);
  * - the inner columns — every `$groupBy` key plus every computed `$select` alias — have
  *   distinct names (`AGG_NESTED_DUPLICATE_COLUMN`);
  * - every name the outer level reads (`$groupBy` entries that are not outer bucket aliases,
@@ -867,6 +888,10 @@ function filterNames(filter: unknown): { names: string[]; relations: string[] } 
  *   to hold no numbers (`AGG_NESTED_NOT_NUMERIC`; bucket labels, plus whatever
  *   `isNumericField` rules out);
  * - the outer level passes {@link resolveBuckets} with the inner columns as its fields.
+ *
+ * The level checks of {@link resolveBuckets} keep their own codes: a bucket or expression
+ * alias that shadows a field (`isField` inside, an inner column outside) or a `$groupBy` entry
+ * naming an expression alias is `AGG_ALIAS_COLLISION` here too ({@link AggregateIssueCode}).
  *
  * The inner level reads the table like a standalone grouped query: field capabilities,
  * schema types and the like stay the caller's, as for {@link resolveBuckets}. Run that
@@ -924,7 +949,7 @@ function issueWith(issues: QueryIssue[], code: NestedIssueCode) {
  * Controls and control shapes of both levels, in report order: the controls `$from` holds
  * ({@link NESTED_STAGE_CONTROLS}; a `$from` inside it is `AGG_NESTED_DEPTH`), no root `$with`,
  * no object-form `$select`, the outer `$groupBy` is a list, `$having` / `$sort` / `$rowOrder` /
- * `$nulls` are objects (a `$having` a well-formed filter), every `$nulls` key is ordered by
+ * `$nulls` of either level are objects (a `$having` a well-formed filter), every `$nulls` key is ordered by
  * (`$sort` / `$rowOrder` at the outer level, `$rowOrder` inside `$from`) and is `'first'` or
  * `'last'`, and the inner `$groupBy` is non-empty (`AGG_NESTED_UNGROUPED`). Returns the paths
  * of the controls reported as not being objects.
@@ -960,6 +985,7 @@ function checkNestedControls(stage: Record<string, unknown>, root: NestedControl
     { path: '$rowOrder', value: root.$rowOrder },
     { path: '$nulls', value: root.$nulls },
     { path: '$from.$having', value: stage.$having, filter: true },
+    { path: '$from.$rowOrder', value: stage.$rowOrder },
     { path: '$from.$nulls', value: stage.$nulls },
   ]
   for (const { path, value, filter } of objects) {
