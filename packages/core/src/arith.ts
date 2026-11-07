@@ -179,6 +179,65 @@ export function parseArith(text: string): ArithExpr {
   return result
 }
 
+// ── build ────────────────────────────────────────────────────────────────
+
+/** Depth of an expression (a leaf is 1), counted up to `cap + 1`. Iterative: a term may be hostile. */
+function arithDepth(expr: ArithExpr, cap: number): number {
+  let max = 0
+  const stack: [unknown, number][] = [[expr, 1]]
+  while (stack.length) {
+    const [e, d] = stack.pop()!
+    if (d > max) max = d
+    if (max > cap) return max
+    if (isNode(e)) for (const a of e.$args) stack.push([a, d + 1])
+  }
+  return max
+}
+
+function foldArith<N extends string>(op: '+' | '*', terms: readonly ArithExpr<N>[]): ArithExpr<N> {
+  const fn = op === '+' ? 'arithAdd' : 'arithMul'
+  if (terms.length === 0) throw new TypeError(`${fn} needs at least 1 term`)
+  const depths = terms.map((t) => arithDepth(t, ARITH_MAX_DEPTH))
+  // Each term sits one level below the fold node, unless it is the only term.
+  const fold = terms.length > 1 ? 1 : 0
+  let depth = depths[0]
+  for (let i = 0; i < terms.length; i++) {
+    if (depths[i] + fold > ARITH_MAX_DEPTH) {
+      const shown = depths[i] > ARITH_MAX_DEPTH ? `over ${ARITH_MAX_DEPTH}` : String(depths[i])
+      throw new RangeError(
+        `${fn} term ${i} is nested ${shown} levels deep, which no longer fits in ARITH_MAX_DEPTH (${ARITH_MAX_DEPTH}) ` +
+          `once it is a term: simplify or split that term`,
+      )
+    }
+    if (i) depth = Math.max(depth, depths[i]) + 1
+  }
+  // The running depth only grows, so its final value is the deepest the fold gets.
+  if (depth > ARITH_MAX_DEPTH) {
+    throw new RangeError(
+      `${fn} over ${terms.length} terms nests deeper than ${ARITH_MAX_DEPTH} levels (ARITH_MAX_DEPTH): ` +
+        `group the terms, e.g. ${fn}(${fn}(a, b), ${fn}(c, d))`,
+    )
+  }
+  return terms.reduce((out, t) => ({ $op: op, $args: [out, t] }))
+}
+
+/**
+ * `a + b + c + …` as an {@link ArithExpr}. `+` is binary, so the terms fold
+ * left: the result deep-equals `parseArith('a+b+c')`. One term is returned as
+ * is; none throws `TypeError`. Throws `RangeError` when the folded tree would
+ * be nested deeper than {@link ARITH_MAX_DEPTH}: every term adds a level, so
+ * group a long sum (`arithAdd(arithAdd(a, b), arithAdd(c, d))`) to keep it shallow.
+ * A single term is checked too: one already deeper than the limit throws.
+ */
+export function arithAdd<N extends string = string>(...terms: ArithExpr<N>[]): ArithExpr<N> {
+  return foldArith('+', terms)
+}
+
+/** `a * b * c * …` as an {@link ArithExpr}: the left fold of {@link arithAdd}, with `*`. */
+export function arithMul<N extends string = string>(...terms: ArithExpr<N>[]): ArithExpr<N> {
+  return foldArith('*', terms)
+}
+
 // ── format ───────────────────────────────────────────────────────────────
 
 const PREC: Record<string, number> = { '+': 1, '-': 1, '*': 2, '/': 2 }

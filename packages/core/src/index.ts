@@ -97,6 +97,8 @@ export {
   arithNames,
   arithNullable,
   validateArith,
+  arithAdd,
+  arithMul,
   ARITH_MAX_NODES,
   ARITH_MAX_DEPTH,
   type FormatArithOptions,

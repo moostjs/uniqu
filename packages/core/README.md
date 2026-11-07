@@ -286,6 +286,17 @@ formatArith(expr, { encodePlus: true })  // 'open*10%2BsevMax' (for a URL)
 - `arithNames(expr)`: the distinct names, in first-use order. `arithNullable(expr, isNullable)`: whether the result may be NULL (a `/`, a nullable name, or a `coalesce` whose arguments are all nullable).
 - `validateArith(expr)`: schema-free rules as `QueryIssue[]`: operators and arities (`-` takes 1 or 2 arguments, `coalesce` at least 2, the rest 2), identifier names, finite literals within `Number.MAX_SAFE_INTEGER`, at least one name (a constant is rejected), and at most `ARITH_MAX_NODES` (64) nodes and `ARITH_MAX_DEPTH` (16) levels. The limits are a guard: the URL is user input.
 
+`+` and `*` take exactly two arguments, like the other binary operators. To build a longer sum or product, use `arithAdd(...terms)` / `arithMul(...terms)`: they fold the terms left, so the result deep-equals what `parseArith` returns for `a+b+c+d`, one term is returned as is (unless it is already deeper than `ARITH_MAX_DEPTH`, which throws), and none throws `TypeError`.
+
+```ts
+import { arithAdd, arithMul } from '@uniqu/core'
+
+// A weighted sum of four columns: same tree as parseArith('w1*t1+w2*t2+w3*t3+w4*t4')
+const score = arithAdd(arithMul('w1', 't1'), arithMul('w2', 't2'), arithMul('w3', 't3'), arithMul('w4', 't4'))
+```
+
+Each extra term adds one nesting level, so a builder throws `RangeError` when the result would be deeper than `ARITH_MAX_DEPTH` (16): at most 16 plain terms in one call. For more, group them (`arithAdd(arithAdd(a, b, c), arithAdd(d, e, f))`); a grouped tree no longer deep-equals the flat parse, and `formatArith` prints it with parentheses. `ARITH_MAX_NODES` (64) still caps the whole expression.
+
 Semantics are the consumer's (a typical engine uses IEEE doubles, NULL propagates, and division by zero gives NULL).
 
 #### Representative row: `first` / `last` and `$rowOrder`
@@ -720,6 +731,7 @@ const insights = getInsights(query)
 | `NULLS_PLACEMENTS` / `isNullsPlacement` | `readonly NullsPlacement[]` / `(v: unknown) => v is NullsPlacement` | `['first', 'last']` and its guard, for validating `$nulls` entries |
 | `ROW_ORDER_FNS` / `EXPR_AGGREGATE_FNS` | `readonly AggregateFn[]` | `['first', 'last']` (need `$rowOrder`) / `['sum', 'avg', 'min', 'max']` (accept `$expr`) |
 | `parseArith` / `formatArith` | `(text) => ArithExpr` / `(expr, { encodePlus? }) => string` | The single arithmetic grammar, text ⇄ JSON |
+| `arithAdd` / `arithMul` | `(...terms: ArithExpr[]) => ArithExpr` | `a+b+c+…` / `a*b*c*…` folded left as `parseArith` does; `RangeError` past `ARITH_MAX_DEPTH` |
 | `arithNames` / `arithNullable` / `validateArith` | see [Arithmetic expressions](#arithmetic-expressions-arithexpr) | Names, nullability and schema-free validation (limits `ARITH_MAX_NODES` 64, `ARITH_MAX_DEPTH` 16) |
 | `isAggregateOfExpr` / `isSelectArithExpr` | `(v: unknown) => v is …` | Type guards for the expression `$select` entries |
 | `STAR_AGGREGATE_FNS` | `readonly AggregateFn[]` | Known functions that accept `'*'` as `$field` (`count`) |

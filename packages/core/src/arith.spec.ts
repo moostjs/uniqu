@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest'
 import {
   ARITH_MAX_DEPTH,
   ARITH_MAX_NODES,
+  arithAdd,
+  arithMul,
   arithNames,
   arithNullable,
   formatArith,
@@ -12,6 +14,11 @@ import type { ArithExpr } from './types'
 
 const bin = (op: '+' | '-' | '*' | '/', a: ArithExpr, b: ArithExpr): ArithExpr => ({ $op: op, $args: [a, b] })
 const neg = (a: ArithExpr): ArithExpr => ({ $op: '-', $args: [a] })
+const nest = (levels: number): ArithExpr => {
+  let e: ArithExpr = 'a'
+  for (let i = 1; i < levels; i++) e = neg(e)
+  return e
+}
 
 describe('parseArith', () => {
   it('parses names, numbers and precedence', () => {
@@ -238,13 +245,66 @@ describe('validateArith', () => {
   })
 
   it('limits the depth', () => {
-    const nest = (levels: number): ArithExpr => {
-      let e: ArithExpr = 'a'
-      for (let i = 1; i < levels; i++) e = neg(e)
-      return e
-    }
     expect(ARITH_MAX_DEPTH).toBe(16)
     expect(validateArith(nest(16))).toEqual([])
     expect(validateArith(nest(17))[0].message).toMatch(/nested too deeply/)
+  })
+})
+
+describe('arithAdd / arithMul', () => {
+  const names = (n: number) => Array.from({ length: n }, (_, i) => `f${i}`)
+
+  it('fold left exactly as the parser does', () => {
+    expect(arithAdd('a', 'b')).toEqual(parseArith('a+b'))
+    expect(arithAdd('a', 'b', 'c', 'd')).toEqual(parseArith('a+b+c+d'))
+    expect(arithMul('a', 2, 'c')).toEqual(parseArith('a*2*c'))
+    expect(arithAdd(arithMul('w1', 't1'), arithMul('w2', 't2'), arithMul('w3', 't3'), arithMul('w4', 't4'))).toEqual(
+      parseArith('w1*t1+w2*t2+w3*t3+w4*t4'),
+    )
+    expect(validateArith(arithAdd('a', 'b', 'c', 'd'))).toEqual([])
+  })
+
+  it('accepts coalesce terms and negative literals', () => {
+    const co = parseArith('coalesce(a, 0)')
+    expect(arithAdd(co, 'b')).toEqual(parseArith('coalesce(a, 0)+b'))
+    expect(arithMul('a', co)).toEqual(parseArith('a*coalesce(a, 0)'))
+    expect(arithAdd('a', -5)).toEqual(parseArith('a+-5'))
+  })
+
+  it('returns a single term as is and rejects none', () => {
+    expect(arithAdd('a')).toBe('a')
+    expect(arithMul(bin('-', 'a', 'b'))).toEqual(bin('-', 'a', 'b'))
+    expect(() => arithAdd()).toThrow(TypeError)
+    const terms: ArithExpr[] = ['a', 'b', 'c']
+    expect(arithMul(...terms)).toEqual(parseArith('a*b*c'))
+  })
+
+  it(`throws past ARITH_MAX_DEPTH (${ARITH_MAX_DEPTH})`, () => {
+    const deepest = arithAdd(...names(ARITH_MAX_DEPTH))
+    expect(validateArith(deepest)).toEqual([])
+    expect(() => arithAdd(...names(ARITH_MAX_DEPTH + 1))).toThrow(RangeError)
+    // A nested term counts towards the depth.
+    const deepTerm = arithMul(...names(ARITH_MAX_DEPTH - 1))
+    expect(() => arithAdd('x', deepTerm)).not.toThrow()
+    expect(() => arithAdd('x', arithMul(...names(ARITH_MAX_DEPTH)))).toThrow(RangeError)
+    expect(() => arithAdd(deepTerm, 'x', 'y')).toThrow(RangeError)
+    // A single term is checked too, consistently with several.
+    const tooDeep = arithMul(...names(ARITH_MAX_DEPTH))
+    expect(() => arithAdd(deepTerm)).not.toThrow()
+    expect(() => arithAdd(tooDeep, 'x')).toThrow(RangeError)
+    expect(() => arithAdd(nest(ARITH_MAX_DEPTH + 2))).toThrow(RangeError)
+    // Grouping keeps a long sum shallow.
+    const grouped = arithAdd(arithAdd(...names(10)), arithAdd(...names(10)))
+    expect(validateArith(grouped)).toEqual([])
+  })
+
+  it('names the offending term when a single term is too deep', () => {
+    const tooDeep = arithMul(...names(ARITH_MAX_DEPTH))
+    expect(() => arithAdd(tooDeep, 'x')).toThrow(/term 0 is nested/)
+    expect(() => arithAdd('x', 'y', tooDeep)).toThrow(/term 2 is nested/)
+    expect(() => arithAdd(nest(ARITH_MAX_DEPTH + 5))).toThrow(/term 0 is nested over 16 levels/)
+    expect(() => arithMul('x', tooDeep)).toThrow(/arithMul term 1/)
+    // Plain over-long sums keep the grouping advice.
+    expect(() => arithAdd(...names(ARITH_MAX_DEPTH + 1))).toThrow(/group the terms/)
   })
 })
